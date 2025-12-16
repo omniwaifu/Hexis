@@ -1,18 +1,193 @@
 # AGI Memory System
 
-A sophisticated database design for Artificial General Intelligence (AGI) memory management, implementing multiple types of memory storage and retrieval mechanisms inspired by human cognitive architecture.
+Postgres-first “agent brain”: memories, goals, a scheduled heartbeat, and a stateless worker that bridges the DB to LLM/embedding services.
 
 ## Overview
 
-This system provides a comprehensive memory management solution for AGI applications, featuring:
+This repo provides:
 
 - Multiple memory types (Episodic, Semantic, Procedural, Strategic)
 - Vector-based memory storage and similarity search
 - Graph-based memory relationships
-- Dynamic memory importance calculation
-- Memory decay simulation
 - Working memory system
-- Memory consolidation mechanisms
+- A gated, autonomous heartbeat (runs only after `agi init`)
+
+## Quickstart
+
+Prereqs: Docker Desktop + Python 3.10+.
+
+### 1) Configure environment
+
+```bash
+cp .env.local .env
+```
+
+### 2) Start services
+
+```bash
+# Passive (db + embeddings)
+docker compose up -d
+```
+
+### 3) (Optional) Configure the agent (`agi init`)
+
+Autonomous heartbeats are **gated** until setup is complete:
+
+```bash
+./agi init  # or `agi init` if you've installed the package
+
+# If you want autonomy:
+docker compose --profile active up -d worker
+```
+
+Config is stored in Postgres in the `config` table (e.g. `agent.objectives`, `agent.guardrails`, `llm.heartbeat`, and `agent.is_configured`).
+
+### 4) Use the Python client (thin DB client)
+
+Install:
+
+```bash
+pip install -e .
+```
+
+Example:
+
+```python
+import asyncio
+from cognitive_memory_api import CognitiveMemory, MemoryType
+
+DSN = "postgresql://agi_user:agi_password@localhost:5432/agi_db"
+
+async def main():
+    async with CognitiveMemory.connect(DSN) as mem:
+        await mem.remember("User prefers dark mode", type=MemoryType.SEMANTIC, importance=0.8)
+        ctx = await mem.hydrate("What do I know about the user's UI preferences?", include_goals=False)
+        print([m.content for m in ctx.memories[:3]])
+
+asyncio.run(main())
+```
+
+## Usage Scenarios
+
+Below are common ways to use this repo, from “just a schema” to a full autonomous agent loop.
+
+### 1) Pure SQL Brain (DB-Native)
+
+Your app talks directly to Postgres functions/views. Postgres is the system of record and the “brain”.
+
+```sql
+-- Store a memory (embedding generated inside the DB)
+SELECT create_semantic_memory('User prefers dark mode', 0.9);
+
+-- Retrieve relevant memories
+SELECT * FROM fast_recall('What do I know about UI preferences?', 5);
+```
+
+### 2) Python Library Client (App/API/UI in the Middle)
+
+Use `cognitive_memory_api.py` as a thin client and build your own UX/API around it.
+
+```python
+from cognitive_memory_api import CognitiveMemory
+
+async with CognitiveMemory.connect(DSN) as mem:
+    await mem.remember("User likes concise answers")
+    ctx = await mem.hydrate("How should I respond?", include_goals=False)
+```
+
+### 3) MCP Tools Server (LLM Tool Use)
+
+Expose memory operations as MCP tools so any MCP-capable runtime can call them.
+
+```bash
+agi mcp
+```
+
+Conceptual flow:
+- LLM calls `remember_batch` after a conversation
+- LLM calls `hydrate` before answering a user
+
+### 4) Worker + Heartbeat (Autonomous State Management)
+
+Turn on the worker so the database can schedule heartbeats and process `external_calls`.
+
+```bash
+docker compose --profile active up -d worker
+```
+
+Conceptual flow:
+- DB decides when a heartbeat is due (`should_run_heartbeat()`)
+- Worker queues/fulfills LLM calls (`external_calls`)
+- DB records outcomes (`heartbeat_log`, new memories, goals, etc.)
+
+### 5) Headless “Agent Brain” Backend (Shared Service)
+
+Run db+embeddings(+worker) as a standalone backend; multiple apps connect over Postgres.
+
+```text
+webapp  ─┐
+cli     ─┼──> postgres://.../agi_db  (shared brain)
+jobs    ─┘
+```
+
+### 6) Per-User Brains (Multi-Tenant by DB)
+
+Operate one database per user/agent for strong isolation (recommended over mixing tenants in one schema).
+
+Conceptual flow:
+- `agi_db_alice`, `agi_db_bob`, ...
+- Each app request uses the user’s DSN to read/write their own brain
+
+### 7) Local-First Personal AGI (Everything on One Machine)
+
+Run everything locally (Docker) and point at a local OpenAI-compatible endpoint (e.g. Ollama).
+
+```bash
+docker compose up -d
+agi init   # choose provider=ollama, endpoint=http://localhost:11434/v1
+```
+
+### 8) Cloud Agent Backend (Production)
+
+Use managed Postgres + hosted embeddings/LLM endpoints; scale stateless workers horizontally.
+
+Conceptual flow:
+- Managed Postgres (RDS/Cloud SQL/etc.)
+- `N` workers polling `external_calls` (no shared state beyond DB)
+- App services connect for RAG + observability
+
+### 9) Batch Ingestion + Retrieval (Knowledge Base / RAG)
+
+Treat the system as a durable memory store and retrieval layer for your app.
+
+```bash
+agi ingest --input ./documents
+```
+
+Conceptual flow:
+- Ingest documents into semantic memories
+- Serve `hydrate()` / `recall()` for prompt augmentation
+
+### 10) Evaluation + Replay Harness (Debuggable Cognition)
+
+Use the DB log as an audit trail to test prompts/policies and replay scenarios.
+
+```sql
+-- Inspect recent heartbeats and decisions
+SELECT heartbeat_number, started_at, narrative
+FROM heartbeat_log
+ORDER BY started_at DESC
+LIMIT 20;
+```
+
+### 11) Tool-Gateway Architecture (Safe Side Effects)
+
+Keep the brain in Postgres, but run side effects (email/text/posting) via an explicit outbox consumer.
+
+Conceptual flow:
+- Heartbeat queues outreach into `outbox_messages`
+- A separate delivery service enforces policy, rate limits, and/or human approval
+- Delivery service marks messages `sent/failed` and logs outcomes back to Postgres
 
 ## Architecture
 
@@ -83,27 +258,6 @@ This system provides a comprehensive memory management solution for AGI applicat
   - AGE (graph database)
   - btree_gist
   - pg_trgm
-  - cube
-
-## Dependencies
-
-### Python Requirements
-- asyncpg>=0.29.0 (PostgreSQL async driver)
-- pytest>=7.4.3 (testing framework)
-- numpy>=1.24.0 (numerical operations)
-- fastapi>=0.104.0 (web framework)
-- pydantic>=2.4.2 (data validation)
-
-### Node.js Requirements  
-- @modelcontextprotocol/sdk (MCP framework)
-- pg (PostgreSQL driver)
-
-### Database Extensions
-- pgvector (vector similarity)
-- AGE (graph database)
-- pg_trgm (text search)
-- btree_gist (indexing)
-- cube (multidimensional indexing)
 
 ## Environment Configuration
 
@@ -113,145 +267,172 @@ Copy `.env.local` to `.env` and configure:
 POSTGRES_DB=agi_db           # Database name
 POSTGRES_USER=agi_user       # Database user
 POSTGRES_PASSWORD=agi_password # Database password
-```
-
-For MCP server, also set:
-```bash
 POSTGRES_HOST=localhost      # Database host
-POSTGRES_PORT=5432          # Database port
+POSTGRES_PORT=5432          # Host port to expose Postgres on (change if 5432 is in use)
 ```
 
-## Setup
+If `5432` is already taken (e.g., another local Postgres), set `POSTGRES_PORT=5433` (or any free port).
+
+### Resetting The Database Volume
+
+Schema changes are applied on **fresh DB initialization**. If you already have a DB volume and want to re-initialize from `schema.sql`, reset the volume:
 
 ```bash
-cp .env.local .env # modify the .env file with your own values
+docker compose down -v
 docker compose up -d
 ```
-
-This will:
-1. Start a PostgreSQL instance with all required extensions (pgvector, AGE, etc.)
-2. Initialize the database schema
-3. Create necessary tables, functions, and triggers
 
 ## Testing
 
 Run the test suite with:
 
 ```bash
-pytest test.py -v
+# Ensure services are up first (passive is enough; tests also use embeddings)
+docker compose up -d
+
+# Run tests
+pytest test.py -q
 ```
 
-## API Reference (MCP Tools)
+## Python Dependencies
 
-### Memory Operations
-- `create_memory(type, content, embedding, importance, metadata)` - Create new memories
-- `get_memory(memory_id)` - Retrieve and access specific memory
-- `search_memories_similarity(embedding, limit, threshold)` - Vector similarity search
-- `search_memories_text(query, limit)` - Full-text search
+Install (editable) with dev/test dependencies:
 
-### Cluster Operations  
-- `get_memory_clusters(limit)` - List memory clusters by importance
-- `activate_cluster(cluster_id, context)` - Activate cluster and get memories
-- `create_memory_cluster(name, type, description, keywords)` - Create new cluster
-
-### System Introspection
-- `get_identity_core()` - Retrieve identity model and core clusters
-- `get_worldview()` - Get worldview primitives and beliefs
-- `get_memory_health()` - System health statistics
-- `get_active_themes(days)` - Recently activated themes
-
-## Usage Examples
-
-### Creating Memories
-```python
-# Via MCP tools
-memory = await create_memory(
-    type="episodic",
-    content="User expressed interest in machine learning",
-    embedding=embedding_vector,
-    importance=0.8,
-    metadata={
-        "emotional_valence": 0.6,
-        "context": {"topic": "AI", "user_mood": "curious"}
-    }
-)
+```bash
+pip install -e ".[dev]"
 ```
 
-### Searching Memories
-```python
-# Similarity search
-similar = await search_memories_similarity(
-    embedding=query_vector,
-    limit=10,
-    threshold=0.7
-)
+If you’re in a restricted/offline environment and build isolation can’t download build deps:
 
-# Text search
-results = await search_memories_text(
-    query="machine learning concepts",
-    limit=5
-)
+```bash
+pip install -e ".[dev]" --no-build-isolation
 ```
 
-## Database Schema
+## Docker Helper CLI
 
-### Core Tables
-1. **working_memory**
-   - Temporary storage with automatic expiry
-   - Vector embeddings for similarity search
-   - Priority scoring for attention mechanisms
+If you install the package (`pip install -e .`), you get an `agi` CLI. If you don’t want to install anything, use the repo wrapper `./agi` instead.
 
-2. **memories**
-   - Permanent storage for consolidated memories
-   - Links to specific memory type tables
-   - Metadata tracking (creation, modification, access)
+```bash
+agi up
+agi ps
+agi logs -f
+agi down
+agi init
+agi status
+agi config show
+agi config validate
+agi demo
+agi chat --endpoint http://localhost:11434/v1 --model llama3.2
+agi ingest --input ./documents
+agi worker
+agi mcp
+```
 
-3. **memory_relationships**
-   - Graph-based relationship storage
-   - Bidirectional links between memories
-   - Relationship type classification
+## MCP Server
 
-### Memory Type Tables
-Each specialized memory type has its own table with type-specific fields:
-- episodic_memories
-- semantic_memories
-- procedural_memories
-- strategic_memories
+Expose the `cognitive_memory_api` surface to an LLM/tooling runtime via MCP (stdio).
 
-### Clustering Tables
-- memory_clusters
-- memory_cluster_members
-- cluster_relationships
-- cluster_activation_history
+Run:
 
-### Identity and Worldview Tables
-- identity_model
-- worldview_primitives
-- worldview_memory_influences
-- identity_memory_resonance
+```bash
+agi mcp
+# or: python -m agi_mcp_server
+```
 
-### Indexes and Constraints
-- Vector indexes for similarity search
-- Graph indexes for relationship traversal
-- Temporal indexes for time-based queries
+The server supports batch-style tools like `remember_batch`, `connect_batch`, `hydrate_batch`, and a generic `batch` tool for sequential tool calls.
 
-## Example Queries
+## Heartbeat Worker
 
-### Memory Retrieval
+The autonomous heartbeat runs via a stateless background worker that:
+- polls `external_calls` for pending LLM work
+- triggers scheduled heartbeats (`start_heartbeat()`)
+- executes heartbeat actions and records the result
+
+### Turning The Worker On/Off
+
+You generally want **two modes**:
+
+- **Passive / RAG-only**: use `hydrate()/recall()/remember()` without autonomous execution → run **no worker**
+- **Active / autonomous**: process `external_calls`, run scheduled heartbeats, and do maintenance → run **the worker**
+
+With Docker Compose:
+
+```bash
+# Default (passive mode): start db + embeddings only
+docker compose up -d
+
+# Active mode: start db + embeddings + worker
+docker compose --profile active up -d
+
+# Start only the worker (and its dependencies)
+docker compose --profile active up -d worker
+
+# Stop the worker (container stays)
+docker compose stop worker
+
+# Stop + remove the worker container
+docker compose rm -f worker
+
+# Restart the worker
+docker compose restart worker
+
+# Passive mode: run DB + embeddings only (no worker)
+docker compose up -d db embeddings
+```
+
+### Running Locally (Optional)
+
+You can also run the worker on your host machine (it will connect to Postgres over TCP):
+
+```bash
+agi worker
+```
+
+If you already have an existing DB volume, the schema init scripts won’t re-run automatically. The simplest upgrade path is to reset the DB volume:
+
+```bash
+docker compose down -v
+docker compose up -d
+```
+
+User/public outreach actions are queued into `outbox_messages` for an external delivery integration.
+
+## Outbox Delivery (Side Effects)
+
+High-risk side effects (email/SMS/posting) should be implemented as a separate “delivery adapter” that consumes `outbox_messages`, performs policy/rate-limit/human-approval checks, and marks messages as `sent` or `failed`.
+
+## RabbitMQ (Default Inbox/Outbox Queues)
+
+The Docker stack includes RabbitMQ (management UI + AMQP) as a default “inbox/outbox” transport:
+
+- Management UI: `http://localhost:15672`
+- AMQP: `amqp://localhost:5672`
+- Default credentials: `agi` / `agi_password` (override via `RABBITMQ_DEFAULT_USER` / `RABBITMQ_DEFAULT_PASS`)
+
+When the worker is running with `RABBITMQ_ENABLED=1`, it will:
+- publish pending DB `outbox_messages` to the RabbitMQ queue `agi.outbox`
+- poll `agi.inbox` and insert messages into DB working memory (so the agent can “hear” them)
+
+This gives you a usable outbox/inbox even before you wire real email/SMS/etc. delivery.
+
+Conceptual loop:
+
 ```sql
--- Find similar memories using vector similarity
-SELECT * FROM memories
-WHERE embedding <-> query_embedding < threshold
-ORDER BY embedding <-> query_embedding
+-- Adapter claims pending messages (use SKIP LOCKED in your implementation)
+SELECT id, kind, payload
+FROM outbox_messages
+WHERE status = 'pending'
+ORDER BY created_at
 LIMIT 10;
-
--- Find related memories through graph
-SELECT * FROM ag_catalog.cypher('memory_graph', $$
-    MATCH (m:MemoryNode)-[:RELATES_TO]->(related)
-    WHERE m.id = $memory_id
-    RETURN related
-$$) as (related agtype);
 ```
+
+## Embedding Model + Dimension
+
+The embeddings model and its vector dimension are configured in `docker-compose.yml` via:
+- `EMBEDDING_MODEL_ID`
+- `EMBEDDING_DIMENSION`
+ 
+If you change `EMBEDDING_DIMENSION` on an existing database volume, reset the DB volume so the vector columns and HNSW indexes are created with the correct dimension.
 
 ## Performance Characteristics
 
@@ -309,11 +490,6 @@ Choose the scheduling method that best fits your infrastructure and monitoring c
 - Check memory_health view for system statistics
 - Consider memory pruning if dataset is very large
 
-**MCP Server Issues:**
-- Verify Node.js dependencies: `npm install`
-- Check database connectivity from MCP server
-- Ensure environment variables are set correctly
-
 ## Usage Guide
 
 ### Memory Interaction Flow
@@ -365,7 +541,7 @@ graph TD
 
 ### Key Integration Points
 
-- Use the MCP API for all memory operations
+- Use the Postgres functions (direct SQL) or `cognitive_memory_api.CognitiveMemory`
 - Implement proper error handling for failed operations
 - Monitor memory usage and system performance
 - Regular backup of critical memories
@@ -388,3 +564,7 @@ This database schema is designed for a single AGI instance. Supporting multiple 
 - Additional access controls and memory ownership
 
 If you need multi-AGI support, consider refactoring the schema to include tenant isolation patterns before implementation.
+
+## Architecture (Design Docs)
+
+See `architecture.md` for a consolidated architecture/design document (includes the heartbeat design proposal and the cognitive architecture essay).

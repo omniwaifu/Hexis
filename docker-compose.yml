@@ -10,8 +10,7 @@ services:
       POSTGRES_HOST_AUTH_METHOD: trust 
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # Maps your schema.sql to run on init
-      - ./schema.sql:/docker-entrypoint-initdb.d/init.sql 
+      # schema.sql is baked into the image (see Dockerfile) to avoid bind-mount issues on macOS external drives.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-agi_memory}"]
       interval: 10s
@@ -19,9 +18,38 @@ services:
       retries: 5
       start_period: 30s
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     # Need to modify search_path for AGE to work seamlessly
-    command: ["postgres", "-c", "search_path=ag_catalog,\"$user\",public"]
+    command:
+      - postgres
+      - -c
+      - search_path=ag_catalog,public
+      - -c
+      - app.embedding_dimension=${EMBEDDING_DIMENSION:-768}
+    networks:
+      - public
+      - private
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: agi_rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-agi}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-agi_password}
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - public
+      - private
 
   embeddings:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
@@ -29,11 +57,15 @@ services:
     platform: linux/amd64
     command: 
       - --model-id
-      - unsloth/embeddinggemma-300m
+      - ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
       - --dtype
       - float32
-    ports:
-      - "8080:80"
+    environment:
+      # Centralized embedding config (also used by DB/worker).
+      EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
+    expose:
+      - "80"  # internal-only; reachable from Postgres as http://embeddings:80
     volumes:
       - embeddings_cache:/data
     healthcheck:
@@ -42,7 +74,40 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+    networks:
+      - private
+      - public  # Needed for initial model download from HuggingFace
+
+  worker:
+    profiles: ["active"]
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: agi_worker
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
+      RABBITMQ_ENABLED: "1"
+      RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
+      RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-agi}
+      RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-agi_password}
+    networks:
+      - private
+      - public
 
 volumes:
   postgres_data:
   embeddings_cache:
+  rabbitmq_data:
+
+networks:
+  private:
+    internal: true
+  public:

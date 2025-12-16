@@ -46,3 +46,6 @@ RUN rm -rf /tmp/* && \
     build-essential && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+# Run schema/init on first database startup.
+COPY schema.sql /docker-entrypoint-initdb.d/init.sql

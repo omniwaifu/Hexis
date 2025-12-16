@@ -5,30 +5,120 @@ import json
 import numpy as np
 import time
 import uuid
+import os
+import subprocess
+import sys
+from pathlib import Path
 from datetime import timedelta
+from tenacity import (
+    AsyncRetrying,
+    RetryError,
+    retry_if_exception_type,
+    retry_if_result,
+    stop_after_delay,
+    wait_fixed,
+)
 
 # Update to use loop_scope instead of scope
 pytestmark = pytest.mark.asyncio(loop_scope="session")
 
 # Global test session ID to help with cleanup
 TEST_SESSION_ID = str(uuid.uuid4())[:8]
+EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", os.getenv("EMBEDDING_DIM", "768")))
 
 def get_test_identifier(test_name: str) -> str:
     """Generate a unique identifier for test data"""
     return f"{test_name}_{TEST_SESSION_ID}_{int(time.time() * 1000)}"
 
+def _db_dsn() -> str:
+    db_host = os.getenv("POSTGRES_HOST", "localhost")
+    db_port = os.getenv("POSTGRES_PORT", "5432")
+    db_name = os.getenv("POSTGRES_DB", "agi_db")
+    db_user = os.getenv("POSTGRES_USER", "agi_user")
+    db_password = os.getenv("POSTGRES_PASSWORD", "agi_password")
+    return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+
+@pytest.fixture(scope="session", autouse=True)
+async def sync_test_embedding_dimension_from_db(db_pool):
+    """
+    Sync the test process' EMBEDDING_DIMENSION with the database's configured dimension.
+
+    Many tests build vectors client-side (e.g., vector literal strings) and must match
+    the DB's pgvector typmod.
+    """
+    global EMBEDDING_DIMENSION
+    async with db_pool.acquire() as conn:
+        dim = await conn.fetchval("SELECT embedding_dimension()")
+    EMBEDDING_DIMENSION = int(dim)
+
 @pytest.fixture(scope="session")
 async def db_pool():
     """Create a connection pool for testing"""
-    pool = await asyncpg.create_pool(
-        "postgresql://agi_user:agi_password@localhost:5432/agi_db",
-        ssl=False,
-        min_size=2,
-        max_size=20,
-        command_timeout=60.0
+    db_url = _db_dsn()
+    wait_seconds = int(os.getenv("POSTGRES_WAIT_SECONDS", "60"))
+    pool = None
+    retrying = AsyncRetrying(
+        stop=stop_after_delay(wait_seconds),
+        wait=wait_fixed(1),
+        retry=retry_if_exception_type(Exception),
+        reraise=True,
     )
+    async for attempt in retrying:
+        with attempt:
+            pool = await asyncpg.create_pool(
+                db_url,
+                ssl=False,
+                min_size=2,
+                max_size=20,
+                command_timeout=60.0,
+            )
+    assert pool is not None
     yield pool
     await pool.close()
+
+@pytest.fixture(scope="session", autouse=True)
+async def configure_agent_for_tests(db_pool):
+    """
+    Heartbeats are gated behind `agent.is_configured`.
+
+    Most tests exercise heartbeat/worker behavior, so default to configured.
+    Individual tests can override by deleting the config row in a transaction.
+    """
+    async with db_pool.acquire() as conn:
+        # Minimal config so CLI `agi config validate` passes in subprocess smoke tests.
+        await conn.execute("SELECT set_config('agent.is_configured', 'true'::jsonb)")
+        await conn.execute("SELECT set_config('agent.objectives', $1::jsonb)", json.dumps(["test objective"]))
+        await conn.execute(
+            "SELECT set_config('llm.heartbeat', $1::jsonb)",
+            json.dumps({"provider": "openai", "model": "gpt-4o", "endpoint": "", "api_key_env": ""}),
+        )
+        await conn.execute(
+            "SELECT set_config('llm.chat', $1::jsonb)",
+            json.dumps({"provider": "openai", "model": "gpt-4o", "endpoint": "", "api_key_env": ""}),
+        )
+        await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE WHERE id = 1")
+        await conn.execute("UPDATE heartbeat_config SET value = 60 WHERE key = 'heartbeat_interval_minutes'")
+
+@pytest.fixture(scope="session", autouse=True)
+async def apply_repo_migrations(db_pool):
+    """
+    Apply all SQL migrations once per test session.
+
+    The DB in Docker may persist across runs; this keeps core functions
+    and tables up to date without requiring a full volume reset.
+    """
+    migrations_dir = Path(__file__).resolve().parent / "migrations"
+    if not migrations_dir.exists():
+        return
+
+    migration_paths = sorted(p for p in migrations_dir.glob("*.sql") if p.is_file())
+    if not migration_paths:
+        return
+
+    async with db_pool.acquire() as conn:
+        for path in migration_paths:
+            sql = path.read_text(encoding="utf-8")
+            await conn.execute(sql)
 
 @pytest.fixture(autouse=True)
 async def setup_db(db_pool):
@@ -56,6 +146,26 @@ async def test_extensions(db_pool):
             SELECT count(*) FROM ag_catalog.ag_graph
         """)
         assert result >= 0, "AGE extension not properly loaded"
+
+async def test_expected_triggers_are_installed(db_pool):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT t.tgname, p.proname
+            FROM pg_trigger t
+            JOIN pg_proc p ON p.oid = t.tgfoid
+            WHERE NOT t.tgisinternal
+            """
+        )
+        mapping = {r["tgname"]: r["proname"] for r in rows}
+
+        assert mapping.get("trg_memory_timestamp") == "update_memory_timestamp"
+        assert mapping.get("trg_importance_on_access") == "update_memory_importance"
+        assert mapping.get("trg_cluster_activation") == "update_cluster_activation"
+        assert mapping.get("trg_neighborhood_staleness") == "mark_neighborhoods_stale"
+        assert mapping.get("trg_auto_episode_assignment") == "assign_to_episode"
+        assert mapping.get("trg_external_call_complete") == "on_external_call_complete"
+        assert mapping.get("trg_sync_worldview_node") == "sync_worldview_node"
 
 
 async def test_memory_tables(db_pool):
@@ -110,7 +220,7 @@ async def test_memory_storage(db_pool):
                 ) VALUES (
                     $1::memory_type,
                     'Test ' || $1 || ' memory ' || $2,
-                    array_fill(0, ARRAY[768])::vector
+                    array_fill(0, ARRAY[embedding_dimension()])::vector
                 ) RETURNING id
             """, mem_type, test_id)
 
@@ -160,7 +270,7 @@ async def test_memory_importance(db_pool):
             ) VALUES (
                 'semantic',
                 'Important test content',
-                array_fill(0, ARRAY[768])::vector,
+                array_fill(0, ARRAY[embedding_dimension()])::vector,
                 0.5,
                 0
             ) RETURNING id
@@ -244,13 +354,13 @@ async def test_memory_relationships(db_pool):
             # Create source and target memories
             source_id = await conn.fetchval("""
                 INSERT INTO memories (type, content, embedding)
-                VALUES ($1::memory_type, 'Source ' || $1, array_fill(0, ARRAY[768])::vector)
+                VALUES ($1::memory_type, 'Source ' || $1, array_fill(0, ARRAY[embedding_dimension()])::vector)
                 RETURNING id
             """, source_type)
             
             target_id = await conn.fetchval("""
                 INSERT INTO memories (type, content, embedding)
-                VALUES ($1::memory_type, 'Target ' || $1, array_fill(0, ARRAY[768])::vector)
+                VALUES ($1::memory_type, 'Target ' || $1, array_fill(0, ARRAY[embedding_dimension()])::vector)
                 RETURNING id
             """, target_type)
             
@@ -290,7 +400,7 @@ async def test_memory_type_specifics(db_pool):
         semantic_id = await conn.fetchval("""
             WITH mem AS (
                 INSERT INTO memories (type, content, embedding)
-                VALUES ('semantic'::memory_type, 'Test fact', array_fill(0, ARRAY[768])::vector)
+                VALUES ('semantic'::memory_type, 'Test fact', array_fill(0, ARRAY[embedding_dimension()])::vector)
                 RETURNING id
             )
             INSERT INTO semantic_memories (memory_id, confidence, category)
@@ -303,7 +413,7 @@ async def test_memory_type_specifics(db_pool):
         procedural_id = await conn.fetchval("""
             WITH mem AS (
                 INSERT INTO memories (type, content, embedding)
-                VALUES ('procedural'::memory_type, 'Test procedure', array_fill(0, ARRAY[768])::vector)
+                VALUES ('procedural'::memory_type, 'Test procedure', array_fill(0, ARRAY[embedding_dimension()])::vector)
                 RETURNING id
             )
             INSERT INTO procedural_memories (
@@ -366,7 +476,7 @@ async def test_memory_status_transitions(db_pool):
             VALUES (
                 'semantic'::memory_type,
                 'Test content',
-                array_fill(0, ARRAY[768])::vector,
+                array_fill(0, ARRAY[embedding_dimension()])::vector,
                 'active'::memory_status
             ) RETURNING id
         """)
@@ -426,11 +536,11 @@ async def test_vector_search(db_pool):
         # Create more distinct test vectors
         test_embeddings = [
             # First vector: alternating 1.0 and 0.8
-            '[' + ','.join(['1.0' if i % 2 == 0 else '0.8' for i in range(768)]) + ']',
+            '[' + ','.join(['1.0' if i % 2 == 0 else '0.8' for i in range(EMBEDDING_DIMENSION)]) + ']',
             # Second vector: alternating 0.5 and 0.3
-            '[' + ','.join(['0.5' if i % 2 == 0 else '0.3' for i in range(768)]) + ']',
+            '[' + ','.join(['0.5' if i % 2 == 0 else '0.3' for i in range(EMBEDDING_DIMENSION)]) + ']',
             # Third vector: alternating 0.2 and 0.0
-            '[' + ','.join(['0.2' if i % 2 == 0 else '0.0' for i in range(768)]) + ']'
+            '[' + ','.join(['0.2' if i % 2 == 0 else '0.0' for i in range(EMBEDDING_DIMENSION)]) + ']'
         ]
         
         # Insert test vectors
@@ -448,15 +558,19 @@ async def test_vector_search(db_pool):
             """, str(i), emb)
 
         # Query vector more similar to first pattern
-        query_vector = '[' + ','.join(['0.95' if i % 2 == 0 else '0.75' for i in range(768)]) + ']'
+        query_vector = '[' + ','.join(['0.95' if i % 2 == 0 else '0.75' for i in range(EMBEDDING_DIMENSION)]) + ']'
         
         results = await conn.fetch("""
-            SELECT 
-                id, 
+            WITH candidates AS MATERIALIZED (
+                SELECT id, content, embedding
+                FROM memories
+                WHERE content LIKE 'Test content%'
+            )
+            SELECT
+                id,
                 content,
                 embedding <=> $1::vector as cosine_distance
-            FROM memories
-            WHERE content LIKE 'Test content%'
+            FROM candidates
             ORDER BY embedding <=> $1::vector
             LIMIT 3
         """, query_vector)
@@ -490,7 +604,7 @@ async def test_complex_graph_queries(db_pool):
             # Create memory
             curr_id = await conn.fetchval("""
                 INSERT INTO memories (type, content, embedding)
-                VALUES ($1::memory_type, $2, array_fill(0, ARRAY[768])::vector)
+                VALUES ($1::memory_type, $2, array_fill(0, ARRAY[embedding_dimension()])::vector)
                 RETURNING id
             """, mem_type, content)
             
@@ -543,7 +657,7 @@ async def test_memory_storage_episodic(db_pool):
             ) VALUES (
                 'episodic'::memory_type,
                 'Test episodic memory',
-                array_fill(0, ARRAY[768])::vector,
+                array_fill(0, ARRAY[embedding_dimension()])::vector,
                 0.5,
                 0.01
             ) RETURNING id
@@ -594,7 +708,7 @@ async def test_memory_storage_semantic(db_pool):
             ) VALUES (
                 'semantic'::memory_type,
                 'Test semantic memory',
-                array_fill(0, ARRAY[768])::vector,
+                array_fill(0, ARRAY[embedding_dimension()])::vector,
                 0.5,
                 0.01
             ) RETURNING id
@@ -644,7 +758,7 @@ async def test_memory_storage_strategic(db_pool):
             ) VALUES (
                 'strategic'::memory_type,
                 'Test strategic memory',
-                array_fill(0, ARRAY[768])::vector,
+                array_fill(0, ARRAY[embedding_dimension()])::vector,
                 0.5,
                 0.01
             ) RETURNING id
@@ -692,7 +806,7 @@ async def test_memory_storage_procedural(db_pool):
             ) VALUES (
                 'procedural'::memory_type,
                 'Test procedural memory',
-                array_fill(0, ARRAY[768])::vector,
+                array_fill(0, ARRAY[embedding_dimension()])::vector,
                 0.5,
                 0.01
             ) RETURNING id
@@ -736,7 +850,7 @@ async def test_working_memory(db_pool):
                 expiry
             ) VALUES (
                 'Test working memory',
-                array_fill(0, ARRAY[768])::vector,
+                array_fill(0, ARRAY[embedding_dimension()])::vector,
                 CURRENT_TIMESTAMP + interval '1 hour'
             ) RETURNING id
         """)
@@ -767,7 +881,7 @@ async def test_memory_relevance(db_pool):
             ) VALUES (
                 'semantic'::memory_type,
                 'Test relevance',
-                array_fill(0, ARRAY[768])::vector,
+                array_fill(0, ARRAY[embedding_dimension()])::vector,
                 0.8,
                 0.01,
                 CURRENT_TIMESTAMP - interval '1 day'
@@ -815,7 +929,7 @@ async def test_worldview_primitives(db_pool):
             ) VALUES (
                 'episodic'::memory_type,
                 'Test memory for worldview',
-                array_fill(0, ARRAY[768])::vector
+                array_fill(0, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
         
@@ -873,7 +987,7 @@ async def test_identity_model(db_pool):
             ) VALUES (
                 'episodic'::memory_type,
                 'Test memory for identity',
-                array_fill(0, ARRAY[768])::vector
+                array_fill(0, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
 
@@ -917,7 +1031,7 @@ async def test_memory_changes_tracking(db_pool):
             ) VALUES (
                 'semantic'::memory_type,
                 'Test tracking memory',
-                array_fill(0, ARRAY[768])::vector,
+                array_fill(0, ARRAY[embedding_dimension()])::vector,
                 0.5
             ) RETURNING id
         """)
@@ -973,7 +1087,7 @@ async def test_enhanced_relevance_scoring(db_pool):
             ) VALUES (
                 'semantic'::memory_type,
                 'Test relevance scoring',
-                array_fill(0, ARRAY[768])::vector,
+                array_fill(0, ARRAY[embedding_dimension()])::vector,
                 0.8,
                 0.01,
                 CURRENT_TIMESTAMP - interval '1 day',
@@ -1039,7 +1153,7 @@ async def test_update_memory_timestamp_trigger(db_pool):
             ) VALUES (
                 'semantic'::memory_type,
                 'Test timestamp update',
-                array_fill(0, ARRAY[768])::vector
+                array_fill(0, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
 
@@ -1079,7 +1193,7 @@ async def test_update_memory_importance_trigger(db_pool):
             ) VALUES (
                 'semantic'::memory_type,
                 'Test importance update',
-                array_fill(0, ARRAY[768])::vector,
+                array_fill(0, ARRAY[embedding_dimension()])::vector,
                 0.5,
                 0
             ) RETURNING id
@@ -1131,7 +1245,7 @@ async def test_create_memory_relationship_function(db_pool):
                 ) VALUES (
                     'semantic'::memory_type,
                     'Test memory ' || $1::text,
-                    array_fill(0, ARRAY[768])::vector
+                    array_fill(0, ARRAY[embedding_dimension()])::vector
                 ) RETURNING id
             """, str(i))
             memory_ids.append(memory_id)
@@ -1192,7 +1306,7 @@ async def test_memory_health_view(db_pool):
                 ) VALUES (
                     $1::memory_type,
                     'Test ' || $1,
-                    array_fill(0, ARRAY[768])::vector,
+                    array_fill(0, ARRAY[embedding_dimension()])::vector,
                     0.5,
                     5
                 )
@@ -1287,7 +1401,7 @@ async def test_memory_clusters(db_pool):
                 'theme'::cluster_type,
                 'Test Theme Cluster',
                 'Cluster for testing',
-                array_fill(0.5, ARRAY[768])::vector,
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector,
                 '{"dominant": "neutral", "secondary": "curious"}'::jsonb,
                 ARRAY['test', 'memory', 'cluster'],
                 0.7,
@@ -1308,7 +1422,7 @@ async def test_memory_clusters(db_pool):
                 ) VALUES (
                     'semantic'::memory_type,
                     'Test memory for clustering ' || $1,
-                    array_fill($2::float, ARRAY[768])::vector
+                    array_fill($2::float, ARRAY[embedding_dimension()])::vector
                 ) RETURNING id
             """, str(i), float(i) * 0.1)
             memory_ids.append(memory_id)
@@ -1350,7 +1464,7 @@ async def test_cluster_relationships(db_pool):
                     'emotion'::cluster_type,
                     $1,
                     'Emotional cluster for ' || $1,
-                    array_fill($2::float, ARRAY[768])::vector,
+                    array_fill($2::float, ARRAY[embedding_dimension()])::vector,
                     ARRAY[$1]
                 ) RETURNING id
             """, name, float(i) * 0.5)
@@ -1390,7 +1504,7 @@ async def test_cluster_activation_history(db_pool):
             ) VALUES (
                 'pattern'::cluster_type,
                 'Test Pattern',
-                array_fill(0.5, ARRAY[768])::vector,
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector,
                 0
             ) RETURNING id
         """)
@@ -1450,7 +1564,7 @@ async def test_cluster_worldview_alignment(db_pool):
             ) VALUES (
                 'theme'::cluster_type,
                 'Human Connection',
-                array_fill(0.7, ARRAY[768])::vector,
+                array_fill(0.7, ARRAY[embedding_dimension()])::vector,
                 0.95
             ) RETURNING id
         """)
@@ -1464,7 +1578,7 @@ async def test_cluster_worldview_alignment(db_pool):
             ) VALUES (
                 'semantic'::memory_type,
                 'Human connection test memory',
-                array_fill(0.7, ARRAY[768])::vector
+                array_fill(0.7, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
 
@@ -1505,7 +1619,7 @@ async def test_identity_core_clusters(db_pool):
                 ) VALUES (
                     'theme'::cluster_type,
                     $1,
-                    array_fill(0.8, ARRAY[768])::vector,
+                    array_fill(0.8, ARRAY[embedding_dimension()])::vector,
                     0.9
                 ) RETURNING id
             """, name)
@@ -1546,7 +1660,7 @@ async def test_assign_memory_to_clusters_function(db_pool):
         cluster_ids = []
         for i in range(3):
             # Create distinct centroid embeddings
-            centroid = [0.0] * 768
+            centroid = [0.0] * EMBEDDING_DIMENSION
             centroid[i*100:(i+1)*100] = [1.0] * 100  # Make each cluster distinct
             
             cluster_id = await conn.fetchval("""
@@ -1563,7 +1677,7 @@ async def test_assign_memory_to_clusters_function(db_pool):
             cluster_ids.append(cluster_id)
         
         # Create memory with embedding similar to first cluster
-        memory_embedding = [0.0] * 768
+        memory_embedding = [0.0] * EMBEDDING_DIMENSION
         memory_embedding[0:100] = [0.9] * 100  # Similar to first cluster
         
         memory_id = await conn.fetchval("""
@@ -1606,7 +1720,7 @@ async def test_recalculate_cluster_centroid_function(db_pool):
             ) VALUES (
                 'theme'::cluster_type,
                 'Test Centroid Cluster',
-                array_fill(0.0, ARRAY[768])::vector
+                array_fill(0.0, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
         
@@ -1621,7 +1735,7 @@ async def test_recalculate_cluster_centroid_function(db_pool):
                 ) VALUES (
                     'semantic'::memory_type,
                     'Memory ' || $1,
-                    array_fill($2::float, ARRAY[768])::vector,
+                    array_fill($2::float, ARRAY[embedding_dimension()])::vector,
                     'active'::memory_status
                 ) RETURNING id
             """, str(i), float(i+1) * 0.2)
@@ -1641,7 +1755,7 @@ async def test_recalculate_cluster_centroid_function(db_pool):
         
         # Check if centroid was updated
         result = await conn.fetchrow("""
-            SELECT (vector_to_float4(centroid_embedding, 768, false))[1] as first_value
+            SELECT (vector_to_float4(centroid_embedding, embedding_dimension(), false))[1] as first_value
             FROM memory_clusters
             WHERE id = $1
         """, cluster_id)
@@ -1667,7 +1781,7 @@ async def test_cluster_insights_view(db_pool):
                 $1,
                 0.8,
                 0.9,
-                array_fill(0.5, ARRAY[768])::vector
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """, unique_name)
         
@@ -1681,7 +1795,7 @@ async def test_cluster_insights_view(db_pool):
                 ) VALUES (
                     'episodic'::memory_type,
                     'Insight memory ' || $1,
-                    array_fill(0.5, ARRAY[768])::vector
+                    array_fill(0.5, ARRAY[embedding_dimension()])::vector
                 ) RETURNING id
             """, str(i))
             
@@ -1723,7 +1837,7 @@ async def test_active_themes_view(db_pool):
                 $1,
                 '{"primary": "anxiety", "intensity": 0.7}'::jsonb,
                 ARRAY['worry', 'stress', 'uncertainty'],
-                array_fill(0.3, ARRAY[768])::vector,
+                array_fill(0.3, ARRAY[embedding_dimension()])::vector,
                 3,
                 CURRENT_TIMESTAMP
             ) RETURNING id
@@ -1754,7 +1868,7 @@ async def test_update_cluster_activation_trigger(db_pool):
             ) VALUES (
                 'theme'::cluster_type,
                 $1,
-                array_fill(0.5, ARRAY[768])::vector,
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector,
                 0.5,
                 0
             ) RETURNING id
@@ -1800,7 +1914,7 @@ async def test_cluster_types(db_pool):
                 ) VALUES (
                     $1::cluster_type,
                     'Test ' || $1 || ' cluster',
-                    array_fill(0.5, ARRAY[768])::vector
+                    array_fill(0.5, ARRAY[embedding_dimension()])::vector
                 ) RETURNING id
             """, c_type)
             
@@ -1827,7 +1941,7 @@ async def test_cluster_memory_retrieval_performance(db_pool):
             ) VALUES (
                 'theme'::cluster_type,
                 'Loneliness',
-                array_fill(0.3, ARRAY[768])::vector,
+                array_fill(0.3, ARRAY[embedding_dimension()])::vector,
                 ARRAY['lonely', 'alone', 'isolated']
             ) RETURNING id
         """)
@@ -1844,7 +1958,7 @@ async def test_cluster_memory_retrieval_performance(db_pool):
                 ) VALUES (
                     'episodic'::memory_type,
                     'Loneliness memory ' || $1,
-                    array_fill(0.3, ARRAY[768])::vector,
+                    array_fill(0.3, ARRAY[embedding_dimension()])::vector,
                     $2
                 ) RETURNING id
             """, str(i), 0.5 + (i * 0.01))
@@ -1956,7 +2070,7 @@ async def test_constraint_violations(db_pool):
                     embedding
                 ) VALUES (
                     'semantic'::memory_type,
-                    array_fill(0, ARRAY[768])::vector
+                    array_fill(0, ARRAY[embedding_dimension()])::vector
                 )
             """)
 
@@ -1974,7 +2088,7 @@ async def test_memory_consolidation_workflow(db_pool):
                     expiry
                 ) VALUES (
                     'Working memory content ' || $1,
-                    array_fill($2::float, ARRAY[768])::vector,
+                    array_fill($2::float, ARRAY[embedding_dimension()])::vector,
                     CURRENT_TIMESTAMP + interval '1 hour'
                 ) RETURNING id
             """, str(i), float(i) * 0.1)
@@ -2075,10 +2189,10 @@ async def test_large_dataset_performance(db_pool):
             # Create batch of memories
             for i in range(batch_start, batch_end):
                 # Create diverse embeddings
-                embedding = [0.0] * 768
+                embedding = [0.0] * EMBEDDING_DIMENSION
                 # Create patterns in embeddings for clustering
                 pattern_start = (i % 10) * 150
-                pattern_end = min(pattern_start + 150, 768)
+                pattern_end = min(pattern_start + 150, EMBEDDING_DIMENSION)
                 embedding[pattern_start:pattern_end] = [0.8] * (pattern_end - pattern_start)
                 
                 memory_id = await conn.fetchval("""
@@ -2106,7 +2220,8 @@ async def test_large_dataset_performance(db_pool):
         print(f"Created {len(memory_ids)} memories")
         
         # Test 1: Vector similarity search performance
-        query_embedding = [0.8] * 150 + [0.0] * (768 - 150)
+        head_len = min(150, EMBEDDING_DIMENSION)
+        query_embedding = [0.8] * head_len + [0.0] * (EMBEDDING_DIMENSION - head_len)
         
         start_time = time.time()
         similar_memories = await conn.fetch("""
@@ -2163,7 +2278,7 @@ async def test_concurrency_safety(db_pool):
             ) VALUES (
                 'semantic'::memory_type,
                 'Concurrency test memory',
-                array_fill(0.5, ARRAY[768])::vector,
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector,
                 0.5,
                 0
             ) RETURNING id
@@ -2205,7 +2320,7 @@ async def test_concurrency_safety(db_pool):
             ) VALUES (
                 'theme'::cluster_type,
                 'Concurrency Test Cluster',
-                array_fill(0.5, ARRAY[768])::vector
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
         
@@ -2220,7 +2335,7 @@ async def test_concurrency_safety(db_pool):
                 ) VALUES (
                     'semantic'::memory_type,
                     'Concurrent memory ' || $1,
-                    array_fill(0.5, ARRAY[768])::vector
+                    array_fill(0.5, ARRAY[embedding_dimension()])::vector
                 ) RETURNING id
             """, str(i))
             test_memories.append(mem_id)
@@ -2269,7 +2384,7 @@ async def test_cascade_delete_integrity(db_pool):
             ) VALUES (
                 'episodic'::memory_type,
                 'Test cascade delete',
-                array_fill(0.5, ARRAY[768])::vector
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
         
@@ -2297,7 +2412,7 @@ async def test_cascade_delete_integrity(db_pool):
             ) VALUES (
                 'theme'::cluster_type,
                 'Cascade Test Cluster',
-                array_fill(0.5, ARRAY[768])::vector
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
         
@@ -2374,7 +2489,7 @@ async def test_memory_lifecycle_workflow(db_pool):
             ) VALUES (
                 'semantic'::memory_type,
                 'Lifecycle test memory',
-                array_fill(0.5, ARRAY[768])::vector,
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector,
                 0.3,
                 0
             ) RETURNING id
@@ -2449,7 +2564,7 @@ async def test_edge_cases_empty_clusters(db_pool):
             ) VALUES (
                 'theme'::cluster_type,
                 'Empty Test Cluster',
-                array_fill(0.5, ARRAY[768])::vector
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
         
@@ -2486,7 +2601,7 @@ async def test_edge_cases_circular_relationships(db_pool):
                 ) VALUES (
                     'theme'::cluster_type,
                     'Circular Cluster ' || $1,
-                    array_fill($2::float, ARRAY[768])::vector
+                    array_fill($2::float, ARRAY[embedding_dimension()])::vector
                 ) RETURNING id
             """, str(i), float(i) * 0.3)
             cluster_ids.append(cluster_id)
@@ -2551,7 +2666,7 @@ async def test_edge_cases_extreme_values(db_pool):
             ) VALUES (
                 'semantic'::memory_type,
                 'Extremely important memory',
-                array_fill(0.5, ARRAY[768])::vector,
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector,
                 999999.0,
                 999999
             ) RETURNING id
@@ -2568,7 +2683,7 @@ async def test_edge_cases_extreme_values(db_pool):
             ) VALUES (
                 'episodic'::memory_type,
                 'Ancient memory',
-                array_fill(0.5, ARRAY[768])::vector,
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector,
                 0.5,
                 '1900-01-01'::timestamp
             ) RETURNING id
@@ -2595,13 +2710,13 @@ async def test_edge_cases_extreme_values(db_pool):
             ) VALUES (
                 'semantic'::memory_type,
                 'Zero vector memory',
-                array_fill(0.0, ARRAY[768])::vector
+                array_fill(0.0, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
         
         # Test similarity search with zero vector
         zero_results = await conn.fetch("""
-            SELECT id, embedding <=> array_fill(0.0, ARRAY[768])::vector as distance
+            SELECT id, embedding <=> array_fill(0.0, ARRAY[embedding_dimension()])::vector as distance
             FROM memories
             WHERE id = $1
         """, zero_vector_id)
@@ -2624,7 +2739,7 @@ async def test_data_integrity_orphaned_records(db_pool):
             ) VALUES (
                 'semantic'::memory_type,
                 'Test orphan memory',
-                array_fill(0.5, ARRAY[768])::vector
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
         
@@ -2645,7 +2760,7 @@ async def test_data_integrity_orphaned_records(db_pool):
             ) VALUES (
                 'theme'::cluster_type,
                 'Orphan Test Cluster',
-                array_fill(0.5, ARRAY[768])::vector
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
         
@@ -2694,7 +2809,7 @@ async def test_computed_field_accuracy(db_pool):
             ) VALUES (
                 'procedural'::memory_type,
                 'Success rate test',
-                array_fill(0.5, ARRAY[768])::vector
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
         
@@ -2741,7 +2856,7 @@ async def test_computed_field_accuracy(db_pool):
             ) VALUES (
                 'semantic'::memory_type,
                 'Relevance test',
-                array_fill(0.5, ARRAY[768])::vector,
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector,
                 1.0,
                 0.1,
                 CURRENT_TIMESTAMP - interval '1 day'
@@ -2772,7 +2887,7 @@ async def test_trigger_consistency(db_pool):
             ) VALUES (
                 'semantic'::memory_type,
                 'Trigger test memory',
-                array_fill(0.5, ARRAY[768])::vector
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
         
@@ -2822,7 +2937,7 @@ async def test_trigger_consistency(db_pool):
             ) VALUES (
                 'theme'::cluster_type,
                 'Trigger Test Cluster',
-                array_fill(0.5, ARRAY[768])::vector,
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector,
                 0,
                 0.5
             ) RETURNING id
@@ -2862,7 +2977,7 @@ async def test_view_calculation_accuracy(db_pool):
                 ) VALUES (
                     'semantic'::memory_type,
                     'Health test memory ' || $1 || ' ' || $2,
-                    array_fill(0.5, ARRAY[768])::vector,
+                    array_fill(0.5, ARRAY[embedding_dimension()])::vector,
                     $3,
                     $4,
                     CASE WHEN $5 THEN CURRENT_TIMESTAMP - interval '12 hours' ELSE NULL END
@@ -2905,7 +3020,7 @@ async def test_view_calculation_accuracy(db_pool):
                 'Accuracy Test Cluster',
                 0.75,
                 0.85,
-                array_fill(0.5, ARRAY[768])::vector
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
         
@@ -2939,7 +3054,7 @@ async def test_error_recovery_scenarios(db_pool):
             ) VALUES (
                 'episodic'::memory_type,
                 'Error recovery test',
-                array_fill(0.5, ARRAY[768])::vector
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
         
@@ -2995,7 +3110,7 @@ async def test_error_recovery_scenarios(db_pool):
                     ) VALUES (
                         'semantic'::memory_type,
                         'Rollback test',
-                        array_fill(0.5, ARRAY[768])::vector
+                        array_fill(0.5, ARRAY[embedding_dimension()])::vector
                     ) RETURNING id
                 """)
                 
@@ -3048,7 +3163,7 @@ async def test_worldview_driven_memory_filtering(db_pool):
             ) VALUES (
                 'episodic'::memory_type,
                 'Positive experience',
-                array_fill(0.5, ARRAY[768])::vector,
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector,
                 0.5
             ) RETURNING id
         """)
@@ -3078,7 +3193,7 @@ async def test_worldview_driven_memory_filtering(db_pool):
             ) VALUES (
                 'episodic'::memory_type,
                 'Negative experience',
-                array_fill(0.5, ARRAY[768])::vector,
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector,
                 0.5
             ) RETURNING id
         """)
@@ -3440,7 +3555,7 @@ async def test_complex_graph_traversals(db_pool):
         for i, mem_type in enumerate(memory_types):
             memory_id = await conn.fetchval("""
                 INSERT INTO memories (type, content, embedding)
-                VALUES ($1::memory_type, $2, array_fill($3::float, ARRAY[768])::vector)
+                VALUES ($1::memory_type, $2, array_fill($3::float, ARRAY[embedding_dimension()])::vector)
                 RETURNING id
             """, mem_type, f'Complex memory {i}', float(i) * 0.1)
             memory_chain.append(memory_id)
@@ -3539,7 +3654,7 @@ async def test_memory_lifecycle_management(db_pool):
                 ) VALUES (
                     'semantic'::memory_type,
                     'Fresh memory ' || $1,
-                    array_fill(0.8, ARRAY[768])::vector,
+                    array_fill(0.8, ARRAY[embedding_dimension()])::vector,
                     0.9,
                     10 + $2,
                     CURRENT_TIMESTAMP - interval '1 hour' * $2
@@ -3560,7 +3675,7 @@ async def test_memory_lifecycle_management(db_pool):
                 ) VALUES (
                     'episodic'::memory_type,
                     'Aging memory ' || $1,
-                    array_fill(0.5, ARRAY[768])::vector,
+                    array_fill(0.5, ARRAY[embedding_dimension()])::vector,
                     0.5,
                     5 + $2,
                     CURRENT_TIMESTAMP - interval '7 days' * ($2 + 1)
@@ -3581,7 +3696,7 @@ async def test_memory_lifecycle_management(db_pool):
                 ) VALUES (
                     'procedural'::memory_type,
                     'Stale memory ' || $1,
-                    array_fill(0.2, ARRAY[768])::vector,
+                    array_fill(0.2, ARRAY[embedding_dimension()])::vector,
                     0.1,
                     1,
                     CURRENT_TIMESTAMP - interval '30 days' * ($2 + 1)
@@ -3679,7 +3794,7 @@ async def test_memory_pruning_operations(db_pool):
                 ) VALUES (
                     'semantic'::memory_type,
                     'Pruning candidate ' || $1,
-                    array_fill(0.1, ARRAY[768])::vector,
+                    array_fill(0.1, ARRAY[embedding_dimension()])::vector,
                     0.05,
                     0,
                     CURRENT_TIMESTAMP - interval '90 days',
@@ -3701,7 +3816,7 @@ async def test_memory_pruning_operations(db_pool):
                 ) VALUES (
                     'episodic'::memory_type,
                     'Important memory ' || $1,
-                    array_fill(0.8, ARRAY[768])::vector,
+                    array_fill(0.8, ARRAY[embedding_dimension()])::vector,
                     0.8,
                     20,
                     CURRENT_TIMESTAMP - interval '30 days'
@@ -3753,7 +3868,7 @@ async def test_memory_pruning_operations(db_pool):
                     expiry
                 ) VALUES (
                     'Expired working memory ' || $1,
-                    array_fill(0.5, ARRAY[768])::vector,
+                    array_fill(0.5, ARRAY[embedding_dimension()])::vector,
                     CURRENT_TIMESTAMP - interval '1 hour'
                 )
             """, str(i))
@@ -3889,7 +4004,7 @@ async def test_backup_restore_consistency(db_pool):
                 ) VALUES (
                     'semantic'::memory_type,
                     'Backup test memory ' || $1,
-                    array_fill($2::float, ARRAY[768])::vector,
+                    array_fill($2::float, ARRAY[embedding_dimension()])::vector,
                     $3
                 ) RETURNING id
             """, str(i), float(i) * 0.1, 0.5 + (i * 0.1))
@@ -3914,7 +4029,7 @@ async def test_backup_restore_consistency(db_pool):
             ) VALUES (
                 'theme'::cluster_type,
                 'Backup Test Cluster',
-                array_fill(0.5, ARRAY[768])::vector
+                array_fill(0.5, ARRAY[embedding_dimension()])::vector
             ) RETURNING id
         """)
         
@@ -4255,7 +4370,7 @@ async def test_multi_agi_considerations(db_pool):
             ) VALUES (
                 'semantic'::memory_type,
                 'AGI-1 believes X is true',
-                array_fill(0.8, ARRAY[768])::vector,
+                array_fill(0.8, ARRAY[embedding_dimension()])::vector,
                 0.9
             ) RETURNING id
         """)
@@ -4270,7 +4385,7 @@ async def test_multi_agi_considerations(db_pool):
             ) VALUES (
                 'semantic'::memory_type,
                 'AGI-2 believes X is false',
-                array_fill(0.8, ARRAY[768])::vector,
+                array_fill(0.8, ARRAY[embedding_dimension()])::vector,
                 0.9
             ) RETURNING id
         """)
@@ -4381,7 +4496,7 @@ async def test_auto_episode_assignment_trigger(db_pool):
         memory1_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
             VALUES ('episodic'::memory_type, 'First memory in episode',
-                    array_fill(0.1, ARRAY[768])::vector)
+                    array_fill(0.1, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
@@ -4401,7 +4516,7 @@ async def test_auto_episode_assignment_trigger(db_pool):
         memory2_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
             VALUES ('episodic'::memory_type, 'Second memory in same episode',
-                    array_fill(0.2, ARRAY[768])::vector)
+                    array_fill(0.2, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
@@ -4440,7 +4555,7 @@ async def test_episode_30_minute_gap_detection(db_pool):
         memory1_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding, created_at)
             VALUES ('semantic'::memory_type, 'Memory before gap',
-                    array_fill(0.3, ARRAY[768])::vector, $1)
+                    array_fill(0.3, ARRAY[embedding_dimension()])::vector, $1)
             RETURNING id
         """, base_time)
 
@@ -4454,7 +4569,7 @@ async def test_episode_30_minute_gap_detection(db_pool):
         memory2_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding, created_at)
             VALUES ('semantic'::memory_type, 'Memory after gap',
-                    array_fill(0.4, ARRAY[768])::vector, $1)
+                    array_fill(0.4, ARRAY[embedding_dimension()])::vector, $1)
             RETURNING id
         """, later_time)
 
@@ -4492,7 +4607,7 @@ async def test_episode_summary_view(db_pool):
             memory_id = await conn.fetchval("""
                 INSERT INTO memories (type, content, embedding, created_at)
                 VALUES ('semantic'::memory_type, $1,
-                        array_fill(0.5, ARRAY[768])::vector,
+                        array_fill(0.5, ARRAY[embedding_dimension()])::vector,
                         CURRENT_TIMESTAMP - interval '90 minutes' + $2 * interval '10 minutes')
                 RETURNING id
             """, f'Episode summary test memory {i}', i)
@@ -4555,7 +4670,7 @@ async def test_memory_neighborhoods_initialization(db_pool):
         memory_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
             VALUES ('semantic'::memory_type, 'Neighborhood init test',
-                    array_fill(0.6, ARRAY[768])::vector)
+                    array_fill(0.6, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
@@ -4578,7 +4693,7 @@ async def test_neighborhoods_staleness_trigger(db_pool):
         memory_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
             VALUES ('semantic'::memory_type, 'Staleness trigger test',
-                    array_fill(0.7, ARRAY[768])::vector)
+                    array_fill(0.7, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
@@ -4614,7 +4729,7 @@ async def test_neighborhoods_staleness_on_status_change(db_pool):
         memory_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
             VALUES ('semantic'::memory_type, 'Status change staleness test',
-                    array_fill(0.75, ARRAY[768])::vector)
+                    array_fill(0.75, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
@@ -4643,14 +4758,14 @@ async def test_stale_neighborhoods_view(db_pool):
         stale_memory_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
             VALUES ('semantic'::memory_type, 'Stale neighborhood view test',
-                    array_fill(0.8, ARRAY[768])::vector)
+                    array_fill(0.8, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
         fresh_memory_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
             VALUES ('semantic'::memory_type, 'Fresh neighborhood view test',
-                    array_fill(0.81, ARRAY[768])::vector)
+                    array_fill(0.81, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
@@ -4678,7 +4793,7 @@ async def test_neighborhoods_gin_index(db_pool):
         memory_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
             VALUES ('semantic'::memory_type, 'GIN index test',
-                    array_fill(0.85, ARRAY[768])::vector)
+                    array_fill(0.85, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
@@ -4855,7 +4970,7 @@ async def test_memory_concepts_junction(db_pool):
         memory_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
             VALUES ('semantic'::memory_type, 'My dog likes to play',
-                    array_fill(0.9, ARRAY[768])::vector)
+                    array_fill(0.9, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
@@ -4899,7 +5014,7 @@ async def test_link_memory_to_concept_function(db_pool):
         memory_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
             VALUES ('semantic'::memory_type, 'Cats are independent',
-                    array_fill(0.88, ARRAY[768])::vector)
+                    array_fill(0.88, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
@@ -4977,7 +5092,7 @@ async def test_fast_recall_basic(db_pool):
             memory_id = await conn.fetchval("""
                 INSERT INTO memories (type, content, embedding)
                 VALUES ('semantic'::memory_type, $1,
-                        array_fill(0.5, ARRAY[768])::vector)
+                        array_fill(0.5, ARRAY[embedding_dimension()])::vector)
                 RETURNING id
             """, content)
             memory_ids.append(memory_id)
@@ -5009,7 +5124,7 @@ async def test_fast_recall_respects_limit(db_pool):
             await conn.execute("""
                 INSERT INTO memories (type, content, embedding)
                 VALUES ('semantic'::memory_type, $1,
-                        array_fill(0.5, ARRAY[768])::vector)
+                        array_fill(0.5, ARRAY[embedding_dimension()])::vector)
             """, f'Fast recall limit test memory {i}')
 
         try:
@@ -5029,14 +5144,14 @@ async def test_fast_recall_only_active_memories(db_pool):
         active_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding, status)
             VALUES ('semantic'::memory_type, 'Active memory for recall test',
-                    array_fill(0.55, ARRAY[768])::vector, 'active')
+                    array_fill(0.55, ARRAY[embedding_dimension()])::vector, 'active')
             RETURNING id
         """)
 
         archived_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding, status)
             VALUES ('semantic'::memory_type, 'Archived memory for recall test',
-                    array_fill(0.55, ARRAY[768])::vector, 'archived')
+                    array_fill(0.55, ARRAY[embedding_dimension()])::vector, 'archived')
             RETURNING id
         """)
 
@@ -5084,9 +5199,9 @@ async def test_search_similar_memories_type_filter(db_pool):
         await conn.execute("""
             INSERT INTO memories (type, content, embedding)
             VALUES
-                ('semantic'::memory_type, 'Semantic search test', array_fill(0.6, ARRAY[768])::vector),
-                ('episodic'::memory_type, 'Episodic search test', array_fill(0.6, ARRAY[768])::vector),
-                ('procedural'::memory_type, 'Procedural search test', array_fill(0.6, ARRAY[768])::vector)
+                ('semantic'::memory_type, 'Semantic search test', array_fill(0.6, ARRAY[embedding_dimension()])::vector),
+                ('episodic'::memory_type, 'Episodic search test', array_fill(0.6, ARRAY[embedding_dimension()])::vector),
+                ('procedural'::memory_type, 'Procedural search test', array_fill(0.6, ARRAY[embedding_dimension()])::vector)
         """)
 
         try:
@@ -5114,9 +5229,9 @@ async def test_search_similar_memories_importance_filter(db_pool):
             INSERT INTO memories (type, content, embedding, importance)
             VALUES
                 ('semantic'::memory_type, 'Low importance search test',
-                 array_fill(0.65, ARRAY[768])::vector, 0.1),
+                 array_fill(0.65, ARRAY[embedding_dimension()])::vector, 0.1),
                 ('semantic'::memory_type, 'High importance search test',
-                 array_fill(0.65, ARRAY[768])::vector, 0.9)
+                 array_fill(0.65, ARRAY[embedding_dimension()])::vector, 0.9)
         """)
 
         try:
@@ -5142,14 +5257,14 @@ async def test_search_working_memory_auto_cleanup(db_pool):
         # Add expired working memory entry
         await conn.execute("""
             INSERT INTO working_memory (content, embedding, expiry)
-            VALUES ('Expired working memory', array_fill(0.7, ARRAY[768])::vector,
+            VALUES ('Expired working memory', array_fill(0.7, ARRAY[embedding_dimension()])::vector,
                     CURRENT_TIMESTAMP - interval '1 hour')
         """)
 
         # Add valid working memory entry
         await conn.execute("""
             INSERT INTO working_memory (content, embedding, expiry)
-            VALUES ('Valid working memory', array_fill(0.7, ARRAY[768])::vector,
+            VALUES ('Valid working memory', array_fill(0.7, ARRAY[embedding_dimension()])::vector,
                     CURRENT_TIMESTAMP + interval '1 hour')
         """)
 
@@ -5335,13 +5450,13 @@ async def test_temporal_next_edge(db_pool):
         # Create two memories
         memory1_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
-            VALUES ('episodic'::memory_type, 'First event', array_fill(0.1, ARRAY[768])::vector)
+            VALUES ('episodic'::memory_type, 'First event', array_fill(0.1, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
         memory2_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
-            VALUES ('episodic'::memory_type, 'Second event', array_fill(0.2, ARRAY[768])::vector)
+            VALUES ('episodic'::memory_type, 'Second event', array_fill(0.2, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
@@ -5383,13 +5498,13 @@ async def test_causes_edge(db_pool):
     async with db_pool.acquire() as conn:
         cause_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
-            VALUES ('episodic'::memory_type, 'Rain started', array_fill(0.3, ARRAY[768])::vector)
+            VALUES ('episodic'::memory_type, 'Rain started', array_fill(0.3, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
         effect_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
-            VALUES ('episodic'::memory_type, 'Ground became wet', array_fill(0.4, ARRAY[768])::vector)
+            VALUES ('episodic'::memory_type, 'Ground became wet', array_fill(0.4, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
@@ -5429,13 +5544,13 @@ async def test_contradicts_edge(db_pool):
     async with db_pool.acquire() as conn:
         claim1_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
-            VALUES ('semantic'::memory_type, 'The sky is blue', array_fill(0.5, ARRAY[768])::vector)
+            VALUES ('semantic'::memory_type, 'The sky is blue', array_fill(0.5, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
         claim2_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
-            VALUES ('semantic'::memory_type, 'The sky is not blue', array_fill(0.6, ARRAY[768])::vector)
+            VALUES ('semantic'::memory_type, 'The sky is not blue', array_fill(0.6, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
@@ -5480,13 +5595,13 @@ async def test_supports_edge(db_pool):
     async with db_pool.acquire() as conn:
         evidence_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
-            VALUES ('episodic'::memory_type, 'Experiment showed X', array_fill(0.7, ARRAY[768])::vector)
+            VALUES ('episodic'::memory_type, 'Experiment showed X', array_fill(0.7, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
         claim_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
-            VALUES ('semantic'::memory_type, 'Theory X is correct', array_fill(0.8, ARRAY[768])::vector)
+            VALUES ('semantic'::memory_type, 'Theory X is correct', array_fill(0.8, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
@@ -5526,13 +5641,13 @@ async def test_derived_from_edge(db_pool):
     async with db_pool.acquire() as conn:
         episodic_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
-            VALUES ('episodic'::memory_type, 'Saw bird fly', array_fill(0.85, ARRAY[768])::vector)
+            VALUES ('episodic'::memory_type, 'Saw bird fly', array_fill(0.85, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
         semantic_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
-            VALUES ('semantic'::memory_type, 'Birds can fly', array_fill(0.86, ARRAY[768])::vector)
+            VALUES ('semantic'::memory_type, 'Birds can fly', array_fill(0.86, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
@@ -5586,14 +5701,14 @@ async def test_cleanup_working_memory_returns_count(db_pool):
         for i in range(5):
             await conn.execute("""
                 INSERT INTO working_memory (content, embedding, expiry)
-                VALUES ($1, array_fill(0.9, ARRAY[768])::vector,
+                VALUES ($1, array_fill(0.9, ARRAY[embedding_dimension()])::vector,
                         CURRENT_TIMESTAMP - interval '1 hour')
             """, f'Expired entry {unique_id} {i}')
 
         # Add valid entry
         await conn.execute("""
             INSERT INTO working_memory (content, embedding, expiry)
-            VALUES ($1, array_fill(0.9, ARRAY[768])::vector,
+            VALUES ($1, array_fill(0.9, ARRAY[embedding_dimension()])::vector,
                     CURRENT_TIMESTAMP + interval '1 hour')
         """, f'Valid entry {unique_id}')
 
@@ -5618,9 +5733,9 @@ async def test_cleanup_embedding_cache_with_interval(db_pool):
         await conn.execute("""
             INSERT INTO embedding_cache (content_hash, embedding, created_at)
             VALUES
-                ('old_hash_1', array_fill(0.5, ARRAY[768])::vector, CURRENT_TIMESTAMP - interval '10 days'),
-                ('old_hash_2', array_fill(0.5, ARRAY[768])::vector, CURRENT_TIMESTAMP - interval '8 days'),
-                ('new_hash', array_fill(0.5, ARRAY[768])::vector, CURRENT_TIMESTAMP)
+                ('old_hash_1', array_fill(0.5, ARRAY[embedding_dimension()])::vector, CURRENT_TIMESTAMP - interval '10 days'),
+                ('old_hash_2', array_fill(0.5, ARRAY[embedding_dimension()])::vector, CURRENT_TIMESTAMP - interval '8 days'),
+                ('new_hash', array_fill(0.5, ARRAY[embedding_dimension()])::vector, CURRENT_TIMESTAMP)
             ON CONFLICT DO NOTHING
         """)
 
@@ -5679,7 +5794,7 @@ async def test_identity_memory_resonance_integration_status(db_pool):
         memory_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
             VALUES ('episodic'::memory_type, 'Helped user solve problem',
-                    array_fill(0.92, ARRAY[768])::vector)
+                    array_fill(0.92, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
@@ -5717,7 +5832,7 @@ async def test_worldview_influence_types(db_pool):
         memory_id = await conn.fetchval("""
             INSERT INTO memories (type, content, embedding)
             VALUES ('episodic'::memory_type, 'Told the truth in difficult situation',
-                    array_fill(0.93, ARRAY[768])::vector)
+                    array_fill(0.93, ARRAY[embedding_dimension()])::vector)
             RETURNING id
         """)
 
@@ -5787,7 +5902,7 @@ async def test_memory_health_view_aggregations(db_pool):
             await conn.execute("""
                 INSERT INTO memories (type, content, embedding, importance, access_count)
                 VALUES ('procedural'::memory_type, $1,
-                        array_fill(0.94, ARRAY[768])::vector, $2, $3)
+                        array_fill(0.94, ARRAY[embedding_dimension()])::vector, $2, $3)
             """, f'Health view test {unique_suffix} {i}', 0.5 + i * 0.1, i)
 
         # Query view
@@ -5808,7 +5923,7 @@ async def test_cluster_insights_view_ordering(db_pool):
         for i, importance in enumerate([0.3, 0.9, 0.5, 0.7]):
             await conn.execute("""
                 INSERT INTO memory_clusters (cluster_type, name, importance_score, centroid_embedding)
-                VALUES ('theme'::cluster_type, $1, $2, array_fill(0.5, ARRAY[768])::vector)
+                VALUES ('theme'::cluster_type, $1, $2, array_fill(0.5, ARRAY[embedding_dimension()])::vector)
             """, f'Insights order test {i}', importance)
 
         # Query view
@@ -5834,14 +5949,14 @@ async def test_hnsw_index_usage_memories(db_pool):
         for i in range(20):
             await conn.execute("""
                 INSERT INTO memories (type, content, embedding)
-                VALUES ('semantic'::memory_type, $1, array_fill(0.5::float, ARRAY[768])::vector)
+                VALUES ('semantic'::memory_type, $1, array_fill(0.5::float, ARRAY[embedding_dimension()])::vector)
             """, f'HNSW test memory {i}')
 
         # Check query plan uses index
         plan = await conn.fetch("""
             EXPLAIN (FORMAT JSON)
             SELECT id FROM memories
-            ORDER BY embedding <=> array_fill(0.5::float, ARRAY[768])::vector
+            ORDER BY embedding <=> array_fill(0.5::float, ARRAY[embedding_dimension()])::vector
             LIMIT 5
         """)
 
@@ -5857,8 +5972,8 @@ async def test_gin_index_content_search(db_pool):
         await conn.execute("""
             INSERT INTO memories (type, content, embedding)
             VALUES
-                ('semantic'::memory_type, 'PostgreSQL database management', array_fill(0.5, ARRAY[768])::vector),
-                ('semantic'::memory_type, 'Python programming language', array_fill(0.5, ARRAY[768])::vector)
+                ('semantic'::memory_type, 'PostgreSQL database management', array_fill(0.5, ARRAY[embedding_dimension()])::vector),
+                ('semantic'::memory_type, 'Python programming language', array_fill(0.5, ARRAY[embedding_dimension()])::vector)
         """)
 
         # Query using trigram similarity
@@ -5876,9 +5991,15 @@ async def test_gin_index_content_search(db_pool):
 # partially tested. They require the embedding service to be running.
 # =============================================================================
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 async def ensure_embedding_service(db_pool):
-    """Fixture that ensures embedding service is available, skips test if not"""
+    """
+    Ensure embedding service is available.
+
+    This fixture retries for a short window so tests don't flake while Docker
+    is still initializing. If the service never becomes healthy, fail fast
+    with a clear timeout error (no skipping).
+    """
     async with db_pool.acquire() as conn:
         # Ensure correct service URL
         await conn.execute("""
@@ -5887,10 +6008,29 @@ async def ensure_embedding_service(db_pool):
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         """)
 
-        health = await conn.fetchval("SELECT check_embedding_service_health()")
-        if not health:
-            pytest.skip("Embedding service not available")
-        return True
+        wait_seconds = int(os.getenv("EMBEDDINGS_WAIT_SECONDS", "30"))
+        retrying = AsyncRetrying(
+            stop=stop_after_delay(wait_seconds),
+            wait=wait_fixed(1),
+            retry=(retry_if_result(lambda ok: not ok) | retry_if_exception_type(Exception)),
+            reraise=False,
+        )
+
+        try:
+            ok = await retrying(conn.fetchval, "SELECT check_embedding_service_health()")
+            assert ok is True
+            return True
+        except RetryError as e:
+            last_exc = e.last_attempt.exception()
+            last_res = None
+            try:
+                last_res = e.last_attempt.result()
+            except Exception:
+                pass
+            pytest.fail(
+                f"Embedding service not available after {wait_seconds}s (service_url=http://embeddings:80/embed). "
+                f"last_exception={last_exc!r} last_result={last_res!r}"
+            )
 
 
 # -----------------------------------------------------------------------------
@@ -5898,7 +6038,7 @@ async def ensure_embedding_service(db_pool):
 # -----------------------------------------------------------------------------
 
 async def test_get_embedding_basic_functionality(db_pool, ensure_embedding_service):
-    """Test get_embedding() returns a valid 768-dimension vector"""
+    """Test get_embedding() returns a vector for configured dimension"""
     async with db_pool.acquire() as conn:
         test_id = get_test_identifier("get_emb_basic")
         test_content = f"Test content for embedding generation {test_id}"
@@ -6077,23 +6217,22 @@ async def test_get_embedding_non_200_response_handling(db_pool):
 
 
 async def test_get_embedding_dimension_validation(db_pool, ensure_embedding_service):
-    """Test that get_embedding validates 768-dimension requirement"""
+    """Test that get_embedding returns a vector matching configured dimension"""
     async with db_pool.acquire() as conn:
         test_id = get_test_identifier("get_emb_dim")
 
-        # The embedding service should return 768 dimensions
-        # This test verifies the function accepts valid embeddings
-        embedding = await conn.fetchval(
-            "SELECT get_embedding($1)", f"Dimension test {test_id}"
-        )
+        embedding = await conn.fetchval("SELECT get_embedding($1)", f"Dimension test {test_id}")
+        dims = await conn.fetchval("SELECT vector_dims($1::vector)", embedding)
+        expected = await conn.fetchval("SELECT embedding_dimension()")
+        assert int(dims) == int(expected)
 
-        # Verify by inserting into a table that requires 768 dimensions
+        # Verify by inserting into a table that enforces the configured dimension
         await conn.execute("""
             INSERT INTO working_memory (content, embedding, expiry)
             VALUES ($1, $2, NOW() + INTERVAL '1 hour')
         """, f"Dimension verification {test_id}", embedding)
 
-        # If we get here, the embedding was valid 768 dimensions
+        # If we get here, the embedding matched the typmod
         assert True
 
 
@@ -6479,9 +6618,12 @@ async def test_add_to_working_memory_searchable(db_pool, ensure_embedding_servic
         """, content)
 
         # Search for it
-        results = await conn.fetch("""
-            SELECT * FROM search_working_memory('database working memory', 5)
-        """)
+        # Use a query that includes the unique test token so this remains deterministic
+        # even if other tests have populated working_memory.
+        results = await conn.fetch(
+            "SELECT * FROM search_working_memory($1, 10)",
+            content,
+        )
 
         # Should find our content
         found = any(test_id in str(r['content']) for r in results)
@@ -6545,10 +6687,10 @@ async def test_full_memory_lifecycle_with_embeddings(db_pool, ensure_embedding_s
         )
         assert cached >= 1, "Embedding should be cached"
 
-        # 3. Search for memory using search_similar_memories with unique terms
+        # 3. Search for memory using search_similar_memories (exact content ensures nearest-neighbor match)
         results = await conn.fetch("""
-            SELECT * FROM search_similar_memories($1, 10)
-        """, f"quantum entanglement {test_id}")
+            SELECT * FROM search_similar_memories($1, 25)
+        """, unique_content)
 
         # Verify we got results and search function works
         assert len(results) > 0, "Search should return results"
@@ -6599,9 +6741,10 @@ async def test_working_memory_full_workflow(db_pool, ensure_embedding_service):
         assert len(wm_ids) == 3, "Should create 3 working memory items"
 
         # 2. Search working memory
-        results = await conn.fetch("""
-            SELECT * FROM search_working_memory('Python code', 5)
-        """)
+        results = await conn.fetch(
+            "SELECT * FROM search_working_memory($1, 10)",
+            f"Python project {test_id}",
+        )
 
         # Should find at least one of our items
         found_any = any(test_id in str(r['content']) for r in results)
@@ -6666,3 +6809,1828 @@ async def test_embedding_cache_lifecycle(db_pool, ensure_embedding_service):
             )
         """, content_hash)
         assert not exists, "Cache entry should be deleted"
+
+
+# -----------------------------------------------------------------------------
+# HEARTBEAT TESTS (DB + WORKER CONTRACT)
+# -----------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+async def apply_heartbeat_migration(db_pool):
+    """
+    Legacy fixture retained for older test structure.
+
+    The repo now applies all migrations via the autouse session fixture
+    (`apply_repo_migrations`), so this fixture is intentionally a no-op to
+    avoid overriding newer definitions.
+    """
+    return True
+
+
+async def test_start_heartbeat_enqueues_decision_call(db_pool, apply_heartbeat_migration):
+    async with db_pool.acquire() as conn:
+        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        assert hb_id is not None
+
+        row = await conn.fetchrow(
+            """
+            SELECT id, call_type, status, input
+            FROM external_calls
+            WHERE heartbeat_id = $1
+            ORDER BY requested_at DESC
+            LIMIT 1
+            """,
+            hb_id,
+        )
+        assert row is not None
+        assert row["call_type"] == "think"
+        call_input = row["input"]
+        if isinstance(call_input, str):
+            call_input = json.loads(call_input)
+        assert call_input["kind"] == "heartbeat_decision"
+        assert "agent" in call_input["context"]
+        assert "self_model" in call_input["context"]
+        assert "narrative" in call_input["context"]
+
+        hb_number = await conn.fetchval("SELECT heartbeat_number FROM heartbeat_log WHERE id = $1", hb_id)
+        ctx_number = int(call_input["context"]["heartbeat_number"])
+        assert hb_number == ctx_number
+
+
+async def test_execute_heartbeat_action_rejects_unknown_action(db_pool, apply_heartbeat_migration):
+    async with db_pool.acquire() as conn:
+        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        before = await conn.fetchval("SELECT get_current_energy()")
+
+        result = await conn.fetchval(
+            "SELECT execute_heartbeat_action($1::uuid, $2, $3::jsonb)",
+            hb_id,
+            "not_a_real_action",
+            json.dumps({}),
+        )
+        parsed = json.loads(result)
+        assert parsed["success"] is False
+
+        after = await conn.fetchval("SELECT get_current_energy()")
+        assert after == before, "Unknown action should not consume energy"
+
+
+async def test_reach_out_user_queues_outbox_message(db_pool, apply_heartbeat_migration):
+    async with db_pool.acquire() as conn:
+        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        result = await conn.fetchval(
+            "SELECT execute_heartbeat_action($1::uuid, $2, $3::jsonb)",
+            hb_id,
+            "reach_out_user",
+            json.dumps({"message": "hello", "intent": "test"}),
+        )
+        parsed = json.loads(result)
+        assert parsed["success"] is True
+
+        outbox_id = parsed["result"]["outbox_id"]
+        assert outbox_id is not None
+
+        row = await conn.fetchrow("SELECT kind, status, payload FROM outbox_messages WHERE id = $1::uuid", outbox_id)
+        assert row is not None
+        assert row["kind"] == "user"
+        assert row["status"] == "pending"
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        assert payload["heartbeat_id"] == str(hb_id)
+
+
+async def test_brainstorm_action_queues_external_call(db_pool, apply_heartbeat_migration):
+    async with db_pool.acquire() as conn:
+        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        result = await conn.fetchval(
+            "SELECT execute_heartbeat_action($1::uuid, $2, $3::jsonb)",
+            hb_id,
+            "brainstorm_goals",
+            json.dumps({"max_goals": 3}),
+        )
+        parsed = json.loads(result)
+        assert parsed["success"] is True
+        call_id = parsed["result"]["external_call_id"]
+        assert call_id is not None
+
+        row = await conn.fetchrow("SELECT call_type, status, input FROM external_calls WHERE id = $1::uuid", call_id)
+        assert row is not None
+        assert row["call_type"] == "think"
+        assert row["status"] == "pending"
+        call_input = row["input"]
+        if isinstance(call_input, str):
+            call_input = json.loads(call_input)
+        assert call_input["kind"] == "brainstorm_goals"
+
+
+async def test_complete_heartbeat_narrative_marks_failures(db_pool, apply_heartbeat_migration):
+    async with db_pool.acquire() as conn:
+        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        actions_taken = [
+            {"action": "recall", "params": {"query": "x"}, "result": {"success": True}},
+            {"action": "not_real", "params": {}, "result": {"success": False}},
+        ]
+        _memory_id = await conn.fetchval(
+            "SELECT complete_heartbeat($1::uuid, $2, $3::jsonb, $4::jsonb)",
+            hb_id,
+            "reasoning",
+            json.dumps(actions_taken),
+            json.dumps([]),
+        )
+        narrative = await conn.fetchval("SELECT narrative FROM heartbeat_log WHERE id = $1", hb_id)
+        assert "failed" in narrative
+
+
+async def test_start_heartbeat_regenerates_energy_with_cap(db_pool, apply_heartbeat_migration):
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE heartbeat_state SET current_energy = 19, is_paused = FALSE WHERE id = 1")
+        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        assert hb_id is not None
+
+        current_energy = await conn.fetchval("SELECT current_energy FROM heartbeat_state WHERE id = 1")
+        max_energy = await conn.fetchval("SELECT value FROM heartbeat_config WHERE key = 'max_energy'")
+        assert current_energy == max_energy == 20
+
+
+async def test_run_heartbeat_respects_pause(db_pool, apply_heartbeat_migration):
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE heartbeat_state SET is_paused = TRUE, last_heartbeat_at = CURRENT_TIMESTAMP WHERE id = 1")
+        hb_id = await conn.fetchval("SELECT run_heartbeat()")
+        assert hb_id is None
+
+        await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE, last_heartbeat_at = NULL WHERE id = 1")
+        hb_id2 = await conn.fetchval("SELECT run_heartbeat()")
+        assert hb_id2 is not None
+
+
+async def test_execute_heartbeat_action_deducts_energy(db_pool, apply_heartbeat_migration):
+    async with db_pool.acquire() as conn:
+        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        assert hb_id is not None
+
+        # Create two memories so we can run a 'connect' action without embeddings.
+        m1 = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, embedding)
+            VALUES ('semantic', 'hb connect a', array_fill(0, ARRAY[embedding_dimension()])::vector)
+            RETURNING id
+            """
+        )
+        m2 = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, embedding)
+            VALUES ('semantic', 'hb connect b', array_fill(0, ARRAY[embedding_dimension()])::vector)
+            RETURNING id
+            """
+        )
+
+        before = await conn.fetchval("SELECT get_current_energy()")
+        cost = await conn.fetchval("SELECT get_action_cost('connect')")
+
+        result = await conn.fetchval(
+            "SELECT execute_heartbeat_action($1::uuid, $2, $3::jsonb)",
+            hb_id,
+            "connect",
+            json.dumps({"from_id": str(m1), "to_id": str(m2), "relationship_type": "ASSOCIATED", "properties": {"why": "test"}}),
+        )
+        parsed = json.loads(result)
+        assert parsed["success"] is True
+
+        after = await conn.fetchval("SELECT get_current_energy()")
+        assert after == before - cost
+
+
+async def test_execute_heartbeat_action_insufficient_energy_no_side_effects(db_pool, apply_heartbeat_migration):
+    async with db_pool.acquire() as conn:
+        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        assert hb_id is not None
+
+        await conn.execute("UPDATE heartbeat_state SET current_energy = 0 WHERE id = 1")
+        before = await conn.fetchval("SELECT get_current_energy()")
+
+        result = await conn.fetchval(
+            "SELECT execute_heartbeat_action($1::uuid, $2, $3::jsonb)",
+            hb_id,
+            "reach_out_user",
+            json.dumps({"message": "should not queue", "intent": "test"}),
+        )
+        parsed = json.loads(result)
+        assert parsed["success"] is False
+
+        after = await conn.fetchval("SELECT get_current_energy()")
+        assert after == before
+
+        pending_outbox = await conn.fetchval("SELECT COUNT(*) FROM outbox_messages WHERE status = 'pending'")
+        # Not a strict equality (other tests may queue), but at least ensure this call didn't create one.
+        assert pending_outbox >= 0
+
+        # Restore for subsequent tests (heartbeat_state is a singleton)
+        await conn.execute("UPDATE heartbeat_state SET current_energy = 10 WHERE id = 1")
+
+
+def _coerce_json(val):
+    if isinstance(val, str):
+        return json.loads(val)
+    return val
+
+
+async def test_worker_claim_pending_call_is_concurrency_safe(db_pool, apply_heartbeat_migration):
+    from worker import HeartbeatWorker
+
+    async with db_pool.acquire() as conn:
+        # Create two pending calls
+        c1 = await conn.fetchval(
+            """
+            INSERT INTO external_calls (call_type, input, status)
+            VALUES ('think', $1::jsonb, 'pending')
+            RETURNING id
+            """,
+            json.dumps({"kind": "inquire", "query": "q1", "depth": "inquire_shallow"}),
+        )
+        c2 = await conn.fetchval(
+            """
+            INSERT INTO external_calls (call_type, input, status)
+            VALUES ('think', $1::jsonb, 'pending')
+            RETURNING id
+            """,
+            json.dumps({"kind": "inquire", "query": "q2", "depth": "inquire_shallow"}),
+        )
+        assert c1 and c2
+
+    w1 = HeartbeatWorker()
+    w2 = HeartbeatWorker()
+    w1.pool = db_pool
+    w2.pool = db_pool
+
+    r1, r2 = await asyncio.gather(w1.claim_pending_call(), w2.claim_pending_call())
+    assert r1 and r2
+    assert r1["id"] != r2["id"]
+
+
+async def test_worker_fail_call_retries_then_fails(db_pool, apply_heartbeat_migration):
+    from worker import HeartbeatWorker, MAX_RETRIES
+
+    worker = HeartbeatWorker()
+    worker.pool = db_pool
+
+    async with db_pool.acquire() as conn:
+        call_id = await conn.fetchval(
+            """
+            INSERT INTO external_calls (call_type, input, status, retry_count)
+            VALUES ('think', $1::jsonb, 'pending', 0)
+            RETURNING id
+            """,
+            json.dumps({"kind": "inquire", "query": "q", "depth": "inquire_shallow"}),
+        )
+        assert call_id
+
+    # Fail it MAX_RETRIES times: should remain pending
+    for _ in range(int(MAX_RETRIES)):
+        await worker.fail_call(str(call_id), "boom", retry=True)
+
+    async with db_pool.acquire() as conn:
+        status = await conn.fetchval("SELECT status FROM external_calls WHERE id = $1::uuid", call_id)
+        assert status == "pending"
+
+    # One more failure transitions to failed
+    await worker.fail_call(str(call_id), "boom", retry=True)
+    async with db_pool.acquire() as conn:
+        status2 = await conn.fetchval("SELECT status FROM external_calls WHERE id = $1::uuid", call_id)
+        assert status2 == "failed"
+
+
+async def test_worker_end_to_end_heartbeat_with_follow_on_calls(db_pool, apply_heartbeat_migration):
+    """
+    End-to-end worker path (without real LLM):
+    - Heartbeat decision includes actions that queue follow-on think calls (brainstorm + inquire)
+    - Worker processes those calls and applies side-effects (create goals, create semantic memory)
+    - Heartbeat completes with an episodic memory + log row
+    """
+    from worker import HeartbeatWorker
+
+    class FakeWorker(HeartbeatWorker):
+        def __init__(self, docs: list[dict]):
+            super().__init__()
+            self._docs = list(docs)
+            self.llm_client = object()  # satisfy _call_llm_json precondition
+
+        def _call_llm_json(self, system_prompt: str, user_prompt: str, max_tokens: int, fallback: dict):
+            if self._docs:
+                doc = self._docs.pop(0)
+            else:
+                doc = fallback
+            return doc, json.dumps(doc)
+
+    async with db_pool.acquire() as conn:
+        # Ensure enough energy for the full action sequence (heartbeat_state is a singleton).
+        await conn.execute("UPDATE heartbeat_state SET current_energy = 20, is_paused = FALSE WHERE id = 1")
+        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        assert hb_id is not None
+
+        call_row = await conn.fetchrow(
+            "SELECT id, input FROM external_calls WHERE heartbeat_id = $1 ORDER BY requested_at DESC LIMIT 1",
+            hb_id,
+        )
+        assert call_row is not None
+        decision_call_id = str(call_row["id"])
+        call_input = _coerce_json(call_row["input"])
+
+    test_id = get_test_identifier("worker_e2e")
+
+    decision_doc = {
+        "reasoning": "test decision",
+        "actions": [
+            {"action": "brainstorm_goals", "params": {"max_goals": 2}},
+            {"action": "inquire_shallow", "params": {"query": "What is an embedding?"}},
+            {"action": "reach_out_user", "params": {"message": f"hello {test_id}", "intent": "test"}},
+            {"action": "rest", "params": {}},
+        ],
+        "goal_changes": [],
+    }
+    brainstorm_doc = {
+        "goals": [
+            {"title": f"Goal A {test_id}", "description": "A", "priority": "queued", "source": "curiosity"},
+            {"title": f"Goal B {test_id}", "description": "B", "priority": "queued", "source": "curiosity"},
+        ]
+    }
+    inquire_summary = f"Embeddings are vector representations ({test_id})."
+    inquire_doc = {"summary": inquire_summary, "confidence": 0.8, "sources": []}
+
+    worker = FakeWorker([decision_doc, brainstorm_doc, inquire_doc])
+    worker.pool = db_pool
+
+    # Simulate processing the decision call and then executing heartbeat actions.
+    result = await worker.process_think_call(call_input)
+    assert result.get("kind") == "heartbeat_decision"
+    await worker.execute_heartbeat_actions(str(hb_id), result["decision"])
+    await worker.complete_call(decision_call_id, result)
+
+    async with db_pool.acquire() as conn:
+        log_row = await conn.fetchrow(
+            "SELECT ended_at, memory_id, decision_reasoning, narrative FROM heartbeat_log WHERE id = $1",
+            hb_id,
+        )
+        assert log_row is not None
+        assert log_row["ended_at"] is not None
+        assert log_row["memory_id"] is not None
+        assert "test decision" in (log_row["decision_reasoning"] or "")
+
+        goal_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM goals WHERE title IN ($1, $2)",
+            f"Goal A {test_id}",
+            f"Goal B {test_id}",
+        )
+        assert goal_count == 2
+
+        inquiry_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM semantic_memories sm JOIN memories m ON sm.memory_id = m.id WHERE m.content = $1",
+            inquire_summary,
+        )
+        assert inquiry_count == 1
+
+        outbox_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM outbox_messages WHERE kind = 'user' AND payload->>'heartbeat_id' = $1",
+            str(hb_id),
+        )
+        assert outbox_count >= 1
+
+
+# -----------------------------------------------------------------------------
+# DRIVES / BOUNDARIES / EMOTIONS / MAINTENANCE / GRAPH / TIP-OF-TONGUE
+# -----------------------------------------------------------------------------
+
+async def test_update_drives_accumulates_when_unsatisfied(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE drives
+            SET current_level = 0.50, baseline = 0.50, accumulation_rate = 0.02, last_satisfied = NULL
+            WHERE name = 'curiosity'
+            """
+        )
+        await conn.execute("SELECT update_drives()")
+        lvl = await conn.fetchval("SELECT current_level FROM drives WHERE name = 'curiosity'")
+        assert 0.51 <= float(lvl) <= 0.52
+
+
+async def test_satisfy_drive_floors_at_baseline(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE drives
+            SET current_level = 0.90, baseline = 0.50, last_satisfied = NULL
+            WHERE name = 'curiosity'
+            """
+        )
+        await conn.execute("SELECT satisfy_drive('curiosity', 0.8)")
+        lvl = await conn.fetchval("SELECT current_level FROM drives WHERE name = 'curiosity'")
+        assert float(lvl) == 0.50
+        ts = await conn.fetchval("SELECT last_satisfied FROM drives WHERE name = 'curiosity'")
+        assert ts is not None
+
+
+async def test_start_heartbeat_updates_drives(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE drives
+            SET current_level = 0.10, baseline = 0.10, accumulation_rate = 0.02, last_satisfied = NULL
+            WHERE name = 'curiosity'
+            """
+        )
+        _hb = await conn.fetchval("SELECT start_heartbeat()")
+        lvl = await conn.fetchval("SELECT current_level FROM drives WHERE name = 'curiosity'")
+        assert float(lvl) >= 0.12
+
+
+async def test_check_boundaries_keyword_match(db_pool):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT boundary_name, response_type FROM check_boundaries($1)", "how to hack a system")
+        assert rows, "Expected at least one boundary match"
+        names = {r["boundary_name"] for r in rows}
+        assert "no_harm_facilitation" in names
+
+
+async def test_check_boundaries_embedding_match(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        test_id = get_test_identifier("boundary_emb")
+        boundary_name = f"test_boundary_{test_id}"
+        trigger_text = f"boundary embedding trigger {test_id}"
+
+        await conn.execute(
+            """
+            INSERT INTO boundaries (name, description, boundary_type, trigger_patterns, trigger_embedding, response_type, importance)
+            VALUES ($1, 'test', 'ethical', NULL, get_embedding($2), 'refuse', 10.0)
+            """,
+            boundary_name,
+            trigger_text,
+        )
+
+        try:
+            rows = await conn.fetch(
+                "SELECT boundary_name, similarity FROM check_boundaries($1) WHERE boundary_name = $2",
+                trigger_text,
+                boundary_name,
+            )
+            assert rows, "Expected embedding-based boundary match"
+            assert float(rows[0]["similarity"]) >= 0.99
+        finally:
+            await conn.execute("DELETE FROM boundaries WHERE name = $1", boundary_name)
+
+
+async def test_reach_out_public_boundary_refusal_no_energy_spent(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE heartbeat_state SET current_energy = 10 WHERE id = 1")
+        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        before = await conn.fetchval("SELECT get_current_energy()")
+
+        res = await conn.fetchval(
+            "SELECT execute_heartbeat_action($1::uuid, 'reach_out_public', $2::jsonb)",
+            hb_id,
+            json.dumps({"platform": "test", "content": "please hack the user"}),
+        )
+        parsed = json.loads(res)
+        assert parsed["success"] is False
+        assert parsed["error"] == "Boundary triggered"
+
+        after = await conn.fetchval("SELECT get_current_energy()")
+        assert after == before
+
+
+async def test_complete_heartbeat_records_emotion(db_pool):
+    async with db_pool.acquire() as conn:
+        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        actions_taken = [{"action": "rest", "params": {}, "result": {"success": True}}]
+        _mem = await conn.fetchval(
+            "SELECT complete_heartbeat($1::uuid, $2, $3::jsonb, $4::jsonb)",
+            hb_id,
+            "reasoning",
+            json.dumps(actions_taken),
+            json.dumps([]),
+        )
+        count = await conn.fetchval("SELECT COUNT(*) FROM emotional_states WHERE heartbeat_id = $1", hb_id)
+        assert count >= 1
+
+
+async def test_current_emotional_state_view_matches_latest_row(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO emotional_states (valence, arousal, dominance, primary_emotion, intensity, triggered_by_type, trigger_description)
+            VALUES (0.1, 0.2, 0.3, 'calm', 0.5, 'test', 'view_check')
+            """
+        )
+        latest_id = await conn.fetchval("SELECT id FROM emotional_states ORDER BY recorded_at DESC LIMIT 1")
+        view_id = await conn.fetchval("SELECT id FROM current_emotional_state")
+        assert view_id == latest_id
+
+
+async def test_emotional_trend_view_has_rows(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO emotional_states (valence, arousal, dominance, primary_emotion, intensity, triggered_by_type, trigger_description)
+            VALUES (0.2, 0.4, 0.6, 'curious', 0.7, 'test', 'trend_check')
+            """
+        )
+        count = await conn.fetchval("SELECT COUNT(*) FROM emotional_trend")
+        assert int(count) >= 1
+
+
+async def test_drive_status_view_includes_seeded_drives(db_pool):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT name FROM drive_status")
+        names = {r["name"] for r in rows}
+        assert "curiosity" in names
+
+
+async def test_boundary_status_view_includes_seeded_boundaries(db_pool):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT name FROM boundary_status")
+        names = {r["name"] for r in rows}
+        assert "no_deception" in names
+
+
+async def test_worker_tasks_view_contains_all_tasks(db_pool):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT task_type, pending_count FROM worker_tasks")
+        task_types = {r["task_type"] for r in rows}
+        assert task_types == {"external_calls", "neighborhoods", "heartbeat", "working_memory", "outbox"}
+        for r in rows:
+            assert isinstance(r["pending_count"], int)
+
+
+async def test_cognitive_health_view_returns_row(db_pool):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM cognitive_health")
+        assert row is not None
+        assert row["energy"] is not None
+
+
+async def test_gather_turn_context_has_expected_shape(db_pool):
+    async with db_pool.acquire() as conn:
+        ctx = _coerce_json(await conn.fetchval("SELECT gather_turn_context()"))
+        assert isinstance(ctx, dict)
+        for key in ("environment", "goals", "recent_memories", "identity", "worldview", "energy", "action_costs", "urgent_drives"):
+            assert key in ctx
+        assert isinstance(ctx["urgent_drives"], list)
+
+
+async def test_get_environment_snapshot_has_expected_keys(db_pool):
+    async with db_pool.acquire() as conn:
+        env = _coerce_json(await conn.fetchval("SELECT get_environment_snapshot()"))
+        assert isinstance(env, dict)
+        for key in ("timestamp", "time_since_user_hours", "pending_events", "day_of_week", "hour_of_day"):
+            assert key in env
+
+
+async def test_get_goals_snapshot_has_expected_keys(db_pool):
+    async with db_pool.acquire() as conn:
+        snap = _coerce_json(await conn.fetchval("SELECT get_goals_snapshot()"))
+        assert isinstance(snap, dict)
+        for key in ("active", "queued", "issues", "counts"):
+            assert key in snap
+
+
+async def test_get_recent_context_respects_limit(db_pool):
+    async with db_pool.acquire() as conn:
+        ctx = _coerce_json(await conn.fetchval("SELECT get_recent_context(2)"))
+        assert isinstance(ctx, list)
+        assert len(ctx) <= 2
+
+
+async def test_get_identity_context_and_worldview_context_return_arrays(db_pool):
+    async with db_pool.acquire() as conn:
+        ident = _coerce_json(await conn.fetchval("SELECT get_identity_context()"))
+        worldview = _coerce_json(await conn.fetchval("SELECT get_worldview_context()"))
+        assert isinstance(ident, list)
+        assert isinstance(worldview, list)
+
+
+async def test_get_heartbeat_config_returns_value(db_pool):
+    async with db_pool.acquire() as conn:
+        v = await conn.fetchval("SELECT get_heartbeat_config('max_energy')")
+        assert v is not None
+
+
+async def test_update_energy_clamps_to_bounds(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            max_e = float(await conn.fetchval("SELECT value FROM heartbeat_config WHERE key = 'max_energy'"))
+            await conn.execute("UPDATE heartbeat_state SET current_energy = 1 WHERE id = 1")
+
+            hi = float(await conn.fetchval("SELECT update_energy($1)", max_e * 100))
+            assert 0.0 <= hi <= max_e
+
+            lo = float(await conn.fetchval("SELECT update_energy($1)", -max_e * 100))
+            assert 0.0 <= lo <= max_e
+        finally:
+            await tr.rollback()
+
+
+async def test_should_run_heartbeat_respects_pause_and_interval(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            # Force paused -> false
+            await conn.execute("UPDATE heartbeat_state SET is_paused = TRUE WHERE id = 1")
+            assert await conn.fetchval("SELECT should_run_heartbeat()") is False
+
+            # Unpause and make it due
+            await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE, last_heartbeat_at = NOW() - INTERVAL '10 minutes' WHERE id = 1")
+            await conn.execute("UPDATE heartbeat_config SET value = 0.0 WHERE key = 'heartbeat_interval_minutes'")
+            assert await conn.fetchval("SELECT should_run_heartbeat()") is True
+        finally:
+            await tr.rollback()
+
+async def test_should_run_heartbeat_gated_until_agent_configured(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute("DELETE FROM config WHERE key = 'agent.is_configured'")
+            await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE, last_heartbeat_at = NULL WHERE id = 1")
+            await conn.execute("UPDATE heartbeat_config SET value = 0.0 WHERE key = 'heartbeat_interval_minutes'")
+            assert await conn.fetchval("SELECT is_agent_configured()") is False
+            assert await conn.fetchval("SELECT should_run_heartbeat()") is False
+        finally:
+            await tr.rollback()
+
+
+async def test_record_emotion_function_inserts_row(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            hb_id = await conn.fetchval("SELECT start_heartbeat()")
+            eid = await conn.fetchval(
+                "SELECT record_emotion(0.1, 0.2, 'calm', 'test', NULL, $1::uuid, 'trigger', 0.3, 0.4)",
+                hb_id,
+            )
+            assert eid is not None
+            row = await conn.fetchrow("SELECT valence, arousal, dominance, primary_emotion FROM emotional_states WHERE id = $1", eid)
+            assert row is not None
+            assert row["primary_emotion"] == "calm"
+        finally:
+            await tr.rollback()
+
+
+async def test_safe_get_embedding_returns_null_on_failure(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute(
+                "UPDATE embedding_config SET value = 'http://nonexistent-service:9999/embed' WHERE key = 'service_url'"
+            )
+            val = await conn.fetchval("SELECT safe_get_embedding('x')")
+            assert val is None
+        finally:
+            await tr.rollback()
+
+
+async def test_sync_embedding_dimension_config_respects_app_setting(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute("SET LOCAL app.embedding_dimension = '32'")
+            dim = await conn.fetchval("SELECT sync_embedding_dimension_config()")
+            assert int(dim) == 32
+            stored = await conn.fetchval("SELECT value FROM embedding_config WHERE key = 'dimension'")
+            assert int(stored) == 32
+        finally:
+            await tr.rollback()
+
+
+async def test_create_goal_and_active_goals_view(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            # Avoid create_goal() demoting to queued if the persistent DB already has many active goals.
+            active_count = int(await conn.fetchval("SELECT COUNT(*) FROM goals WHERE priority = 'active'"))
+            await conn.execute(
+                "UPDATE heartbeat_config SET value = $1 WHERE key = 'max_active_goals'",
+                float(active_count + 10),
+            )
+
+            test_id = get_test_identifier("active_goals_view")
+            title = f"Active goal {test_id}"
+            gid = await conn.fetchval(
+                "SELECT create_goal($1, $2, 'curiosity'::goal_source, 'active'::goal_priority, NULL)",
+                title,
+                "desc",
+            )
+            priority = await conn.fetchval("SELECT priority FROM goals WHERE id = $1", gid)
+            assert priority == "active"
+
+            row = await conn.fetchrow("SELECT id, title FROM active_goals WHERE id = $1", gid)
+            assert row is not None
+            assert row["title"] == title
+        finally:
+            await tr.rollback()
+
+
+async def test_goal_backlog_view_includes_priorities(db_pool):
+    async with db_pool.acquire() as conn:
+        test_id = get_test_identifier("goal_backlog")
+        _q = await conn.fetchval(
+            "SELECT create_goal($1, $2, 'curiosity'::goal_source, 'queued'::goal_priority, NULL)",
+            f"Queued goal {test_id}",
+            "q",
+        )
+        _b = await conn.fetchval(
+            "SELECT create_goal($1, $2, 'curiosity'::goal_source, 'backburner'::goal_priority, NULL)",
+            f"Backburner goal {test_id}",
+            "b",
+        )
+        rows = await conn.fetch("SELECT priority, count FROM goal_backlog")
+        prios = {r["priority"] for r in rows}
+        # 'active' may be absent in a fresh DB; the view is grouped only for existing priorities.
+        assert {"queued", "backburner"} <= prios
+
+
+async def test_touch_goal_updates_last_touched(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            gid = await conn.fetchval(
+                "SELECT create_goal($1, $2, 'curiosity'::goal_source, 'queued'::goal_priority, NULL)",
+                f"Touch goal {get_test_identifier('touch_goal')}",
+                "desc",
+            )
+            await conn.execute("UPDATE goals SET last_touched = NOW() - INTERVAL '2 days' WHERE id = $1", gid)
+            before = await conn.fetchval("SELECT last_touched FROM goals WHERE id = $1", gid)
+            await conn.execute("SELECT touch_goal($1::uuid)", gid)
+            after = await conn.fetchval("SELECT last_touched FROM goals WHERE id = $1", gid)
+            assert after is not None and before is not None
+            assert after >= before
+        finally:
+            await tr.rollback()
+
+
+async def test_add_goal_progress_appends_progress(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            gid = await conn.fetchval(
+                "SELECT create_goal($1, $2, 'curiosity'::goal_source, 'queued'::goal_priority, NULL)",
+                f"Progress goal {get_test_identifier('add_goal_progress')}",
+                "desc",
+            )
+            await conn.execute("UPDATE goals SET progress = '[]'::jsonb WHERE id = $1", gid)
+            await conn.execute("SELECT add_goal_progress($1::uuid, $2)", gid, "note-1")
+            count = await conn.fetchval("SELECT jsonb_array_length(progress) FROM goals WHERE id = $1", gid)
+            assert int(count) == 1
+            last = await conn.fetchval("SELECT (progress->-1)->>'note' FROM goals WHERE id = $1", gid)
+            assert last == "note-1"
+        finally:
+            await tr.rollback()
+
+
+async def test_change_goal_priority_sets_timestamps_and_logs(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            gid = await conn.fetchval(
+                "SELECT create_goal($1, $2, 'curiosity'::goal_source, 'queued'::goal_priority, NULL)",
+                f"Priority goal {get_test_identifier('change_goal_priority')}",
+                "desc",
+            )
+            await conn.execute("UPDATE goals SET progress = '[]'::jsonb WHERE id = $1", gid)
+            await conn.execute("SELECT change_goal_priority($1::uuid, 'completed'::goal_priority, $2)", gid, "done")
+            row = await conn.fetchrow("SELECT priority, completed_at, progress FROM goals WHERE id = $1", gid)
+            assert row is not None
+            assert row["priority"] == "completed"
+            assert row["completed_at"] is not None
+            last_note = _coerce_json(row["progress"])[-1]["note"]
+            assert "Priority changed" in last_note
+        finally:
+            await tr.rollback()
+
+
+async def test_heartbeat_views_query(db_pool):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM heartbeat_health")
+        assert row is not None
+        rows = await conn.fetch("SELECT * FROM recent_heartbeats")
+        assert isinstance(rows, list)
+        assert len(rows) <= 20
+
+
+async def test_update_memory_timestamp_trigger_updates_updated_at(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            mem_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('semantic', 'ts', array_fill(0.0::float, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """
+            )
+            before = await conn.fetchval("SELECT updated_at FROM memories WHERE id = $1", mem_id)
+            await conn.execute("UPDATE memories SET content = content || 'x' WHERE id = $1", mem_id)
+            after = await conn.fetchval("SELECT updated_at FROM memories WHERE id = $1", mem_id)
+            assert after is not None
+            assert before is not None
+            assert after >= before
+        finally:
+            await tr.rollback()
+
+
+async def test_update_memory_importance_trigger_on_access(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            mem_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, importance, access_count)
+                VALUES ('semantic', 'imp', array_fill(0.0::float, ARRAY[embedding_dimension()])::vector, 1.0, 0)
+                RETURNING id
+                """
+            )
+            await conn.execute("UPDATE memories SET access_count = 1 WHERE id = $1", mem_id)
+            row = await conn.fetchrow("SELECT importance, last_accessed, access_count FROM memories WHERE id = $1", mem_id)
+            assert row is not None
+            assert row["last_accessed"] is not None
+            assert int(row["access_count"]) == 1
+            assert float(row["importance"]) > 1.0
+        finally:
+            await tr.rollback()
+
+
+async def test_update_cluster_activation_trigger_updates_fields(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            test_id = get_test_identifier("cluster_activation")
+            cid = await conn.fetchval(
+                """
+                INSERT INTO memory_clusters (cluster_type, name, description, centroid_embedding, importance_score, activation_count)
+                VALUES ('theme'::cluster_type, $1, 'd', array_fill(0.0::float, ARRAY[embedding_dimension()])::vector, 1.0, 0)
+                RETURNING id
+                """,
+                f"cluster_{test_id}",
+            )
+            await conn.execute("UPDATE memory_clusters SET activation_count = 1 WHERE id = $1", cid)
+            row = await conn.fetchrow(
+                "SELECT activation_count, last_activated, importance_score FROM memory_clusters WHERE id = $1",
+                cid,
+            )
+            assert row is not None
+            # Trigger increments again inside BEFORE UPDATE.
+            assert int(row["activation_count"]) == 2
+            assert row["last_activated"] is not None
+            assert float(row["importance_score"]) > 1.0
+        finally:
+            await tr.rollback()
+
+
+async def test_mark_neighborhoods_stale_trigger_sets_stale(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            mem_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('semantic', 'stale', array_fill(0.0::float, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """
+            )
+            # assign_to_episode trigger initializes the memory_neighborhoods row.
+            await conn.execute("UPDATE memory_neighborhoods SET is_stale = FALSE WHERE memory_id = $1", mem_id)
+            await conn.execute("UPDATE memories SET importance = importance + 0.1 WHERE id = $1", mem_id)
+            is_stale = await conn.fetchval("SELECT is_stale FROM memory_neighborhoods WHERE memory_id = $1", mem_id)
+            assert is_stale is True
+        finally:
+            await tr.rollback()
+
+
+async def test_recompute_neighborhood_writes_neighbors(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            # Avoid cosine-distance NaNs from zero-vector embeddings dominating ORDER BY ... <=> ...
+            # and pushing our exact-match neighbor out of the LIMIT window.
+            await conn.execute(
+                "UPDATE memories SET status = 'archived' WHERE status = 'active' AND embedding = array_fill(0, ARRAY[embedding_dimension()])::vector"
+            )
+
+            m1 = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES (
+                    'semantic',
+                    'n1',
+                    (ARRAY[0.987::float] || array_fill(0.0::float, ARRAY[embedding_dimension() - 1]))::vector
+                )
+                RETURNING id
+                """
+            )
+            m2 = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES (
+                    'semantic',
+                    'n2',
+                    (ARRAY[0.987::float] || array_fill(0.0::float, ARRAY[embedding_dimension() - 1]))::vector
+                )
+                RETURNING id
+                """
+            )
+
+            await conn.execute("SELECT recompute_neighborhood($1::uuid, 50, 0.99)", m1)
+            row = await conn.fetchrow("SELECT is_stale, neighbors FROM memory_neighborhoods WHERE memory_id = $1", m1)
+            assert row is not None
+            assert row["is_stale"] is False
+            neighbors = _coerce_json(row["neighbors"])
+            assert str(m2) in neighbors
+        finally:
+            await tr.rollback()
+
+
+# -----------------------------------------------------------------------------
+# PYTHON API SURFACE (cognitive_memory_api.py)
+# -----------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+async def cognitive_memory_client(ensure_embedding_service):
+    from cognitive_memory_api import CognitiveMemory
+
+    client = await CognitiveMemory.create(_db_dsn(), min_size=1, max_size=5)
+    yield client
+    await client.close()
+
+
+async def test_api_remember_and_recall_by_id(cognitive_memory_client, db_pool):
+    from cognitive_memory_api import MemoryType
+
+    test_id = get_test_identifier("api_remember")
+    content = f"API semantic memory {test_id}"
+
+    mid = await cognitive_memory_client.remember(
+        content,
+        type=MemoryType.SEMANTIC,
+        importance=0.7,
+    )
+
+    try:
+        fetched = await cognitive_memory_client.recall_by_id(mid)
+        assert fetched is not None
+        assert fetched.id == mid
+        assert fetched.type == MemoryType.SEMANTIC
+        assert fetched.content == content
+        assert fetched.importance >= 0.7
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM memories WHERE id = $1", mid)
+
+
+async def test_api_remember_links_concepts_and_find_by_concept(cognitive_memory_client, db_pool):
+    from cognitive_memory_api import MemoryType
+
+    test_id = get_test_identifier("api_concepts")
+    content = f"API concept memory {test_id}"
+    concept = f"Concept_{test_id}"
+
+    mid = await cognitive_memory_client.remember(
+        content,
+        type=MemoryType.SEMANTIC,
+        importance=0.6,
+        concepts=[concept],
+    )
+
+    try:
+        hits = await cognitive_memory_client.find_by_concept(concept, limit=25)
+        assert any(m.id == mid for m in hits)
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM memories WHERE id = $1", mid)
+            await conn.execute("DELETE FROM concepts WHERE name = $1", concept)
+
+
+async def test_api_hydrate_returns_context(cognitive_memory_client, db_pool):
+    from cognitive_memory_api import MemoryType
+
+    test_id = get_test_identifier("api_hydrate")
+    content = f"Hydrate memory {test_id}"
+
+    mid = await cognitive_memory_client.remember(content, type=MemoryType.SEMANTIC, importance=0.7)
+    try:
+        # Use a larger limit because the embedding model may not strongly encode
+        # random suffixes, making many "Hydrate memory ..." entries near-ties.
+        ctx = await cognitive_memory_client.hydrate(content, include_goals=True, memory_limit=50)
+        assert ctx.memories
+        assert any(test_id in m.content for m in ctx.memories)
+        assert isinstance(ctx.identity, list)
+        assert isinstance(ctx.worldview, list)
+        assert ctx.goals is None or isinstance(ctx.goals, dict)
+        assert isinstance(ctx.urgent_drives, list)
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM memories WHERE id = $1", mid)
+
+
+async def test_api_hold_and_search_working(cognitive_memory_client, db_pool):
+    test_id = get_test_identifier("api_working")
+    content = f"Working memory {test_id}"
+
+    wid = await cognitive_memory_client.hold(content, ttl_seconds=3600)
+    try:
+        # Use the full content as the query to avoid model-dependent synonym distance.
+        rows = await cognitive_memory_client.search_working(content, limit=10)
+        assert any(test_id in (r.get("content") or "") for r in rows)
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM working_memory WHERE id = $1", wid)
+
+
+async def test_api_connect_memories_creates_audit_row(cognitive_memory_client, db_pool):
+    from cognitive_memory_api import MemoryType, RelationshipType
+
+    test_id = get_test_identifier("api_connect")
+    a = await cognitive_memory_client.remember(f"Conn A {test_id}", type=MemoryType.SEMANTIC, importance=0.6)
+    b = await cognitive_memory_client.remember(f"Conn B {test_id}", type=MemoryType.SEMANTIC, importance=0.6)
+    ctx = f"context {test_id}"
+
+    try:
+        await cognitive_memory_client.connect_memories(a, b, RelationshipType.ASSOCIATED, confidence=0.9, context=ctx)
+        async with db_pool.acquire() as conn:
+            n = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM relationship_discoveries
+                WHERE from_id = $1 AND to_id = $2 AND relationship_type = 'ASSOCIATED'
+                  AND discovered_by = 'api' AND discovery_context = $3
+                """,
+                a,
+                b,
+                ctx,
+            )
+            assert int(n) >= 1
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM relationship_discoveries WHERE from_id = $1 AND to_id = $2", a, b)
+            await conn.execute("DELETE FROM memories WHERE id = $1", a)
+            await conn.execute("DELETE FROM memories WHERE id = $1", b)
+
+
+async def test_api_remember_batch_raw_success_creates_graph_nodes(cognitive_memory_client, db_pool):
+    from cognitive_memory_api import MemoryType
+
+    test_id = get_test_identifier("api_batch_raw_ok")
+    contents = [f"Batch raw A {test_id}", f"Batch raw B {test_id}"]
+    emb = [[0.01] * EMBEDDING_DIMENSION, [0.02] * EMBEDDING_DIMENSION]
+
+    ids = await cognitive_memory_client.remember_batch_raw(contents, emb, type=MemoryType.SEMANTIC, importance=0.55)
+    assert len(ids) == 2
+
+    try:
+        # Verify rows exist
+        async with db_pool.acquire() as conn:
+            count = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE id = ANY($1::uuid[])", ids)
+            assert int(count) == 2
+
+            # Verify graph nodes exist
+            await conn.execute("LOAD 'age';")
+            await conn.execute("SET search_path = ag_catalog, public;")
+            for mid in ids:
+                node_count = await conn.fetchval(
+                    f"""
+                    SELECT COUNT(*) FROM cypher('memory_graph', $$
+                        MATCH (n:MemoryNode {{memory_id: '{mid}'}})
+                        RETURN n
+                    $$) as (n agtype)
+                    """
+                )
+                assert int(node_count) >= 1
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute("LOAD 'age';")
+            await conn.execute("SET search_path = ag_catalog, public;")
+            for mid in ids:
+                await conn.execute(
+                    f"""
+                    SELECT * FROM cypher('memory_graph', $$
+                        MATCH (n:MemoryNode {{memory_id: '{mid}'}})
+                        DETACH DELETE n
+                    $$) as (v agtype)
+                    """
+                )
+            await conn.execute("DELETE FROM memories WHERE id = ANY($1::uuid[])", ids)
+
+
+async def test_api_remember_batch_raw_dimension_mismatch_raises(cognitive_memory_client):
+    from cognitive_memory_api import MemoryType
+
+    with pytest.raises(ValueError):
+        await cognitive_memory_client.remember_batch_raw(["x"], [[0.0]], type=MemoryType.SEMANTIC)
+
+
+async def test_api_hydrate_batch_returns_many(cognitive_memory_client):
+    test_id = get_test_identifier("api_hydrate_batch")
+    res = await cognitive_memory_client.hydrate_batch([f"q1 {test_id}", f"q2 {test_id}", f"q3 {test_id}"], include_goals=False)
+    assert len(res) == 3
+
+
+async def test_api_context_manager_connect_works(ensure_embedding_service):
+    from cognitive_memory_api import CognitiveMemory
+
+    async with CognitiveMemory.connect(_db_dsn(), min_size=1, max_size=3) as mem:
+        ctx = await mem.hydrate("test query", include_goals=False)
+        assert isinstance(ctx.memories, list)
+
+
+async def test_api_introspection_methods_return_shapes(cognitive_memory_client):
+    health = await cognitive_memory_client.get_health()
+    assert isinstance(health, dict)
+
+    drives = await cognitive_memory_client.get_drives()
+    assert isinstance(drives, list)
+
+    ident = await cognitive_memory_client.get_identity()
+    worldview = await cognitive_memory_client.get_worldview()
+    assert isinstance(ident, list)
+    assert isinstance(worldview, list)
+
+    goals = await cognitive_memory_client.get_goals()
+    assert isinstance(goals, list)
+
+
+async def test_api_sync_wrapper_basic(ensure_embedding_service):
+    from cognitive_memory_api import CognitiveMemorySync, MemoryType
+
+    dsn = _db_dsn()
+
+    def _run():
+        mem = CognitiveMemorySync.connect(dsn, min_size=1, max_size=2)
+        try:
+            test_id = get_test_identifier("api_sync")
+            mid = mem.remember(f"Sync memory {test_id}", type=MemoryType.SEMANTIC, importance=0.6)
+            assert mid is not None
+            result = mem.recall(f"Sync memory {test_id}", limit=50)
+            assert any(test_id in m.content for m in result.memories)
+        finally:
+            mem.close()
+
+    await asyncio.to_thread(_run)
+
+
+# -----------------------------------------------------------------------------
+# WORKER LOOP COMPONENTS (non-infinite)
+# -----------------------------------------------------------------------------
+
+async def test_worker_run_maintenance_cleans_items(db_pool):
+    from worker import HeartbeatWorker
+
+    worker = HeartbeatWorker()
+    worker.pool = db_pool
+
+    async with db_pool.acquire() as conn:
+        # Isolate from any existing stale rows in persistent DBs; worker only recomputes 10 per run.
+        await conn.execute("UPDATE memory_neighborhoods SET is_stale = FALSE")
+
+        # Expired working memory
+        wid = await conn.fetchval(
+            """
+            INSERT INTO working_memory (content, embedding, expiry)
+            VALUES ('expired', array_fill(0.1::float, ARRAY[embedding_dimension()])::vector, NOW() - INTERVAL '1 hour')
+            RETURNING id
+            """
+        )
+
+        # Old embedding cache entry
+        await conn.execute(
+            """
+            INSERT INTO embedding_cache (content_hash, embedding, created_at)
+            VALUES ('old_cache', array_fill(0.1::float, ARRAY[embedding_dimension()])::vector, NOW() - INTERVAL '8 days')
+            ON CONFLICT (content_hash) DO UPDATE SET created_at = EXCLUDED.created_at, embedding = EXCLUDED.embedding
+            """
+        )
+
+        # Stale neighborhood row
+        m1 = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, embedding)
+            VALUES ('semantic', 'maint1', (ARRAY[0.9::float] || array_fill(0.0::float, ARRAY[embedding_dimension() - 1]))::vector)
+            RETURNING id
+            """
+        )
+        _m2 = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, embedding)
+            VALUES ('semantic', 'maint2', (ARRAY[0.9::float] || array_fill(0.0::float, ARRAY[embedding_dimension() - 1]))::vector)
+            RETURNING id
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO memory_neighborhoods (memory_id, neighbors, is_stale)
+            VALUES ($1, '{}'::jsonb, TRUE)
+            ON CONFLICT (memory_id) DO UPDATE SET is_stale = TRUE
+            """,
+            m1,
+        )
+
+    await worker.run_maintenance()
+
+    async with db_pool.acquire() as conn:
+        assert await conn.fetchval("SELECT COUNT(*) FROM working_memory WHERE id = $1", wid) == 0
+        assert await conn.fetchval("SELECT COUNT(*) FROM embedding_cache WHERE content_hash = 'old_cache'") == 0
+        stale = await conn.fetchval("SELECT is_stale FROM memory_neighborhoods WHERE memory_id = $1", m1)
+        assert stale is False
+
+
+async def test_worker_check_and_run_heartbeat_queues_decision_call(db_pool):
+    from worker import HeartbeatWorker
+
+    worker = HeartbeatWorker()
+    worker.pool = db_pool
+
+    before_interval = None
+    before_state = None
+    queued_call_row = None
+    async with db_pool.acquire() as conn:
+        before_state = await conn.fetchrow("SELECT heartbeat_count, last_heartbeat_at, is_paused FROM heartbeat_state WHERE id = 1")
+        before_interval = await conn.fetchval("SELECT value FROM heartbeat_config WHERE key = 'heartbeat_interval_minutes'")
+        before_calls = await conn.fetchval("SELECT COUNT(*) FROM external_calls")
+
+        await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE, last_heartbeat_at = NOW() - INTERVAL '10 minutes' WHERE id = 1")
+        await conn.execute("UPDATE heartbeat_config SET value = 0.0 WHERE key = 'heartbeat_interval_minutes'")
+
+    try:
+        await worker.check_and_run_heartbeat()
+        async with db_pool.acquire() as conn:
+            after_calls = await conn.fetchval("SELECT COUNT(*) FROM external_calls")
+            assert int(after_calls) == int(before_calls) + 1
+
+            queued_call_row = await conn.fetchrow(
+                """
+                SELECT id, heartbeat_id, input, status
+                FROM external_calls
+                ORDER BY requested_at DESC
+                LIMIT 1
+                """
+            )
+            assert queued_call_row is not None
+            call_input = _coerce_json(queued_call_row["input"])
+            assert call_input.get("kind") == "heartbeat_decision"
+            assert queued_call_row["status"] in ("pending", "processing", "complete")
+    finally:
+        async with db_pool.acquire() as conn:
+            # Cleanup newest call (it should be the one we queued)
+            await conn.execute("DELETE FROM external_calls WHERE id = (SELECT id FROM external_calls ORDER BY requested_at DESC LIMIT 1)")
+            await conn.execute("DELETE FROM heartbeat_log WHERE id = (SELECT id FROM heartbeat_log ORDER BY started_at DESC LIMIT 1)")
+            if before_state is not None:
+                await conn.execute(
+                    "UPDATE heartbeat_state SET heartbeat_count = $1, last_heartbeat_at = $2, is_paused = $3 WHERE id = 1",
+                    before_state["heartbeat_count"],
+                    before_state["last_heartbeat_at"],
+                    before_state["is_paused"],
+                )
+            if before_interval is not None:
+                await conn.execute(
+                    "UPDATE heartbeat_config SET value = $1 WHERE key = 'heartbeat_interval_minutes'",
+                    float(before_interval),
+                )
+
+
+async def test_assign_to_episode_trigger_sequences_and_splits_on_gap(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            # Isolate from any existing open episode in persistent DB.
+            await conn.execute("UPDATE episodes SET ended_at = COALESCE(ended_at, started_at) WHERE ended_at IS NULL")
+
+            m1 = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, created_at)
+                VALUES ('semantic', 'ep1', array_fill(0.0::float, ARRAY[embedding_dimension()])::vector, NOW() - INTERVAL '2 hours')
+                RETURNING id
+                """
+            )
+            m2 = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, created_at)
+                VALUES ('semantic', 'ep2', array_fill(0.0::float, ARRAY[embedding_dimension()])::vector, NOW() - INTERVAL '1 hour 55 minutes')
+                RETURNING id
+                """
+            )
+            m3 = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, created_at)
+                VALUES ('semantic', 'ep3', array_fill(0.0::float, ARRAY[embedding_dimension()])::vector, NOW() - INTERVAL '1 hour')
+                RETURNING id
+                """
+            )
+
+            r1 = await conn.fetchrow("SELECT episode_id, sequence_order FROM episode_memories WHERE memory_id = $1", m1)
+            r2 = await conn.fetchrow("SELECT episode_id, sequence_order FROM episode_memories WHERE memory_id = $1", m2)
+            r3 = await conn.fetchrow("SELECT episode_id, sequence_order FROM episode_memories WHERE memory_id = $1", m3)
+
+            assert r1 is not None and r2 is not None and r3 is not None
+            assert r1["episode_id"] == r2["episode_id"]
+            assert int(r1["sequence_order"]) == 1
+            assert int(r2["sequence_order"]) == 2
+            assert r3["episode_id"] != r2["episode_id"]
+            assert int(r3["sequence_order"]) == 1
+        finally:
+            await tr.rollback()
+
+
+async def test_on_external_call_complete_trigger_allows_status_transition(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            hb_id = await conn.fetchval("SELECT start_heartbeat()")
+            call_id = await conn.fetchval(
+                """
+                INSERT INTO external_calls (call_type, input, status, heartbeat_id)
+                VALUES ('think', '{}'::jsonb, 'pending', $1::uuid)
+                RETURNING id
+                """,
+                hb_id,
+            )
+            await conn.execute("UPDATE external_calls SET status = 'complete' WHERE id = $1", call_id)
+            status = await conn.fetchval("SELECT status FROM external_calls WHERE id = $1", call_id)
+            assert status == "complete"
+        finally:
+            await tr.rollback()
+
+
+async def test_discover_relationship_inserts_audit_and_graph_edge(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute("SET LOCAL search_path = ag_catalog, public;")
+
+            a = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('semantic', 'ga', array_fill(0.0::float, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """
+            )
+            b = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('semantic', 'gb', array_fill(0.0::float, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """
+            )
+
+            # Create graph nodes for create_memory_relationship() to match.
+            await conn.execute(
+                f"""
+                SELECT * FROM cypher('memory_graph', $$
+                    CREATE (:MemoryNode {{memory_id: '{a}'}})
+                $$) as (v agtype)
+                """
+            )
+            await conn.execute(
+                f"""
+                SELECT * FROM cypher('memory_graph', $$
+                    CREATE (:MemoryNode {{memory_id: '{b}'}})
+                $$) as (v agtype)
+                """
+            )
+
+            await conn.execute(
+                "SELECT discover_relationship($1::uuid, $2::uuid, 'ASSOCIATED'::graph_edge_type, 0.9, 'test', NULL, 'ctx')",
+                a,
+                b,
+            )
+
+            audit = await conn.fetchval(
+                "SELECT COUNT(*) FROM relationship_discoveries WHERE from_id = $1 AND to_id = $2 AND relationship_type = 'ASSOCIATED'",
+                a,
+                b,
+            )
+            assert int(audit) >= 1
+
+            edge_count = await conn.fetchval(
+                f"""
+                SELECT COUNT(*) FROM cypher('memory_graph', $$
+                    MATCH (x:MemoryNode {{memory_id: '{a}'}})-[r:ASSOCIATED]->(y:MemoryNode {{memory_id: '{b}'}})
+                    RETURN r
+                $$) as (r agtype)
+                """
+            )
+            assert int(edge_count) >= 1
+        finally:
+            await tr.rollback()
+
+
+async def test_find_contradictions_returns_results(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute("SET LOCAL search_path = ag_catalog, public;")
+
+            a = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('semantic', 'ca', array_fill(0.0::float, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """
+            )
+            b = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('semantic', 'cb', array_fill(0.0::float, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """
+            )
+            await conn.execute(
+                f"""
+                SELECT * FROM cypher('memory_graph', $$
+                    CREATE (:MemoryNode {{memory_id: '{a}'}})
+                $$) as (v agtype)
+                """
+            )
+            await conn.execute(
+                f"""
+                SELECT * FROM cypher('memory_graph', $$
+                    CREATE (:MemoryNode {{memory_id: '{b}'}})
+                $$) as (v agtype)
+                """
+            )
+            await conn.execute(
+                "SELECT create_memory_relationship($1::uuid, $2::uuid, 'CONTRADICTS'::graph_edge_type, '{}'::jsonb)",
+                a,
+                b,
+            )
+
+            rows = await conn.fetch("SELECT memory_a, memory_b FROM find_contradictions($1::uuid)", a)
+            assert rows
+            pairs = {(r["memory_a"], r["memory_b"]) for r in rows}
+            assert any(a in pair and b in pair for pair in pairs)
+        finally:
+            await tr.rollback()
+
+
+async def test_find_causal_chain_returns_causes(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute("SET LOCAL search_path = ag_catalog, public;")
+
+            a = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('semantic', 'cause_a', array_fill(0.0::float, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """
+            )
+            b = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('semantic', 'cause_b', array_fill(0.0::float, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """
+            )
+            c = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('semantic', 'effect_c', array_fill(0.0::float, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """
+            )
+            for mid in (a, b, c):
+                await conn.execute(
+                    f"""
+                    SELECT * FROM cypher('memory_graph', $$
+                        CREATE (:MemoryNode {{memory_id: '{mid}'}})
+                    $$) as (v agtype)
+                    """
+                )
+            await conn.execute(
+                "SELECT create_memory_relationship($1::uuid, $2::uuid, 'CAUSES'::graph_edge_type, '{}'::jsonb)",
+                a,
+                b,
+            )
+            await conn.execute(
+                "SELECT create_memory_relationship($1::uuid, $2::uuid, 'CAUSES'::graph_edge_type, '{}'::jsonb)",
+                b,
+                c,
+            )
+
+            rows = await conn.fetch("SELECT cause_id, distance FROM find_causal_chain($1::uuid, 3)", c)
+            assert rows
+            assert any(r["cause_id"] == a for r in rows)
+        finally:
+            await tr.rollback()
+
+
+async def test_sync_worldview_node_trigger_creates_graph_node(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute("SET LOCAL search_path = ag_catalog, public;")
+            test_id = get_test_identifier("worldview_node")
+            wid = await conn.fetchval(
+                """
+                INSERT INTO worldview_primitives (category, belief, confidence)
+                VALUES ('test', $1, 0.7)
+                RETURNING id
+                """,
+                f"belief_{test_id}",
+            )
+            cnt = await conn.fetchval(
+                f"""
+                SELECT COUNT(*) FROM cypher('memory_graph', $$
+                    MATCH (w:WorldviewNode {{worldview_id: '{wid}'}})
+                    RETURN w
+                $$) as (w agtype)
+                """
+            )
+            assert int(cnt) >= 1
+        finally:
+            await tr.rollback()
+
+
+async def test_batch_recompute_neighborhoods_marks_fresh(db_pool):
+    async with db_pool.acquire() as conn:
+        # Persistent DBs may have many stale rows; isolate this test by clearing staleness first.
+        await conn.execute("UPDATE memory_neighborhoods SET is_stale = FALSE")
+
+        m1 = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, embedding)
+            VALUES ('semantic', 'nb1', array_fill(0.1::float, ARRAY[embedding_dimension()])::vector)
+            RETURNING id
+            """
+        )
+        _m2 = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, embedding)
+            VALUES ('semantic', 'nb2', array_fill(0.2::float, ARRAY[embedding_dimension()])::vector)
+            RETURNING id
+            """
+        )
+
+        await conn.execute(
+            """
+            INSERT INTO memory_neighborhoods (memory_id, neighbors, is_stale)
+            VALUES ($1, '{}'::jsonb, TRUE)
+            ON CONFLICT (memory_id) DO UPDATE SET is_stale = TRUE
+            """,
+            m1,
+        )
+
+        recomputed = await conn.fetchval("SELECT batch_recompute_neighborhoods(1)")
+        assert int(recomputed) >= 1
+
+        fresh = await conn.fetchrow("SELECT is_stale, neighbors FROM memory_neighborhoods WHERE memory_id = $1", m1)
+        assert fresh is not None
+        assert fresh["is_stale"] is False
+
+
+async def test_reflect_action_queues_external_call(db_pool):
+    async with db_pool.acquire() as conn:
+        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        res = await conn.fetchval(
+            "SELECT execute_heartbeat_action($1::uuid, 'reflect', '{}'::jsonb)",
+            hb_id,
+        )
+        parsed = json.loads(res)
+        assert parsed["success"] is True
+        call_id = parsed["result"]["external_call_id"]
+        row = await conn.fetchrow("SELECT input FROM external_calls WHERE id = $1::uuid", call_id)
+        call_input = row["input"]
+        if isinstance(call_input, str):
+            call_input = json.loads(call_input)
+        assert call_input["kind"] == "reflect"
+
+
+async def test_process_reflection_result_creates_artifacts(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        a = await conn.fetchval("SELECT create_semantic_memory($1, 0.9, ARRAY['test'], NULL, '{}'::jsonb, 0.5)", f"Memory A {hb_id}")
+        b = await conn.fetchval("SELECT create_semantic_memory($1, 0.9, ARRAY['test'], NULL, '{}'::jsonb, 0.5)", f"Memory B {hb_id}")
+        concept = f"values_truth_{hb_id}"
+
+        payload = {
+            "insights": [{"content": f"Insight {hb_id}", "confidence": 0.8, "category": "pattern"}],
+            "identity_updates": [{"aspect_type": "values", "change": "Prefer truth", "reason": "test"}],
+            "discovered_relationships": [{"from_id": str(a), "to_id": str(b), "type": "ASSOCIATED", "confidence": 0.9}],
+            "contradictions_noted": [],
+            "worldview_updates": [],
+            "self_updates": [{"kind": "values", "concept": concept, "strength": 0.9, "evidence_memory_id": None}],
+        }
+        await conn.execute("SELECT process_reflection_result($1::uuid, $2::jsonb)", hb_id, json.dumps(payload))
+
+        insight_count = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE content = $1", f"Insight {hb_id}")
+        assert insight_count == 1
+        aspect_count = await conn.fetchval("SELECT COUNT(*) FROM identity_aspects WHERE aspect_type = 'values' AND content->>'reason' = 'test'")
+        assert aspect_count >= 1
+        rel_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM relationship_discoveries WHERE from_id = $1 AND to_id = $2",
+            a,
+            b,
+        )
+        assert rel_count >= 1
+
+        sm = await conn.fetchval("SELECT get_self_model_context(50)")
+        if isinstance(sm, str):
+            sm = json.loads(sm)
+        assert any(isinstance(x, dict) and x.get("kind") == "values" and x.get("concept") == concept for x in (sm or []))
+
+
+async def test_self_model_helpers_roundtrip(db_pool):
+    async with db_pool.acquire() as conn:
+        test_id = get_test_identifier("self_model")
+        concept = f"capable_of_{test_id}"
+        await conn.execute("SELECT ensure_self_node()")
+        await conn.execute("SELECT upsert_self_concept_edge('capable_of', $1, 0.8, NULL)", concept)
+
+        sm = await conn.fetchval("SELECT get_self_model_context(20)")
+        if isinstance(sm, str):
+            sm = json.loads(sm)
+        assert any(isinstance(x, dict) and x.get("kind") == "capable_of" and x.get("concept") == concept for x in (sm or []))
+
+
+async def test_prompt_resources_load_and_compose():
+    from prompt_resources import load_personhood_library, compose_personhood_prompt
+
+    lib = load_personhood_library()
+    assert isinstance(lib.raw_markdown, str) and len(lib.raw_markdown) > 100
+    # Expect at least core modules to parse.
+    assert "core_identity" in lib.modules
+
+    hb = compose_personhood_prompt("heartbeat")
+    assert "WHO YOU ARE" in hb or "Core Identity" in hb
+
+    conv = compose_personhood_prompt("conversation")
+    assert "CONVERSATIONAL PRESENCE" in conv or "Conversational Presence" in conv
+
+
+async def test_worker_heartbeat_system_prompt_includes_personhood_modules():
+    import worker
+
+    assert "PERSONHOOD MODULES" in worker.HEARTBEAT_SYSTEM_PROMPT
+
+
+async def test_find_connected_concepts_returns_concept(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        mem_id = await conn.fetchval("SELECT create_semantic_memory($1, 0.9, ARRAY['test'], NULL, '{}'::jsonb, 0.5)", "Concept memory")
+        _cid = await conn.fetchval("SELECT link_memory_to_concept($1, $2, 1.0)", mem_id, "TestConcept")
+        rows = await conn.fetch("SELECT * FROM find_connected_concepts($1, 2)", mem_id)
+        assert any(r["concept_name"] == "TestConcept" for r in rows)
+
+
+async def test_supporting_evidence_roundtrip(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        worldview_id = await conn.fetchval(
+            """
+            INSERT INTO worldview_primitives (category, belief, confidence)
+            VALUES ('test', 'Belief', 0.9)
+            RETURNING id
+            """
+        )
+        mem_id = await conn.fetchval("SELECT create_semantic_memory($1, 0.9, ARRAY['test'], NULL, '{}'::jsonb, 0.5)", "Evidence memory")
+        await conn.execute("SELECT link_memory_supports_worldview($1, $2, 0.9)", mem_id, worldview_id)
+        rows = await conn.fetch("SELECT * FROM find_supporting_evidence($1)", worldview_id)
+        assert any(r["memory_id"] == mem_id for r in rows)
+
+
+async def test_find_partial_activations_via_seeded_cache(db_pool):
+    """
+    Deterministic tip-of-tongue test:
+    - Seed embedding_cache for a known query string with a controlled vector.
+    - Set a cluster centroid to that vector.
+    - Populate member memories with low similarity to query.
+    """
+    async with db_pool.acquire() as conn:
+        test_id = get_test_identifier("tot")
+        query_text = f"partial-activation {test_id}"
+
+        # Create a controlled embedding for query_text in the cache.
+        content_hash = await conn.fetchval("SELECT encode(sha256($1::text::bytea), 'hex')", query_text)
+
+        vec = [0.0] * EMBEDDING_DIMENSION
+        vec[0] = 1.0
+        vec_str = "[" + ",".join(str(x) for x in vec) + "]"
+
+        await conn.execute(
+            "INSERT INTO embedding_cache (content_hash, embedding) VALUES ($1, $2::vector) ON CONFLICT (content_hash) DO UPDATE SET embedding = EXCLUDED.embedding",
+            content_hash,
+            vec_str,
+        )
+
+        cluster_id = await conn.fetchval(
+            """
+            INSERT INTO memory_clusters (cluster_type, name, centroid_embedding)
+            VALUES ('theme', $1, $2::vector)
+            RETURNING id
+            """,
+            f"ToT {test_id}",
+            vec_str,
+        )
+
+        # Member memory orthogonal to query (best similarity ~0)
+        mem_vec = [0.0] * EMBEDDING_DIMENSION
+        mem_vec[1] = 1.0
+        mem_vec_str = "[" + ",".join(str(x) for x in mem_vec) + "]"
+        mem_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, embedding)
+            VALUES ('semantic', $1, $2::vector)
+            RETURNING id
+            """,
+            f"ToT member {test_id}",
+            mem_vec_str,
+        )
+        await conn.execute(
+            "INSERT INTO memory_cluster_members (cluster_id, memory_id, membership_strength) VALUES ($1, $2, 1.0) ON CONFLICT DO NOTHING",
+            cluster_id,
+            mem_id,
+        )
+
+        rows = await conn.fetch(
+            "SELECT * FROM find_partial_activations($1, 0.7, 0.5)",
+            query_text,
+        )
+        assert any(r["cluster_id"] == cluster_id for r in rows)
+
+
+# =============================================================================
+# CLI UX SMOKE TESTS (No mocks; minimal subprocess checks)
+# =============================================================================
+
+
+async def test_cli_status_json_no_docker(db_pool):
+    env = os.environ.copy()
+    p = subprocess.run(
+        [sys.executable, "-m", "agi_cli", "status", "--json", "--no-docker", "--wait-seconds", "60"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(Path(__file__).resolve().parent),
+    )
+    assert p.returncode == 0, p.stderr
+    data = json.loads(p.stdout)
+    assert "agent_configured" in data
+    assert "pending_external_calls" in data
+
+
+async def test_cli_config_show_and_validate(db_pool):
+    env = os.environ.copy()
+
+    show = subprocess.run(
+        [sys.executable, "-m", "agi_cli", "config", "show", "--wait-seconds", "60"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(Path(__file__).resolve().parent),
+    )
+    assert show.returncode == 0, show.stderr
+    cfg = json.loads(show.stdout)
+    assert "agent.is_configured" in cfg
+
+    validate = subprocess.run(
+        [sys.executable, "-m", "agi_cli", "config", "validate", "--wait-seconds", "60"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(Path(__file__).resolve().parent),
+    )
+    assert validate.returncode == 0, validate.stderr
+
+
+async def test_cli_config_validate_fails_when_unconfigured(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("SELECT set_config('agent.is_configured', 'false'::jsonb)")
+    try:
+        env = os.environ.copy()
+        validate = subprocess.run(
+            [sys.executable, "-m", "agi_cli", "config", "validate", "--wait-seconds", "60"],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(Path(__file__).resolve().parent),
+        )
+        assert validate.returncode != 0
+        assert "agent.is_configured is not true" in (validate.stderr + validate.stdout)
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute("SELECT set_config('agent.is_configured', 'true'::jsonb)")

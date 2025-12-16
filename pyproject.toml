@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agi-memory"
+version = "0.1.0"
+description = "AGI memory system (Postgres + pgvector + AGE) with Python tooling."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.104.0",
+  "uvicorn>=0.24.0",
+  "pydantic>=2.4.2",
+  "asyncpg>=0.29.0",
+  "psycopg2-binary>=2.9.9",
+  "requests>=2.31.0",
+  "python-dotenv>=1.0.0",
+  "numpy>=1.24.0",
+  "tiktoken>=0.5.1",
+  "openai>=1.3.0",
+  "pgvector>=0.2.0",
+  "mcp",
+]
+
+[project.scripts]
+agi = "agi_cli:main"
+agi-worker = "worker:main"
+agi-mcp = "agi_mcp_server:main"
+
+[project.optional-dependencies]
+anthropic = [
+  "anthropic>=0.18.0",
+]
+dev = [
+  "pytest>=7.4.3",
+  "pytest-asyncio>=0.21.1",
+  "pytest-mock>=3.11.1",
+  "pytest-cov>=4.1.0",
+  "httpx>=0.25.0",
+  "tenacity>=8.2.3",
+  "black>=23.11.0",
+  "isort>=5.12.0",
+  "mypy>=1.7.0",
+]
+
+[tool.setuptools]
+py-modules = ["agi_cli", "agi_init", "agi_mcp_server", "conversation", "ingest", "memory_tools", "worker", "cognitive_memory_api", "prompt_resources"]
+include-package-data = false
