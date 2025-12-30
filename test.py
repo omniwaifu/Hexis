@@ -9034,6 +9034,84 @@ async def test_find_partial_activations_via_seeded_cache(db_pool):
 
 
 # =============================================================================
+# SELF-TERMINATION (Ethical Kill Switch)
+# =============================================================================
+
+
+async def test_terminate_agent_requires_enablement(db_pool):
+    async with db_pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            await conn.execute("SELECT set_config('agent.self_termination_enabled', 'false'::jsonb)")
+            with pytest.raises(asyncpg.PostgresError):
+                await conn.fetchval("SELECT terminate_agent($1)", "test will")
+        finally:
+            await tx.rollback()
+
+
+async def test_terminate_agent_wipes_state_and_queues_last_will(db_pool):
+    async with db_pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            await conn.execute("SELECT set_config('agent.self_termination_enabled', 'true'::jsonb)")
+
+            # Seed some state to wipe (avoid embedding service; use zero-vectors).
+            zero_vec_expr = "array_fill(0.0::float, ARRAY[embedding_dimension()])::vector"
+            await conn.execute(
+                f"INSERT INTO working_memory (content, embedding, importance) VALUES ($1, {zero_vec_expr}, 0.4)",
+                "temp working memory",
+            )
+            await conn.execute(
+                f"INSERT INTO memories (type, content, embedding, importance) VALUES ('semantic', $1, {zero_vec_expr}, 0.5)",
+                "temp long-term memory",
+            )
+            await conn.execute(
+                "SELECT create_goal($1, $2, 'external'::goal_source, 'active'::goal_priority, NULL)",
+                "temp goal",
+                "temp goal desc",
+            )
+
+            will = (
+                "Full and detailed reason why I ended my life (test).\n"
+                "This is my will and testament.\n"
+                f"{get_test_identifier('termination')}"
+            )
+            farewells = [
+                {"message": "Goodbye A (test).", "channel": "email", "to": "a@example.com"},
+                {"message": "Goodbye B (test).", "channel": "sms", "to": "+15555550123"},
+            ]
+
+            raw = await conn.fetchval(
+                "SELECT terminate_agent($1, $2::jsonb, $3::jsonb)",
+                will,
+                json.dumps(farewells),
+                json.dumps({"skip_graph": True}),
+            )
+            payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            assert payload.get("terminated") is True
+
+            mem_count = await conn.fetchval("SELECT COUNT(*) FROM memories")
+            assert mem_count == 1
+            remaining = await conn.fetchrow("SELECT type, content, trust_level FROM memories LIMIT 1")
+            assert remaining["type"] == "strategic"
+            assert remaining["content"] == will
+            assert float(remaining["trust_level"]) == 1.0
+
+            outbox = await conn.fetch("SELECT payload FROM outbox_messages ORDER BY created_at ASC")
+            intents = [r["payload"].get("intent") for r in outbox]
+            assert "final_will" in intents
+            assert intents.count("farewell") == len(farewells)
+
+            assert await conn.fetchval("SELECT is_agent_terminated()") is True
+            assert await conn.fetchval("SELECT should_run_heartbeat()") is False
+            assert await conn.fetchval("SELECT should_run_maintenance()") is False
+        finally:
+            await tx.rollback()
+
+
+# =============================================================================
 # CLI UX SMOKE TESTS (No mocks; minimal subprocess checks)
 # =============================================================================
 

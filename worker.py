@@ -92,7 +92,7 @@ You must output a JSON response with:
 - emotional_assessment (optional): Your current affective state {valence: -1..1, arousal: 0..1, primary_emotion: str}
 
 Each action should have:
-- action: The action type (recall, connect, reprioritize, reflect, maintain, brainstorm_goals, inquire_shallow, synthesize, reach_out_user, inquire_deep, reach_out_public, rest)
+- action: The action type (recall, connect, reprioritize, reflect, maintain, brainstorm_goals, inquire_shallow, synthesize, reach_out_user, inquire_deep, reach_out_public, terminate, rest)
 - params: Parameters for the action (varies by type)
 
 Guidelines:
@@ -902,6 +902,11 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                     'result': result_dict
                 })
 
+                if action == "terminate" and result_dict.get("success"):
+                    logger.info("Termination action executed; stopping workers and skipping heartbeat completion.")
+                    self.stop()
+                    return
+
                 # Check if we ran out of energy
                 if not result_dict.get('success', True):
                     logger.info(f"Action {action} failed: {result_dict.get('error', 'unknown')}")
@@ -1092,6 +1097,10 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
         try:
             while self.running:
                 try:
+                    if await self._is_agent_terminated():
+                        logger.info("Agent is terminated; heartbeat worker exiting.")
+                        break
+
                     # Process any pending external calls
                     call = await self.claim_pending_call()
 
@@ -1116,7 +1125,14 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
 
                                 # Heartbeat decision calls drive execution; other think kinds are side tasks.
                                 if heartbeat_id and result.get("kind") == "heartbeat_decision" and "decision" in result:
-                                    await self.execute_heartbeat_actions(str(heartbeat_id), result["decision"])
+                                    # Persist the decision before executing actions so termination can safely wipe `external_calls`.
+                                    await self.complete_call(call_id, result)
+                                    try:
+                                        await self.execute_heartbeat_actions(str(heartbeat_id), result["decision"])
+                                    except Exception as e:
+                                        # The decision is already persisted; action execution failures should not flip the call back to failed.
+                                        logger.error(f"Heartbeat action execution failed for {heartbeat_id}: {e}")
+                                    result = result | {"actions_executed": True}
                                 elif heartbeat_id and result.get("kind") == "brainstorm_goals":
                                     async with self.pool.acquire() as conn:
                                         created = await self._apply_brainstormed_goals(conn, str(heartbeat_id), result.get("goals", []))
@@ -1132,7 +1148,9 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                             else:
                                 result = {'error': f'Unknown call type: {call_type}'}
 
-                            await self.complete_call(call_id, result)
+                            # Heartbeat decisions are completed above (before action execution).
+                            if not (heartbeat_id and isinstance(result, dict) and result.get("kind") == "heartbeat_decision"):
+                                await self.complete_call(call_id, result)
 
                         except Exception as e:
                             logger.error(f"Error processing call {call_id}: {e}")
@@ -1153,6 +1171,15 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
         """Stop the worker gracefully."""
         self.running = False
         logger.info("Worker stopping...")
+
+    async def _is_agent_terminated(self) -> bool:
+        if not self.pool:
+            return False
+        try:
+            async with self.pool.acquire() as conn:
+                return bool(await conn.fetchval("SELECT is_agent_terminated()"))
+        except Exception:
+            return False
 
 
 class MaintenanceWorker:
@@ -1218,6 +1245,9 @@ class MaintenanceWorker:
         try:
             while self.running:
                 try:
+                    if await self._is_agent_terminated():
+                        logger.info("Agent is terminated; maintenance worker exiting.")
+                        break
                     if RABBITMQ_ENABLED:
                         await self.poll_inbox_messages()
                         await self.publish_outbox_messages(max_messages=10)
@@ -1231,6 +1261,15 @@ class MaintenanceWorker:
     def stop(self):
         self.running = False
         logger.info("Maintenance worker stopping...")
+
+    async def _is_agent_terminated(self) -> bool:
+        if not self.pool:
+            return False
+        try:
+            async with self.pool.acquire() as conn:
+                return bool(await conn.fetchval("SELECT is_agent_terminated()"))
+        except Exception:
+            return False
 
 
 async def _amain(mode: str) -> None:

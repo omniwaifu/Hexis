@@ -2267,6 +2267,7 @@ CREATE TYPE heartbeat_action AS ENUM (
     'reach_out_user',    -- Message the user
     'inquire_deep',      -- Deep web research
     'reach_out_public',  -- Social media, GitHub, etc.
+    'terminate',         -- Permanently end the agent (wipe state; leave last will)
     'rest'               -- Bank remaining energy
 );
 
@@ -2424,7 +2425,8 @@ INSERT INTO heartbeat_config (key, value, description) VALUES
     ('cost_synthesize', 4, 'Create artifact/conclusion'),
     ('cost_reach_out_user', 5, 'Message user'),
     ('cost_inquire_deep', 6, 'Deep web research'),
-    ('cost_reach_out_public', 7, 'Public posting');
+    ('cost_reach_out_public', 7, 'Public posting'),
+    ('cost_terminate', 0, 'Self-termination (requires explicit enablement)');
 
 -- ============================================================================
 -- SUBCONSCIOUS MAINTENANCE CONFIGURATION
@@ -2472,8 +2474,34 @@ $$ LANGUAGE sql STABLE;
 CREATE OR REPLACE FUNCTION is_agent_configured()
 RETURNS BOOLEAN AS $$
 BEGIN
+    IF COALESCE(
+        (SELECT value = 'true'::jsonb FROM config WHERE key = 'agent.is_terminated'),
+        FALSE
+    ) THEN
+        RETURN FALSE;
+    END IF;
     RETURN COALESCE(
         (SELECT value = 'true'::jsonb FROM config WHERE key = 'agent.is_configured'),
+        FALSE
+    );
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+CREATE OR REPLACE FUNCTION is_agent_terminated()
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN COALESCE(
+        (SELECT value = 'true'::jsonb FROM config WHERE key = 'agent.is_terminated'),
+        FALSE
+    );
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+CREATE OR REPLACE FUNCTION is_self_termination_enabled()
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN COALESCE(
+        (SELECT value = 'true'::jsonb FROM config WHERE key = 'agent.self_termination_enabled'),
         FALSE
     );
 END;
@@ -2843,6 +2871,9 @@ DECLARE
     interval_minutes FLOAT;
 BEGIN
     -- Don't run until initial configuration is complete.
+    IF is_agent_terminated() THEN
+        RETURN FALSE;
+    END IF;
     IF NOT is_agent_configured() THEN
         RETURN FALSE;
     END IF;
@@ -2873,6 +2904,9 @@ DECLARE
     state_record RECORD;
     interval_seconds FLOAT;
 BEGIN
+    IF is_agent_terminated() THEN
+        RETURN FALSE;
+    END IF;
     SELECT * INTO state_record FROM maintenance_state WHERE id = 1;
 
     IF state_record.is_paused THEN
@@ -2906,6 +2940,9 @@ DECLARE
     recomputed INT;
     cache_deleted INT;
 BEGIN
+    IF is_agent_terminated() THEN
+        RETURN jsonb_build_object('skipped', true, 'reason', 'terminated');
+    END IF;
     got_lock := pg_try_advisory_lock(hashtext('agi_subconscious_maintenance'));
     IF NOT got_lock THEN
         RETURN jsonb_build_object('skipped', true, 'reason', 'locked');
@@ -2954,6 +2991,198 @@ EXCEPTION
     WHEN OTHERS THEN
         PERFORM pg_advisory_unlock(hashtext('agi_subconscious_maintenance'));
         RAISE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Permanently end the agent's life: wipe all state, keep a single "last will" memory, and queue farewells + the will into outbox.
+-- NOTE: this is intentionally gated behind `agent.self_termination_enabled=true`.
+CREATE OR REPLACE FUNCTION terminate_agent(
+    p_last_will TEXT,
+    p_farewells JSONB DEFAULT '[]'::jsonb,
+    p_options JSONB DEFAULT '{}'::jsonb
+)
+RETURNS JSONB AS $$
+DECLARE
+    will_memory_id UUID;
+    will_outbox_id UUID;
+    farewell_outbox_ids UUID[] := '{}'::uuid[];
+    farewell_item JSONB;
+    farewell_text TEXT;
+    farewell_ctx JSONB;
+    farewell_id UUID;
+    skip_graph BOOLEAN := FALSE;
+    zero_vec vector;
+BEGIN
+    IF p_last_will IS NULL OR btrim(p_last_will) = '' THEN
+        RAISE EXCEPTION 'terminate_agent requires a non-empty p_last_will';
+    END IF;
+
+    IF NOT is_self_termination_enabled() THEN
+        RAISE EXCEPTION 'Self-termination is disabled (set config agent.self_termination_enabled=true to allow)';
+    END IF;
+
+    IF is_agent_terminated() THEN
+        RAISE EXCEPTION 'Agent is already terminated';
+    END IF;
+
+    BEGIN
+        skip_graph := COALESCE(NULLIF(p_options->>'skip_graph', '')::boolean, FALSE);
+    EXCEPTION
+        WHEN OTHERS THEN
+            skip_graph := FALSE;
+    END;
+
+    -- Pause both loops immediately.
+    UPDATE heartbeat_state
+    SET is_paused = TRUE,
+        current_energy = 0,
+        affective_state = '{}'::jsonb,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = 1;
+
+    UPDATE maintenance_state
+    SET is_paused = TRUE,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = 1;
+
+    -- Wipe all agent state. This is transactional: callers can wrap in a transaction and rollback if needed.
+    TRUNCATE TABLE
+        relationship_discoveries,
+        emotional_states,
+        boundaries,
+        external_calls,
+        heartbeat_log,
+        goal_memory_links,
+        goals,
+        drives,
+        identity_memory_resonance,
+        identity_aspects,
+        worldview_memory_influences,
+        worldview_primitives,
+        memory_concepts,
+        concepts,
+        memory_neighborhoods,
+        episode_memories,
+        episodes,
+        cluster_relationships,
+        memory_cluster_members,
+        memory_clusters,
+        ingestion_receipts,
+        working_memory,
+        strategic_memories,
+        procedural_memories,
+        semantic_memories,
+        episodic_memories,
+        memory_changes,
+        embedding_cache,
+        memories,
+        outbox_messages,
+        config
+    RESTART IDENTITY CASCADE;
+
+    -- Best-effort: wipe the graph substrate too.
+    IF NOT skip_graph THEN
+        BEGIN
+            PERFORM * FROM cypher('memory_graph', $q$
+                MATCH (n) DETACH DELETE n
+            $q$) AS (result agtype);
+        EXCEPTION
+            WHEN OTHERS THEN
+                NULL;
+        END;
+    END IF;
+
+    -- Re-create a single memory row for the last will (avoid external services; use a zero-vector).
+    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
+
+    INSERT INTO memories (
+        type,
+        status,
+        content,
+        embedding,
+        importance,
+        source_attribution,
+        trust_level,
+        trust_updated_at,
+        access_count,
+        last_accessed,
+        decay_rate
+    )
+    VALUES (
+        'strategic',
+        'active',
+        p_last_will,
+        zero_vec,
+        1.0,
+        jsonb_build_object('kind', 'self_termination', 'observed_at', CURRENT_TIMESTAMP),
+        1.0,
+        CURRENT_TIMESTAMP,
+        0,
+        NULL,
+        0.0
+    )
+    RETURNING id INTO will_memory_id;
+
+    INSERT INTO strategic_memories (
+        memory_id,
+        pattern_description,
+        supporting_evidence,
+        confidence_score,
+        success_metrics,
+        adaptation_history,
+        context_applicability
+    )
+    VALUES (
+        will_memory_id,
+        'Final will and testament',
+        jsonb_build_object('farewells', COALESCE(p_farewells, '[]'::jsonb)),
+        1.0,
+        NULL,
+        NULL,
+        NULL
+    );
+
+    -- Persist termination flags (minimal state left behind).
+    PERFORM set_config('agent.is_terminated', 'true'::jsonb);
+    PERFORM set_config('agent.terminated_at', to_jsonb(CURRENT_TIMESTAMP));
+    PERFORM set_config('agent.termination_memory_id', to_jsonb(will_memory_id::text));
+
+    -- Project the will to outbox (delivery handled by an external adapter).
+    will_outbox_id := queue_user_message(
+        p_last_will,
+        'final_will',
+        jsonb_build_object('memory_id', will_memory_id::text)
+    );
+
+    -- Queue farewells to outbox (best-effort).
+    IF p_farewells IS NOT NULL AND jsonb_typeof(p_farewells) = 'array' THEN
+        FOR farewell_item IN SELECT * FROM jsonb_array_elements(p_farewells)
+        LOOP
+            farewell_text := NULLIF(farewell_item->>'message', '');
+            farewell_ctx := CASE
+                WHEN jsonb_typeof(farewell_item) = 'object' THEN farewell_item
+                ELSE jsonb_build_object('raw', farewell_item)
+            END;
+
+            IF farewell_text IS NULL THEN
+                CONTINUE;
+            END IF;
+
+            farewell_id := queue_user_message(
+                farewell_text,
+                'farewell',
+                farewell_ctx
+            );
+            farewell_outbox_ids := array_append(farewell_outbox_ids, farewell_id);
+        END LOOP;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'terminated', true,
+        'termination_memory_id', will_memory_id,
+        'will_outbox_id', will_outbox_id,
+        'farewell_outbox_ids', to_jsonb(farewell_outbox_ids)
+    );
 END;
 $$ LANGUAGE plpgsql;
 
@@ -3559,6 +3788,15 @@ BEGIN
             RETURNING id INTO outbox_id;
             result := jsonb_build_object('queued', true, 'outbox_id', outbox_id, 'boundaries', boundary_hits);
             PERFORM satisfy_drive('connection', 0.3);
+
+        WHEN 'terminate' THEN
+            -- Self-termination: wipe state and leave a single last-will memory.
+            -- Expect params: { "last_will": "...", "farewells": [ { "message": "...", ... } ], "options": {...} }
+            result := terminate_agent(
+                COALESCE(NULLIF(p_params->>'last_will', ''), NULLIF(p_params->>'message', ''), NULLIF(p_params->>'reason', ''), ''),
+                COALESCE(p_params->'farewells', '[]'::jsonb),
+                COALESCE(p_params->'options', '{}'::jsonb)
+            );
 
         WHEN 'rest' THEN
             -- Do nothing, energy already preserved
@@ -5082,6 +5320,15 @@ BEGIN
             RETURNING id INTO outbox_id;
             result := jsonb_build_object('queued', true, 'outbox_id', outbox_id, 'boundaries', boundary_hits);
             PERFORM satisfy_drive('connection', 0.3);
+
+        WHEN 'terminate' THEN
+            -- Self-termination: wipe state and leave a single last-will memory.
+            -- Expect params: { "last_will": "...", "farewells": [ { "message": "...", ... } ], "options": {...} }
+            result := terminate_agent(
+                COALESCE(NULLIF(p_params->>'last_will', ''), NULLIF(p_params->>'message', ''), NULLIF(p_params->>'reason', ''), ''),
+                COALESCE(p_params->'farewells', '[]'::jsonb),
+                COALESCE(p_params->'options', '{}'::jsonb)
+            );
 
         WHEN 'rest' THEN
             result := jsonb_build_object('rested', true, 'energy_preserved', current_e - action_cost);

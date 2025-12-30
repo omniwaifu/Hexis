@@ -48,6 +48,8 @@ docker compose --profile active up -d
 
 Config is stored in Postgres in the `config` table (e.g. `agent.objectives`, `agent.guardrails`, `llm.heartbeat`, and `agent.is_configured`).
 
+Optional safety feature: self-termination is **disabled by default**. If enabled (`agent.self_termination_enabled=true`), the agent can choose the `terminate` heartbeat action to permanently wipe its state and leave a single “last will” memory.
+
 ### 4) Use the Python client (thin DB client)
 
 Install:
@@ -362,6 +364,30 @@ The heartbeat worker:
 - polls `external_calls` for pending LLM work
 - triggers scheduled heartbeats (`start_heartbeat()`)
 - executes heartbeat actions and records the result
+
+### Self-Termination (Optional, Default Off)
+
+If enabled, the agent may choose the `terminate` action. This will:
+
+- Wipe all agent state (memories/goals/worldview/identity/etc.)
+- Leave a single strategic memory containing a “last will and testament”
+- Queue the will + any farewell messages into `outbox_messages`
+
+Enable/disable:
+
+```sql
+SELECT set_config('agent.self_termination_enabled', 'true'::jsonb);  -- enable
+SELECT set_config('agent.self_termination_enabled', 'false'::jsonb); -- disable
+```
+
+The `terminate` action expects params like:
+
+```json
+{
+  "last_will": "Full and detailed reason…",
+  "farewells": [{"message": "Goodbye…", "channel": "email", "to": "a@example.com"}]
+}
+```
 
 ### Turning Workers On/Off
 

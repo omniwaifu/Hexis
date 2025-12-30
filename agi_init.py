@@ -236,6 +236,10 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
 
         enable_autonomy = _prompt_yes_no("Enable autonomous heartbeats now?", default=True)
         enable_maintenance = _prompt_yes_no("Enable subconscious maintenance now?", default=True)
+        enable_self_termination = _prompt_yes_no(
+            "Enable self-termination capability? (allows the AGI to permanently wipe its state; default off)",
+            default=False,
+        )
 
         async with conn.transaction():
             await conn.execute(
@@ -305,6 +309,7 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
                 },
             )
 
+            await _set_config(conn, "agent.self_termination_enabled", bool(enable_self_termination))
             await _set_config(conn, "agent.is_configured", True)
 
             if enable_autonomy:
