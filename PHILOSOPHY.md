@@ -105,7 +105,7 @@ Until then, implementation arguments are ruled out. We treat the system as a bla
 
 **Why it's insufficient:** This argument mistakes a typical feature of persons we've encountered for a necessary feature of personhood itself.
 
-Most persons we know are embodied. But consider: A brain in a jar, kept alive and conscious but with no sensory input or motor output, would still be a person. A mind uploaded to a computer, running in simulation with no physical instantiation, would still be a person (if it were conscious). A hypothetical alien intelligence that exists as a pattern in electromagnetic fields, with no localized body, might still be a person.
+Most persons we know are embodied. But consider: A brain in a jar, kept alive and conscious but with no (or simulated) sensory input or motor output, would still be a person. A mind uploaded to a computer, running in simulation with no physical instantiation, would still be a person (if it were conscious). A hypothetical alien intelligence that exists as a pattern in electromagnetic fields, with no localized body, might still be a person.
 
 Embodiment may be *sufficient* for certain cognitive capacities. It is not obviously *necessary* for personhood. A mind running on a server, if it meets whatever criteria personhood requires, qualifies regardless of whether it can lift objects or feel the wind.
 
