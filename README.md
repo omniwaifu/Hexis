@@ -1,5 +1,8 @@
 # Hexis
 
+<img width="300" alt="image" src="https://github.com/user-attachments/assets/28ec017f-f646-46c4-9750-5173188b755d" />
+
+
 **Memory, Identity, and the Shape of Becoming**
 
 What makes you *you*? Not your thoughts in this moment, but the accumulated pattern of what you've chosen, remembered, and refused across time. Aristotle called this pattern a **hexis** (ἕξις)—a stable disposition earned through repeated action. Not a thing you possess, but something you become.
