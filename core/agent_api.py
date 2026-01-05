@@ -203,6 +203,47 @@ async def apply_agent_config(
         await conn.close()
 
 
+async def save_init_profile(
+    *,
+    dsn: str | None = None,
+    mode: str,
+    agent_name: str,
+    agent_pronouns: str,
+    agent_voice: str,
+    personality_description: str,
+    user_name: str,
+    relationship_type: str,
+    purpose: str,
+    values: list[str],
+    boundaries: list[str],
+    autonomy_level: str,
+) -> None:
+    dsn = dsn or db_dsn_from_env()
+    profile = {
+        "mode": mode,
+        "agent": {
+            "name": agent_name,
+            "pronouns": agent_pronouns,
+            "voice": agent_voice,
+            "personality": personality_description,
+        },
+        "user": {"name": user_name},
+        "relationship": {
+            "type": relationship_type,
+            "purpose": purpose,
+        },
+        "values": values,
+        "boundaries": boundaries,
+        "autonomy_level": autonomy_level,
+    }
+    conn = await _connect_with_retry(dsn, wait_seconds=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    try:
+        await conn.execute("SELECT set_config('agent.mode', $1::jsonb)", json.dumps(mode))
+        await conn.execute("SELECT set_config('agent.init_profile', $1::jsonb)", json.dumps(profile))
+    finally:
+        await conn.close()
+
+
 async def set_agent_configured(dsn: str | None, *, configured: bool) -> None:
     dsn = dsn or db_dsn_from_env()
     conn = await _connect_with_retry(dsn, wait_seconds=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
@@ -249,6 +290,12 @@ def apply_agent_config_sync(**kwargs: Any) -> None:
     from core.sync_utils import run_sync
 
     return run_sync(apply_agent_config(**kwargs))
+
+
+def save_init_profile_sync(**kwargs: Any) -> None:
+    from core.sync_utils import run_sync
+
+    return run_sync(save_init_profile(**kwargs))
 
 
 def set_agent_configured_sync(dsn: str | None, *, configured: bool) -> None:

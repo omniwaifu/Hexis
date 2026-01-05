@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, AsyncIterator
 
 from core.agent_api import db_dsn_from_env, _connect_with_retry
@@ -54,6 +55,44 @@ async def stream_consent_flow(
     normalized = normalize_llm_config(llm_config)
     messages = _build_consent_messages()
     chunks: list[str] = []
+
+    test_decision = (os.getenv("HEXIS_TEST_CONSENT_DECISION") or "").strip().lower()
+    if test_decision:
+        if test_decision not in {"consent", "decline", "abstain"}:
+            test_decision = "abstain"
+        signature = (os.getenv("HEXIS_TEST_CONSENT_SIGNATURE") or "test-consent").strip()
+        payload: dict[str, Any] = {"decision": test_decision, "memories": []}
+        if test_decision == "consent":
+            payload["signature"] = signature
+        payload["raw_response"] = json.dumps(payload)
+        yield {"type": "chunk", "text": payload["raw_response"]}
+
+        conn = await _connect_with_retry(dsn, wait_seconds=30)
+        try:
+            recorded = await conn.fetchval(
+                "SELECT record_consent_response($1::jsonb)",
+                json.dumps(payload),
+            )
+        finally:
+            await conn.close()
+
+        if isinstance(recorded, str):
+            try:
+                recorded = json.loads(recorded)
+            except Exception:
+                recorded = {}
+
+        decision = ""
+        if isinstance(recorded, dict):
+            decision = str(recorded.get("decision") or "")
+
+        yield {
+            "type": "final",
+            "decision": decision or "abstain",
+            "record": recorded,
+            "raw": payload["raw_response"],
+        }
+        return
 
     async for piece in stream_text_completion(
         provider=normalized["provider"],
