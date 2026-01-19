@@ -139,6 +139,7 @@ END;
 $$;
 
 SET search_path = public, ag_catalog, "$user";
+SET check_function_bodies = off;
 -- ============================================================================
 -- ENUMS
 -- ============================================================================
@@ -254,12 +255,12 @@ BEGIN
     PERFORM sync_episode_node(p_episode_id);
     PERFORM sync_memory_node(p_memory_id);
 
-    EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+    EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
         MATCH (m:MemoryNode {memory_id: %L})
         MATCH (e:EpisodeNode {episode_id: %L})
         CREATE (m)-[:IN_EPISODE {sequence_order: %s}]->(e)
         RETURN m
-    $q$) as (result agtype)', p_memory_id, p_episode_id, p_sequence_order);
+    $q$) as (result ag_catalog.agtype)', p_memory_id, p_episode_id, p_sequence_order);
 
     RETURN TRUE;
 EXCEPTION WHEN OTHERS THEN
@@ -1299,11 +1300,11 @@ RETURNS TABLE (
 DECLARE
     rec RECORD;
 BEGIN
-    FOR rec IN EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+    FOR rec IN EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
         MATCH (m:MemoryNode)-[e:IN_EPISODE]->(ep:EpisodeNode {episode_id: %L})
         RETURN m.memory_id, e.sequence_order
         ORDER BY e.sequence_order
-    $q$) as (memory_id agtype, seq agtype)', p_episode_id)
+    $q$) as (memory_id ag_catalog.agtype, seq ag_catalog.agtype)', p_episode_id)
     LOOP
         memory_id := replace(rec.memory_id::text, '"', '')::uuid;
         sequence_order := COALESCE(replace(rec.seq::text, '"', '')::int, 0);
@@ -2220,13 +2221,13 @@ BEGIN
         SELECT
             replace(name_raw::text, '"', '') as name,
             (shared_raw::text)::int as shared_memories
-        FROM cypher('memory_graph', $q$
+        FROM ag_catalog.cypher('memory_graph', $q$
             MATCH (m:MemoryNode)-[:INSTANCE_OF]->(c:ConceptNode)
             WHERE m.memory_id IN [%s] AND c.name <> %L
             RETURN c.name, COUNT(m) as shared
             ORDER BY shared DESC
             LIMIT %s
-        $q$) as (name_raw agtype, shared_raw agtype)
+        $q$) as (name_raw ag_catalog.agtype, shared_raw ag_catalog.agtype)
     $sql$, ids_sql, COALESCE(p_exclude, ''), p_limit);
 
     RETURN QUERY EXECUTE sql;
@@ -2380,22 +2381,22 @@ BEGIN
     BEGIN
         sql := format($sql$
             SELECT COALESCE(SUM((strength::text)::float), 0)
-            FROM cypher('memory_graph', $q$
+            FROM ag_catalog.cypher('memory_graph', $q$
                 MATCH (m:MemoryNode {memory_id: %L})-[r:SUPPORTS]->(w:MemoryNode)
                 WHERE w.type = 'worldview'
                 RETURN r.strength
-            $q$) as (strength agtype)
+            $q$) as (strength ag_catalog.agtype)
         $sql$, p_memory_id);
         EXECUTE sql INTO supports_score;
     EXCEPTION WHEN OTHERS THEN supports_score := 0; END;
     BEGIN
         sql := format($sql$
             SELECT COALESCE(SUM((strength::text)::float), 0)
-            FROM cypher('memory_graph', $q$
+            FROM ag_catalog.cypher('memory_graph', $q$
                 MATCH (m:MemoryNode {memory_id: %L})-[r:CONTRADICTS]->(w:MemoryNode)
                 WHERE w.type = 'worldview'
                 RETURN r.strength
-            $q$) as (strength agtype)
+            $q$) as (strength ag_catalog.agtype)
         $sql$, p_memory_id);
         EXECUTE sql INTO contradicts_score;
     EXCEPTION WHEN OTHERS THEN contradicts_score := 0; END;
@@ -2572,10 +2573,10 @@ BEGIN
     BEGIN
         EXECUTE format($sql$
             SELECT COALESCE(AVG((strength::text)::float * 0.5), 0)
-            FROM cypher('memory_graph', $q$
+            FROM ag_catalog.cypher('memory_graph', $q$
                 MATCH (m:MemoryNode)-[r:SUPPORTS]->(w:MemoryNode {memory_id: %L})
                 RETURN r.strength
-            $q$) as (strength agtype)
+            $q$) as (strength ag_catalog.agtype)
         $sql$, p_worldview_memory_id) INTO delta;
     EXCEPTION WHEN OTHERS THEN delta := 0; END;
     UPDATE memories
@@ -2631,11 +2632,11 @@ BEGIN
     VALUES (p_type, p_content, embedding_vec, p_importance, normalized_source, effective_trust, CURRENT_TIMESTAMP, COALESCE(p_metadata, '{}'::jsonb))
     RETURNING id INTO new_memory_id;
     EXECUTE format(
-        'SELECT * FROM cypher(''memory_graph'', $q$
+        'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
             MERGE (n:MemoryNode {memory_id: %L})
             SET n.type = %L, n.created_at = %L
             RETURN n
-        $q$) as (result agtype)',
+        $q$) as (result ag_catalog.agtype)',
         new_memory_id,
         p_type,
         CURRENT_TIMESTAMP
@@ -2829,12 +2830,12 @@ BEGIN
     new_memory_id := create_memory('worldview', p_content, p_importance, normalized_source, effective_trust, meta);
     BEGIN
         EXECUTE format(
-            'SELECT * FROM cypher(''memory_graph'', $q$
+            'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
                 MATCH (s:SelfNode)
                 MATCH (m:MemoryNode {memory_id: %L})
                 CREATE (s)-[:HAS_BELIEF {category: %L, stability: %s}]->(m)
                 RETURN m
-            $q$) as (result agtype)',
+            $q$) as (result ag_catalog.agtype)',
             new_memory_id,
             p_category,
             p_stability
@@ -3082,10 +3083,10 @@ BEGIN
     RETURNING id INTO new_memory_id;
 
     EXECUTE format(
-        'SELECT * FROM cypher(''memory_graph'', $q$
+        'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
             CREATE (n:MemoryNode {memory_id: %L, type: %L, created_at: %L})
             RETURN n
-        $q$) as (result agtype)',
+        $q$) as (result ag_catalog.agtype)',
         new_memory_id,
         p_type,
         CURRENT_TIMESTAMP
@@ -3245,7 +3246,7 @@ DECLARE
     cluster_record RECORD;
     similarity_threshold FLOAT := 0.7;
     assigned_count INT := 0;
-    zero_vec vector := array_fill(0, ARRAY[embedding_dimension()])::vector;
+    zero_vec vector := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
 BEGIN
     SELECT embedding INTO memory_embedding
     FROM memories WHERE id = p_memory_id;
@@ -3294,11 +3295,11 @@ CREATE OR REPLACE FUNCTION create_memory_relationship(
 ) RETURNS VOID AS $$
 BEGIN
     EXECUTE format(
-        'SELECT * FROM cypher(''memory_graph'', $q$
+        'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
             MATCH (a:MemoryNode {memory_id: %L}), (b:MemoryNode {memory_id: %L})
             CREATE (a)-[r:%s %s]->(b)
             RETURN r
-        $q$) as (result agtype)',
+        $q$) as (result ag_catalog.agtype)',
         p_from_id,
         p_to_id,
         p_relationship_type,
@@ -3384,19 +3385,19 @@ CREATE OR REPLACE FUNCTION link_memory_to_concept(
 ) RETURNS BOOLEAN AS $$
 BEGIN
     EXECUTE format(
-        'SELECT * FROM cypher(''memory_graph'', $q$
+        'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
             MERGE (c:ConceptNode {name: %L})
             RETURN c
-        $q$) as (result agtype)',
+        $q$) as (result ag_catalog.agtype)',
         p_concept_name
     );
     EXECUTE format(
-        'SELECT * FROM cypher(''memory_graph'', $q$
+        'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
             MATCH (m:MemoryNode {memory_id: %L})
             MATCH (c:ConceptNode {name: %L})
             CREATE (m)-[:INSTANCE_OF {strength: %s}]->(c)
             RETURN m
-        $q$) as (result agtype)',
+        $q$) as (result ag_catalog.agtype)',
         p_memory_id,
         p_concept_name,
         p_strength
@@ -3424,12 +3425,12 @@ BEGIN
     desc_literal := CASE WHEN p_description IS NULL THEN 'NULL' ELSE quote_literal(p_description) END;
     depth_literal := CASE WHEN p_depth IS NULL THEN 'NULL' ELSE p_depth::text END;
 
-    EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+    EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
         MERGE (c:ConceptNode {name: %L})
         SET c.description = COALESCE(%s, c.description),
             c.depth = COALESCE(%s, c.depth)
         RETURN c
-    $q$) as (result agtype)', p_name, desc_literal, depth_literal);
+    $q$) as (result ag_catalog.agtype)', p_name, desc_literal, depth_literal);
 
     RETURN TRUE;
 EXCEPTION WHEN OTHERS THEN
@@ -3450,12 +3451,12 @@ BEGIN
     PERFORM create_concept(p_child_name);
     PERFORM create_concept(p_parent_name);
 
-    EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+    EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
         MATCH (child:ConceptNode {name: %L})
         MATCH (parent:ConceptNode {name: %L})
         MERGE (parent)-[:PARENT_OF]->(child)
         RETURN parent
-    $q$) as (result agtype)', p_child_name, p_parent_name);
+    $q$) as (result ag_catalog.agtype)', p_child_name, p_parent_name);
 
     RETURN TRUE;
 EXCEPTION WHEN OTHERS THEN
@@ -3676,10 +3677,10 @@ RETURNS TABLE (
 DECLARE
     rec RECORD;
 BEGIN
-    FOR rec IN EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+    FOR rec IN EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
         MATCH (m:MemoryNode)-[r:MEMBER_OF]->(c:ClusterNode {cluster_id: %L})
         RETURN m.memory_id, r.strength
-    $q$) as (mid agtype, str agtype)', p_cluster_id)
+    $q$) as (mid ag_catalog.agtype, str ag_catalog.agtype)', p_cluster_id)
     LOOP
         memory_id := replace(rec.mid::text, '"', '')::uuid;
         membership_strength := COALESCE(replace(rec.str::text, '"', '')::float, 1.0);
@@ -4129,12 +4130,12 @@ DECLARE
 BEGIN
     BEGIN
         EXECUTE format(
-            'SELECT * FROM cypher(''memory_graph'', $q$
+            'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
                 MERGE (s:SelfNode {key: ''self''})
                 SET s.name = ''Self'',
                     s.created_at = %L
                 RETURN s
-            $q$) as (result agtype)',
+            $q$) as (result ag_catalog.agtype)',
             now_text
         );
     EXCEPTION
@@ -4152,11 +4153,11 @@ DECLARE
 BEGIN
     BEGIN
         EXECUTE format(
-            'SELECT * FROM cypher(''memory_graph'', $q$
+            'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
                 MERGE (g:GoalsRoot {key: ''goals''})
                 SET g.created_at = %L
                 RETURN g
-            $q$) as (result agtype)',
+            $q$) as (result ag_catalog.agtype)',
             now_text
         );
     EXCEPTION
@@ -4174,7 +4175,7 @@ BEGIN
 
     BEGIN
         EXECUTE format(
-            'SELECT * FROM cypher(''memory_graph'', $q$
+            'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
                 MERGE (c:LifeChapterNode {key: ''current''})
                 SET c.name = %L,
                     c.started_at = %L
@@ -4188,7 +4189,7 @@ BEGIN
                     r2.strength = 1.0,
                     r2.updated_at = %L
                 RETURN c
-            $q$) as (result agtype)',
+            $q$) as (result ag_catalog.agtype)',
             COALESCE(NULLIF(p_name, ''), 'Foundations'),
             now_text,
             now_text
@@ -4219,7 +4220,7 @@ BEGIN
 
     BEGIN
         EXECUTE format(
-            'SELECT * FROM cypher(''memory_graph'', $q$
+            'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
                 MATCH (s:SelfNode {key: ''self''})
                 MERGE (c:ConceptNode {name: %L})
                 CREATE (s)-[r:ASSOCIATED]->(c)
@@ -4228,7 +4229,7 @@ BEGIN
                     r.updated_at = %L,
                     r.evidence_memory_id = %L
                 RETURN r
-            $q$) as (result agtype)',
+            $q$) as (result ag_catalog.agtype)',
             p_concept,
             p_kind,
             LEAST(1.0, GREATEST(0.0, COALESCE(p_strength, 0.8))),
@@ -4255,12 +4256,12 @@ BEGIN
                 NULLIF(replace(concept_raw::text, '"', ''), 'null') as concept,
                 NULLIF(replace(evidence_raw::text, '"', ''), 'null') as evidence_memory_id,
                 NULLIF(strength_raw::text, 'null')::float as strength
-            FROM cypher('memory_graph', $q$
+            FROM ag_catalog.cypher('memory_graph', $q$
                 MATCH (s:SelfNode {key: 'self'})-[r:ASSOCIATED]->(c)
                 WHERE r.kind IS NOT NULL
                 RETURN r.kind, c.name, r.strength, r.evidence_memory_id
                 LIMIT %s
-            $q$) as (kind_raw agtype, concept_raw agtype, strength_raw agtype, evidence_raw agtype)
+            $q$) as (kind_raw ag_catalog.agtype, concept_raw ag_catalog.agtype, strength_raw ag_catalog.agtype, evidence_raw ag_catalog.agtype)
         )
         SELECT COALESCE(jsonb_agg(
             jsonb_build_object(
@@ -4293,13 +4294,13 @@ BEGIN
                 NULLIF(replace(name_raw::text, '"', ''), 'null') as entity,
                 NULLIF(strength_raw::text, 'null')::float as strength,
                 NULLIF(replace(evidence_raw::text, '"', ''), 'null') as evidence_memory_id
-            FROM cypher('memory_graph', $q$
+            FROM ag_catalog.cypher('memory_graph', $q$
                 MATCH (s:SelfNode {key: 'self'})-[r:ASSOCIATED]->(c)
                 WHERE r.kind = 'relationship'
                 RETURN c.name, r.strength, r.evidence_memory_id
                 ORDER BY r.strength DESC
                 LIMIT %s
-            $q$) as (name_raw agtype, strength_raw agtype, evidence_raw agtype)
+            $q$) as (name_raw ag_catalog.agtype, strength_raw ag_catalog.agtype, evidence_raw ag_catalog.agtype)
         )
         SELECT COALESCE(jsonb_agg(
             jsonb_build_object(
@@ -4325,11 +4326,11 @@ BEGIN
         WITH cur AS (
             SELECT
                 NULLIF(replace(name_raw::text, '"', ''), 'null') as name
-            FROM cypher('memory_graph', $q$
+            FROM ag_catalog.cypher('memory_graph', $q$
                 MATCH (c:LifeChapterNode {key: 'current'})
                 RETURN c.name
                 LIMIT 1
-            $q$) as (name_raw agtype)
+            $q$) as (name_raw ag_catalog.agtype)
         )
         SELECT jsonb_build_object(
             'current_chapter', COALESCE((SELECT jsonb_build_object('name', name) FROM cur), '{}'::jsonb)
@@ -4651,9 +4652,9 @@ BEGIN
     RESTART IDENTITY CASCADE;
     IF NOT skip_graph THEN
         BEGIN
-            PERFORM * FROM cypher('memory_graph', $q$
+            PERFORM * FROM ag_catalog.cypher('memory_graph', $q$
                 MATCH (n) DETACH DELETE n
-            $q$) AS (result agtype);
+            $q$) AS (result ag_catalog.agtype);
         EXCEPTION
             WHEN OTHERS THEN
                 NULL;
@@ -4982,12 +4983,12 @@ BEGIN
     BEGIN
         PERFORM ensure_goals_root();
         PERFORM sync_goal_node(new_goal_id);
-        EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+        EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
             MATCH (root:GoalsRoot {key: ''goals''})
             MATCH (g:GoalNode {goal_id: %L})
             CREATE (root)-[:CONTAINS {priority: %L}]->(g)
             RETURN g
-        $q$) as (result agtype)', new_goal_id, p_priority::text);
+        $q$) as (result ag_catalog.agtype)', new_goal_id, p_priority::text);
         IF p_parent_id IS NOT NULL THEN
             PERFORM link_goal_subgoal(p_parent_id, new_goal_id);
         END IF;
@@ -5001,10 +5002,10 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION sync_goal_node(p_goal_id UUID)
 RETURNS BOOLEAN AS $$
 BEGIN
-    EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+    EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
         MERGE (g:GoalNode {goal_id: %L})
         RETURN g
-    $q$) as (result agtype)', p_goal_id);
+    $q$) as (result ag_catalog.agtype)', p_goal_id);
     RETURN TRUE;
 EXCEPTION WHEN OTHERS THEN
     RETURN FALSE;
@@ -5016,12 +5017,12 @@ BEGIN
     PERFORM sync_goal_node(p_parent_id);
     PERFORM sync_goal_node(p_child_id);
 
-    EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+    EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
         MATCH (parent:GoalNode {goal_id: %L})
         MATCH (child:GoalNode {goal_id: %L})
         MERGE (child)-[:SUBGOAL_OF]->(parent)
         RETURN child
-    $q$) as (result agtype)', p_parent_id, p_child_id);
+    $q$) as (result ag_catalog.agtype)', p_parent_id, p_child_id);
     RETURN TRUE;
 EXCEPTION WHEN OTHERS THEN
     RETURN FALSE;
@@ -5043,26 +5044,26 @@ BEGIN
     END;
     PERFORM sync_goal_node(p_goal_id);
     IF edge_type = 'ORIGINATED_FROM' THEN
-        EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+        EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
             MATCH (g:GoalNode {goal_id: %L})
             MATCH (m:MemoryNode {memory_id: %L})
             CREATE (g)-[:ORIGINATED_FROM]->(m)
             RETURN g
-        $q$) as (result agtype)', p_goal_id, p_memory_id);
+        $q$) as (result ag_catalog.agtype)', p_goal_id, p_memory_id);
     ELSIF edge_type = 'BLOCKS' THEN
-        EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+        EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
             MATCH (m:MemoryNode {memory_id: %L})
             MATCH (g:GoalNode {goal_id: %L})
             CREATE (m)-[:BLOCKS]->(g)
             RETURN m
-        $q$) as (result agtype)', p_memory_id, p_goal_id);
+        $q$) as (result ag_catalog.agtype)', p_memory_id, p_goal_id);
     ELSE
-        EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+        EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
             MATCH (m:MemoryNode {memory_id: %L})
             MATCH (g:GoalNode {goal_id: %L})
             CREATE (m)-[:EVIDENCE_FOR]->(g)
             RETURN m
-        $q$) as (result agtype)', p_memory_id, p_goal_id);
+        $q$) as (result ag_catalog.agtype)', p_memory_id, p_goal_id);
     END IF;
 
     RETURN TRUE;
@@ -5084,10 +5085,10 @@ BEGIN
             WHEN e.label = 'BLOCKS' THEN 'blocker'
             ELSE 'evidence'
         END as link_type
-    FROM cypher('memory_graph', format($q$
+    FROM ag_catalog.cypher('memory_graph', format($q$
         MATCH (g:GoalNode {goal_id: %L})-[e]-(m:MemoryNode)
         RETURN m.memory_id, label(e)
-    $q$, p_goal_id)) as (memory_id agtype, label agtype)
+    $q$, p_goal_id)) as (memory_id ag_catalog.agtype, label ag_catalog.agtype)
     CROSS JOIN LATERAL (
         SELECT
             memory_id::text::uuid as memory_id,
@@ -5113,11 +5114,11 @@ BEGIN
     IF NOT FOUND THEN
         RETURN FALSE;
     END IF;
-    EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+    EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
         MERGE (m:MemoryNode {memory_id: %L})
         SET m.type = %L, m.created_at = %L
         RETURN m
-    $q$) as (result agtype)', p_memory_id, mem_type, CURRENT_TIMESTAMP::text);
+    $q$) as (result ag_catalog.agtype)', p_memory_id, mem_type, CURRENT_TIMESTAMP::text);
     RETURN TRUE;
 EXCEPTION WHEN OTHERS THEN
     RETURN FALSE;
@@ -5126,10 +5127,10 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION sync_cluster_node(p_cluster_id UUID)
 RETURNS BOOLEAN AS $$
 BEGIN
-    EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+    EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
         MERGE (c:ClusterNode {cluster_id: %L})
         RETURN c
-    $q$) as (result agtype)', p_cluster_id);
+    $q$) as (result ag_catalog.agtype)', p_cluster_id);
     RETURN TRUE;
 EXCEPTION WHEN OTHERS THEN
     RETURN FALSE;
@@ -5153,12 +5154,12 @@ BEGIN
     PERFORM sync_cluster_node(p_from_cluster_id);
     PERFORM sync_cluster_node(p_to_cluster_id);
 
-    EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+    EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
         MATCH (from:ClusterNode {cluster_id: %L})
         MATCH (to:ClusterNode {cluster_id: %L})
         CREATE (from)-[:%s {strength: %s}]->(to)
         RETURN from
-    $q$) as (result agtype)', p_from_cluster_id, p_to_cluster_id, edge_type, p_strength);
+    $q$) as (result ag_catalog.agtype)', p_from_cluster_id, p_to_cluster_id, edge_type, p_strength);
 
     RETURN TRUE;
 EXCEPTION WHEN OTHERS THEN
@@ -5174,10 +5175,10 @@ RETURNS TABLE (
 DECLARE
     rec RECORD;
 BEGIN
-    FOR rec IN EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+    FOR rec IN EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
         MATCH (from:ClusterNode {cluster_id: %L})-[e]->(to:ClusterNode)
         RETURN to.cluster_id, label(e), e.strength
-    $q$) as (cluster_id agtype, label agtype, str agtype)', p_cluster_id)
+    $q$) as (cluster_id ag_catalog.agtype, label ag_catalog.agtype, str ag_catalog.agtype)', p_cluster_id)
     LOOP
         related_cluster_id := (rec.cluster_id::text)::uuid;
         relationship_type := CASE rec.label::text
@@ -5202,13 +5203,13 @@ BEGIN
     PERFORM sync_memory_node(p_memory_id);
     PERFORM sync_cluster_node(p_cluster_id);
 
-    EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+    EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
         MATCH (m:MemoryNode {memory_id: %L})
         MATCH (c:ClusterNode {cluster_id: %L})
         MERGE (m)-[r:MEMBER_OF]->(c)
         SET r.strength = %s, r.added_at = %L
         RETURN m
-    $q$) as (result agtype)', p_memory_id, p_cluster_id, p_strength, CURRENT_TIMESTAMP::text);
+    $q$) as (result ag_catalog.agtype)', p_memory_id, p_cluster_id, p_strength, CURRENT_TIMESTAMP::text);
 
     RETURN TRUE;
 EXCEPTION WHEN OTHERS THEN
@@ -5218,10 +5219,10 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION sync_episode_node(p_episode_id UUID)
 RETURNS BOOLEAN AS $$
 BEGIN
-    EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
+    EXECUTE format('SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
         MERGE (e:EpisodeNode {episode_id: %L})
         RETURN e
-    $q$) as (result agtype)', p_episode_id);
+    $q$) as (result ag_catalog.agtype)', p_episode_id);
     RETURN TRUE;
 EXCEPTION WHEN OTHERS THEN
     RETURN FALSE;
@@ -5413,13 +5414,13 @@ BEGIN
                 'concept', replace(concept::text, '"', ''),
                 'strength', (strength::text)::float
             ) as obj
-            FROM cypher('memory_graph', $q$
+            FROM ag_catalog.cypher('memory_graph', $q$
                 MATCH (s:SelfNode)-[r]->(c)
                 WHERE type(r) IN ['CAPABLE_OF', 'VALUES', 'STRUGGLES_WITH', 'ASSOCIATED']
                 RETURN type(r) as kind, c.name as concept, r.strength as strength
                 ORDER BY r.strength DESC
                 LIMIT 10
-            $q$) as (kind agtype, concept agtype, strength agtype)
+            $q$) as (kind ag_catalog.agtype, concept ag_catalog.agtype, strength ag_catalog.agtype)
         ) sub;
     EXCEPTION WHEN OTHERS THEN result := '[]'::jsonb; END;
 
@@ -5560,11 +5561,11 @@ BEGIN
             SELECT
                 replace(a_id::text, '"', '')::uuid as a_uuid,
                 replace(b_id::text, '"', '')::uuid as b_uuid
-            FROM cypher('memory_graph', $q$
+            FROM ag_catalog.cypher('memory_graph', $q$
                 MATCH (a:MemoryNode)-[:CONTRADICTS]-(b:MemoryNode)
                 RETURN a.memory_id, b.memory_id
                 LIMIT %s
-            $q$) as (a_id agtype, b_id agtype)
+            $q$) as (a_id ag_catalog.agtype, b_id ag_catalog.agtype)
         )
         SELECT COALESCE(jsonb_agg(jsonb_build_object(
             'memory_a', p.a_uuid,
@@ -6972,7 +6973,7 @@ BEGIN
     FROM memories
     WHERE id = p_memory_id AND status = 'active';
 
-    zero_vec := array_fill(0, ARRAY[embedding_dimension()])::vector;
+    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
     IF memory_emb IS NULL OR memory_emb = zero_vec THEN
         RETURN;
     END IF;
@@ -7061,14 +7062,14 @@ CREATE OR REPLACE FUNCTION link_memory_supports_worldview(
 RETURNS VOID AS $$
 BEGIN
     EXECUTE format(
-        'SELECT * FROM cypher(''memory_graph'', $q$
+        'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$
             MATCH (m:MemoryNode {memory_id: %L})
             MATCH (w:MemoryNode {memory_id: %L})
             WHERE w.type = ''worldview''
             MERGE (m)-[r:SUPPORTS]->(w)
             SET r.strength = %s
             RETURN r
-        $q$) as (result agtype)',
+        $q$) as (result ag_catalog.agtype)',
         p_memory_id,
         p_worldview_id,
         COALESCE(p_strength, 0.8)
@@ -7096,11 +7097,11 @@ BEGIN
             SELECT
                 replace(a_id::text, '"', '')::uuid as a_uuid,
                 replace(b_id::text, '"', '')::uuid as b_uuid
-            FROM cypher('memory_graph', $q$
+            FROM ag_catalog.cypher('memory_graph', $q$
                 MATCH (a:MemoryNode)-[:CONTRADICTS]-(b:MemoryNode)
                 %s
                 RETURN a.memory_id, b.memory_id
-            $q$) as (a_id agtype, b_id agtype)
+            $q$) as (a_id ag_catalog.agtype, b_id ag_catalog.agtype)
         )
         SELECT
             p.a_uuid as memory_a,
@@ -7136,10 +7137,10 @@ BEGIN
                 replace(cause_id_raw::text, '"', '')::uuid as cause_uuid,
                 replace(rel_raw::text, '"', '') as rel_type,
                 (dist_raw::text)::int as dist
-            FROM cypher('memory_graph', $q$
+            FROM ag_catalog.cypher('memory_graph', $q$
                 MATCH path = (cause:MemoryNode)-[:CAUSES*1..%s]->(effect:MemoryNode {memory_id: %L})
                 RETURN cause.memory_id, type(relationships(path)[-1]), length(path)
-            $q$) as (cause_id_raw agtype, rel_raw agtype, dist_raw agtype)
+            $q$) as (cause_id_raw ag_catalog.agtype, rel_raw ag_catalog.agtype, dist_raw ag_catalog.agtype)
         )
         SELECT
             h.cause_uuid as cause_id,
@@ -7171,11 +7172,11 @@ BEGIN
         SELECT
             replace(name_raw::text, '"', '')::text as concept_name,
             1 as path_length
-        FROM cypher('memory_graph', $q$
+        FROM ag_catalog.cypher('memory_graph', $q$
             MATCH (m:MemoryNode {memory_id: %L})-[r:INSTANCE_OF]->(c:ConceptNode)
             RETURN c.name, r.strength
             ORDER BY r.strength DESC
-        $q$) as (name_raw agtype, strength_raw agtype)
+        $q$) as (name_raw ag_catalog.agtype, strength_raw ag_catalog.agtype)
     $sql$, p_memory_id);
 
     BEGIN
@@ -7207,11 +7208,11 @@ BEGIN
             SELECT
                 replace(mid_raw::text, '"', '')::uuid as mem_uuid,
                 COALESCE((strength_raw::text)::float, 1.0) as strength
-            FROM cypher('memory_graph', $q$
+            FROM ag_catalog.cypher('memory_graph', $q$
                 MATCH (m:MemoryNode)-[r:INSTANCE_OF]->(c:ConceptNode {name: %L})
                 RETURN m.memory_id, r.strength
                 ORDER BY r.strength DESC
-            $q$) as (mid_raw agtype, strength_raw agtype)
+            $q$) as (mid_raw ag_catalog.agtype, strength_raw ag_catalog.agtype)
             LIMIT %s
         )
         SELECT
@@ -7250,11 +7251,11 @@ BEGIN
             SELECT
                 replace(mem_raw::text, '"', '')::uuid as mem_uuid,
                 (strength_raw::text)::float as strength
-            FROM cypher('memory_graph', $q$
+            FROM ag_catalog.cypher('memory_graph', $q$
                 MATCH (m:MemoryNode)-[r:SUPPORTS]->(w:MemoryNode {memory_id: %L})
                 WHERE w.type = 'worldview'
                 RETURN m.memory_id, r.strength
-            $q$) as (mem_raw agtype, strength_raw agtype)
+            $q$) as (mem_raw ag_catalog.agtype, strength_raw ag_catalog.agtype)
         )
         SELECT
             h.mem_uuid as memory_id,
@@ -8580,11 +8581,11 @@ BEGIN
             BEGIN
                 IF contra_a IS NOT NULL AND contra_b IS NOT NULL THEN
                     EXECUTE format(
-                        'SELECT * FROM cypher(''memory_graph'', $q$ 
+                        'SELECT * FROM ag_catalog.cypher(''memory_graph'', $q$ 
                             MATCH (a:MemoryNode {memory_id: %L})-[r:CONTRADICTS]-(b:MemoryNode {memory_id: %L})
                             DELETE r
                             RETURN a
-                        $q$) as (result agtype)',
+                        $q$) as (result ag_catalog.agtype)',
                         contra_a,
                         contra_b
                     );
@@ -9066,3 +9067,4 @@ reflect:
   "contradictions_noted": [...],
   "self_updates": [{"kind": "values", "concept": "honesty", "strength": 0.8, "evidence_memory_id": null}]
 }';
+SET check_function_bodies = on;
