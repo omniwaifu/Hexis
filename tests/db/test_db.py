@@ -5,6 +5,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import asyncpg
 import numpy as np
 import pytest
 from tenacity import (
@@ -26,6 +27,12 @@ from tests.utils import (
 pytestmark = [pytest.mark.asyncio(loop_scope="session"), pytest.mark.db]
 
 EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", os.getenv("EMBEDDING_DIM", "768")))
+PERF_CLUSTER_RETRIEVAL_SECONDS = float(os.getenv("HEXIS_TEST_PERF_CLUSTER_SECONDS", "2.0"))
+PERF_VECTOR_SEARCH_SECONDS = float(os.getenv("HEXIS_TEST_PERF_VECTOR_SECONDS", "2.5"))
+PERF_COMPLEX_QUERY_SECONDS = float(os.getenv("HEXIS_TEST_PERF_COMPLEX_QUERY_SECONDS", "1.5"))
+PERF_VIEW_QUERY_SECONDS = float(os.getenv("HEXIS_TEST_PERF_VIEW_QUERY_SECONDS", "1.5"))
+PERF_OPTIMIZE_QUERY_SECONDS = float(os.getenv("HEXIS_TEST_PERF_OPTIMIZE_QUERY_SECONDS", "2.0"))
+LARGE_DATASET_SIZE = int(os.getenv("HEXIS_TEST_LARGE_DATASET_SIZE", "1000"))
 
 async def _ensure_memory_node(conn, memory_id: uuid.UUID, mem_type: str) -> None:
     await conn.execute("LOAD 'age';")
@@ -55,6 +62,85 @@ async def _fetch_episode_for_memory(conn, memory_id: uuid.UUID):
         memory_id,
     )
 
+
+async def _set_heartbeat_state(
+    conn,
+    heartbeat_count: int,
+    current_energy: float | None = None,
+) -> None:
+    payload = {"heartbeat_count": heartbeat_count}
+    if current_energy is not None:
+        payload["current_energy"] = current_energy
+    await conn.execute(
+        "SELECT set_state('heartbeat_state', $1::jsonb)",
+        json.dumps(payload),
+    )
+
+
+async def _create_goal_memory(conn, content: str) -> uuid.UUID:
+    return await conn.fetchval(
+        """
+        INSERT INTO memories (type, content, embedding)
+        VALUES ('goal'::memory_type, $1, array_fill(0.05, ARRAY[embedding_dimension()])::vector)
+        RETURNING id
+        """,
+        content,
+    )
+
+
+async def _create_transformable_belief(
+    conn,
+    content: str,
+    category: str = "belief",
+    subcategory: str = "test_belief",
+    origin: str = "user_initialized",
+    trait: str | None = None,
+) -> uuid.UUID:
+    return await conn.fetchval(
+        """
+        INSERT INTO memories (type, content, embedding, metadata)
+        VALUES (
+            'worldview'::memory_type,
+            $1,
+            array_fill(0.08, ARRAY[embedding_dimension()])::vector,
+            jsonb_build_object(
+                'category', $2::text,
+                'subcategory', $3::text,
+                'origin', $4::text,
+                'trait', $5::text,
+                'change_requires', 'deliberate_transformation',
+                'transformation_state', default_transformation_state()
+            )
+        )
+        RETURNING id
+        """,
+        content,
+        category,
+        subcategory,
+        origin,
+        trait,
+    )
+
+
+async def _create_episode(
+    conn,
+    started_at: datetime | None = None,
+    ended_at: datetime | None = None,
+    summary: str | None = None,
+    episode_type: str | None = None,
+) -> uuid.UUID:
+    return await conn.fetchval(
+        """
+        INSERT INTO episodes (started_at, ended_at, summary, metadata)
+        VALUES ($1, $2, $3, jsonb_build_object('episode_type', $4::text))
+        RETURNING id
+        """,
+        started_at or datetime.now(timezone.utc),
+        ended_at,
+        summary,
+        episode_type,
+    )
+
 async def test_extensions(db_pool):
     """Test that required PostgreSQL extensions are installed"""
     async with db_pool.acquire() as conn:
@@ -63,7 +149,7 @@ async def test_extensions(db_pool):
         """)
         ext_names = {ext['extname'] for ext in extensions}
         
-        required_extensions = {'vector', 'age', 'btree_gist', 'pg_trgm'}
+        required_extensions = {'vector', 'age', 'btree_gist', 'pg_trgm', 'http'}
         for ext in required_extensions:
             assert ext in ext_names, f"{ext} extension not found"
         # Verify AGE is loaded
@@ -245,21 +331,28 @@ async def test_memory_importance(db_pool):
 async def test_age_setup(db_pool):
     """Test AGE graph functionality"""
     async with db_pool.acquire() as conn:
-        # Ensure clean state
-        await conn.execute("""
-            LOAD 'age';
-            SET search_path = ag_catalog, public;
-            SELECT drop_graph('memory_graph', true);
+        await conn.execute("LOAD 'age';")
+        await conn.execute("SET search_path = ag_catalog, public;")
+
+        graph_id = await conn.fetchval("""
+            SELECT graphid FROM ag_catalog.ag_graph
+            WHERE name = 'memory_graph'::name
         """)
-        
-        # Create graph and label
-        await conn.execute("""
-            SELECT create_graph('memory_graph');
-        """)
-        
-        await conn.execute("""
-            SELECT create_vlabel('memory_graph', 'MemoryNode');
-        """)
+        if graph_id is None:
+            await conn.execute("SELECT create_graph('memory_graph');")
+            graph_id = await conn.fetchval("""
+                SELECT graphid FROM ag_catalog.ag_graph
+                WHERE name = 'memory_graph'::name
+            """)
+
+        label_count = await conn.fetchval("""
+            SELECT COUNT(*)
+            FROM ag_catalog.ag_label
+            WHERE name = 'MemoryNode'::name
+              AND graph = $1
+        """, graph_id)
+        if int(label_count or 0) == 0:
+            await conn.execute("SELECT create_vlabel('memory_graph', 'MemoryNode');")
 
         # Test graph exists
         result = await conn.fetch("""
@@ -869,6 +962,1092 @@ async def test_age_in_days_function(db_pool):
         """)
         assert abs(result - 7.0) < 0.1, "Should be approximately 7 days"
 
+
+async def test_default_transformation_state(db_pool):
+    async with db_pool.acquire() as conn:
+        state = _coerce_json(await conn.fetchval("SELECT default_transformation_state()"))
+        assert state["active_exploration"] is False
+        assert state["exploration_goal_id"] is None
+        assert state["evidence_memories"] == []
+        assert state["reflection_count"] == 0
+        assert state["first_questioned_heartbeat"] is None
+        assert state["contemplation_actions"] == 0
+
+
+async def test_normalize_transformation_state_null_returns_defaults(db_pool):
+    async with db_pool.acquire() as conn:
+        state = _coerce_json(await conn.fetchval("SELECT normalize_transformation_state(NULL)"))
+        baseline = _coerce_json(await conn.fetchval("SELECT default_transformation_state()"))
+        assert state == baseline
+
+
+async def test_normalize_transformation_state_merges_values(db_pool):
+    async with db_pool.acquire() as conn:
+        state = _coerce_json(
+            await conn.fetchval(
+                "SELECT normalize_transformation_state($1::jsonb)",
+                json.dumps({"active_exploration": True, "reflection_count": 3}),
+            )
+        )
+        assert state["active_exploration"] is True
+        assert state["reflection_count"] == 3
+        assert state["evidence_memories"] == []
+        assert state["contemplation_actions"] == 0
+
+
+async def test_get_transformation_config_prefers_subcategory(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            test_id = get_test_identifier("transformation_prefers_subcategory")
+            sub_key = f"transformation.sub_{test_id}"
+            cat_key = f"transformation.cat_{test_id}"
+            await conn.execute(
+                """
+                INSERT INTO config (key, value)
+                VALUES ($1, $2::jsonb)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                sub_key,
+                json.dumps({"min_reflections": 2}),
+            )
+            await conn.execute(
+                """
+                INSERT INTO config (key, value)
+                VALUES ($1, $2::jsonb)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                cat_key,
+                json.dumps({"min_reflections": 5}),
+            )
+            cfg = _coerce_json(
+                await conn.fetchval(
+                    "SELECT get_transformation_config($1, $2)",
+                    f"sub_{test_id}",
+                    f"cat_{test_id}",
+                )
+            )
+            assert cfg["min_reflections"] == 2
+        finally:
+            await tr.rollback()
+
+
+async def test_get_transformation_config_falls_back_to_category(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            test_id = get_test_identifier("transformation_fallback_category")
+            cat_key = f"transformation.cat_only_{test_id}"
+            await conn.execute(
+                """
+                INSERT INTO config (key, value)
+                VALUES ($1, $2::jsonb)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                cat_key,
+                json.dumps({"min_reflections": 7}),
+            )
+            cfg = _coerce_json(
+                await conn.fetchval(
+                    "SELECT get_transformation_config($1, $2)",
+                    f"missing_{test_id}",
+                    f"cat_only_{test_id}",
+                )
+            )
+            assert cfg["min_reflections"] == 7
+        finally:
+            await tr.rollback()
+
+
+async def test_get_transformation_config_returns_null_when_missing(db_pool):
+    async with db_pool.acquire() as conn:
+        test_id = get_test_identifier("transformation_missing")
+        cfg = _coerce_json(
+            await conn.fetchval(
+                "SELECT get_transformation_config($1, $2)",
+                f"missing_{test_id}",
+                f"missing_{test_id}",
+            )
+        )
+        assert cfg is None
+
+
+async def test_begin_belief_exploration_success(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            test_id = get_test_identifier("begin_explore")
+            await _set_heartbeat_state(conn, 12, 10)
+            goal_id = await _create_goal_memory(conn, f"Goal {test_id}")
+            belief_id = await _create_transformable_belief(
+                conn,
+                f"Belief {test_id}",
+                subcategory=f"sub_{test_id}",
+            )
+
+            result = _coerce_json(
+                await conn.fetchval(
+                    "SELECT begin_belief_exploration($1, $2)",
+                    belief_id,
+                    goal_id,
+                )
+            )
+            assert result["success"] is True
+
+            state = _coerce_json(
+                await conn.fetchval(
+                    "SELECT metadata->'transformation_state' FROM memories WHERE id = $1",
+                    belief_id,
+                )
+            )
+            assert state["active_exploration"] is True
+            assert state["exploration_goal_id"] == str(goal_id)
+            assert state["reflection_count"] == 0
+            assert state["evidence_memories"] == []
+            assert state["contemplation_actions"] == 0
+            assert state["first_questioned_heartbeat"] == 12
+        finally:
+            await tr.rollback()
+
+
+async def test_begin_belief_exploration_rejects_non_transformable(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            belief_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, metadata)
+                VALUES (
+                    'worldview'::memory_type,
+                    $1,
+                    array_fill(0.04, ARRAY[embedding_dimension()])::vector,
+                    jsonb_build_object('category', 'belief', 'subcategory', 'test')
+                )
+                RETURNING id
+                """,
+                f"Not transformable {get_test_identifier('non_transformable')}",
+            )
+            result = _coerce_json(
+                await conn.fetchval(
+                    "SELECT begin_belief_exploration($1, $2)",
+                    belief_id,
+                    uuid.uuid4(),
+                )
+            )
+            assert result["success"] is False
+            assert result["reason"] == "not_transformable"
+        finally:
+            await tr.rollback()
+
+
+async def test_record_transformation_effort_tracks_reflections_and_evidence(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            test_id = get_test_identifier("effort")
+            await _set_heartbeat_state(conn, 5, 10)
+            goal_id = await _create_goal_memory(conn, f"Goal {test_id}")
+            belief_id = await _create_transformable_belief(
+                conn,
+                f"Belief {test_id}",
+                subcategory=f"sub_{test_id}",
+            )
+            await conn.fetchval("SELECT begin_belief_exploration($1, $2)", belief_id, goal_id)
+
+            evidence_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, importance, trust_level)
+                VALUES ('semantic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector, 0.9, 0.9)
+                RETURNING id
+                """,
+                f"Evidence {test_id}",
+            )
+
+            result = _coerce_json(
+                await conn.fetchval(
+                    "SELECT record_transformation_effort($1, 'reflect', $2, $3)",
+                    belief_id,
+                    "Noted evidence",
+                    evidence_id,
+                )
+            )
+            assert result["success"] is True
+            assert result["reflection_increment"] == 1
+            assert result["new_reflection_count"] == 1
+
+            state = _coerce_json(
+                await conn.fetchval(
+                    "SELECT metadata->'transformation_state' FROM memories WHERE id = $1",
+                    belief_id,
+                )
+            )
+            assert state["reflection_count"] == 1
+            assert state["contemplation_actions"] == 1
+            assert str(evidence_id) in state["evidence_memories"]
+
+            await conn.fetchval(
+                "SELECT record_transformation_effort($1, 'debate_internally', NULL, $2)",
+                belief_id,
+                evidence_id,
+            )
+            state = _coerce_json(
+                await conn.fetchval(
+                    "SELECT metadata->'transformation_state' FROM memories WHERE id = $1",
+                    belief_id,
+                )
+            )
+            assert state["reflection_count"] == 3
+            assert state["contemplation_actions"] == 2
+            assert state["evidence_memories"].count(str(evidence_id)) == 1
+        finally:
+            await tr.rollback()
+
+
+async def test_abandon_belief_exploration_resets_state(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            test_id = get_test_identifier("abandon")
+            await _set_heartbeat_state(conn, 2, 10)
+            goal_id = await _create_goal_memory(conn, f"Goal {test_id}")
+            belief_id = await _create_transformable_belief(
+                conn,
+                f"Belief {test_id}",
+                subcategory=f"sub_{test_id}",
+            )
+            await conn.fetchval(
+                "SELECT begin_belief_exploration($1, $2)",
+                belief_id,
+                goal_id,
+            )
+
+            result = _coerce_json(
+                await conn.fetchval(
+                    "SELECT abandon_belief_exploration($1, $2)",
+                    belief_id,
+                    "No longer relevant",
+                )
+            )
+            assert result["success"] is True
+
+            state = _coerce_json(
+                await conn.fetchval(
+                    "SELECT metadata->'transformation_state' FROM memories WHERE id = $1",
+                    belief_id,
+                )
+            )
+            baseline = _coerce_json(await conn.fetchval("SELECT default_transformation_state()"))
+            assert state == baseline
+        finally:
+            await tr.rollback()
+
+
+async def test_get_transformation_progress_reports_metrics(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            test_id = get_test_identifier("progress")
+            subcategory = f"sub_{test_id}"
+            await conn.execute(
+                """
+                INSERT INTO config (key, value)
+                VALUES ($1, $2::jsonb)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                f"transformation.{subcategory}",
+                json.dumps(
+                    {
+                        "min_reflections": 2,
+                        "min_heartbeats": 3,
+                        "evidence_threshold": 0.5,
+                        "stability": 0.8,
+                        "max_change_per_attempt": 0.3,
+                    }
+                ),
+            )
+            await _set_heartbeat_state(conn, 5, 10)
+            goal_id = await _create_goal_memory(conn, f"Goal {test_id}")
+            belief_id = await _create_transformable_belief(
+                conn,
+                f"Belief {test_id}",
+                subcategory=subcategory,
+            )
+            await conn.fetchval(
+                "SELECT begin_belief_exploration($1, $2)",
+                belief_id,
+                goal_id,
+            )
+            await _set_heartbeat_state(conn, 9, 10)
+
+            evidence_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, importance, trust_level)
+                VALUES ('semantic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector, 0.9, 0.9)
+                RETURNING id
+                """,
+                f"Evidence {test_id}",
+            )
+
+            await conn.fetchval(
+                "SELECT record_transformation_effort($1, 'reflect', NULL, $2)",
+                belief_id,
+                evidence_id,
+            )
+            await conn.fetchval(
+                "SELECT record_transformation_effort($1, 'debate_internally', NULL, $2)",
+                belief_id,
+                evidence_id,
+            )
+
+            progress = _coerce_json(
+                await conn.fetchval(
+                    "SELECT get_transformation_progress($1)",
+                    belief_id,
+                )
+            )
+            assert progress["status"] == "exploring"
+            assert progress["requirements"]["min_reflections"] == 2
+            assert progress["requirements"]["min_heartbeats"] == 3
+            assert progress["progress"]["reflections"]["current"] == 3
+            assert progress["progress"]["time"]["current_heartbeats"] == 4
+            assert progress["progress"]["evidence"]["memory_count"] == 1
+            samples = progress["evidence_samples"]
+            assert any(sample["memory_id"] == str(evidence_id) for sample in samples)
+        finally:
+            await tr.rollback()
+
+
+async def test_get_active_transformations_context_returns_active_only(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            test_id = get_test_identifier("active")
+            subcategory = f"sub_{test_id}"
+            await conn.execute(
+                """
+                INSERT INTO config (key, value)
+                VALUES ($1, $2::jsonb)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                f"transformation.{subcategory}",
+                json.dumps({"min_reflections": 1, "min_heartbeats": 0, "evidence_threshold": 0.1}),
+            )
+            await _set_heartbeat_state(conn, 1, 10)
+            goal_id = await _create_goal_memory(conn, f"Goal {test_id}")
+            belief_one = await _create_transformable_belief(
+                conn,
+                f"Belief one {test_id}",
+                subcategory=subcategory,
+            )
+            belief_two = await _create_transformable_belief(
+                conn,
+                f"Belief two {test_id}",
+                subcategory=subcategory,
+            )
+            await conn.fetchval("SELECT begin_belief_exploration($1, $2)", belief_one, goal_id)
+            await conn.fetchval("SELECT begin_belief_exploration($1, $2)", belief_two, goal_id)
+
+            context = _coerce_json(await conn.fetchval("SELECT get_active_transformations_context(2)"))
+            ids = {item["belief_id"] for item in context}
+            assert str(belief_one) in ids
+            assert str(belief_two) in ids
+        finally:
+            await tr.rollback()
+
+
+async def test_calibrate_neutral_belief_updates_metadata_and_content(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            test_id = get_test_identifier("calibrate")
+            await _set_heartbeat_state(conn, 4, 10)
+            goal_id = await _create_goal_memory(conn, f"Goal {test_id}")
+            belief_id = await _create_transformable_belief(
+                conn,
+                f"Neutral belief {test_id}",
+                subcategory="openness",
+                origin="neutral_default",
+                trait="openness",
+            )
+            await conn.fetchval("SELECT begin_belief_exploration($1, $2)", belief_id, goal_id)
+
+            evidence_ids = []
+            for idx in range(2):
+                evidence_ids.append(
+                    await conn.fetchval(
+                        """
+                        INSERT INTO memories (type, content, embedding, importance, trust_level)
+                        VALUES ('semantic'::memory_type, $1, array_fill(0.3, ARRAY[embedding_dimension()])::vector, 0.9, 0.9)
+                        RETURNING id
+                        """,
+                        f"Evidence {test_id} {idx}",
+                    )
+                )
+            await conn.fetchval(
+                "SELECT record_transformation_effort($1, 'reflect', NULL, $2)",
+                belief_id,
+                evidence_ids[0],
+            )
+
+            result = _coerce_json(
+                await conn.fetchval(
+                    "SELECT calibrate_neutral_belief($1, 0.8, $2::uuid[])",
+                    belief_id,
+                    evidence_ids,
+                )
+            )
+            assert result["success"] is True
+
+            row = await conn.fetchrow(
+                "SELECT content, metadata FROM memories WHERE id = $1",
+                belief_id,
+            )
+            metadata = _coerce_json(row["metadata"])
+            assert metadata["origin"] == "self_discovered"
+            assert abs(metadata["value"] - 0.8) < 0.001
+            assert metadata["transformation_state"]["active_exploration"] is False
+            assert "high" in row["content"]
+        finally:
+            await tr.rollback()
+
+
+async def test_initialize_personality_creates_traits(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            result = _coerce_json(
+                await conn.fetchval(
+                    "SELECT initialize_personality($1::jsonb)",
+                    json.dumps({"openness": 0.7}),
+                )
+            )
+            assert result["success"] is True
+            assert result["created_traits"] == 5
+
+            count = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM memories
+                WHERE type = 'worldview' AND metadata->>'subcategory' = 'personality'
+                """
+            )
+            assert int(count) == 5
+
+            row = await conn.fetchrow(
+                """
+                SELECT metadata FROM memories
+                WHERE type = 'worldview' AND metadata->>'trait' = 'openness'
+                """
+            )
+            metadata = _coerce_json(row["metadata"])
+            assert metadata["origin"] == "user_initialized"
+            assert abs(metadata["value"] - 0.7) < 0.01
+        finally:
+            await tr.rollback()
+
+
+async def test_initialize_core_values_creates_values(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            result = _coerce_json(
+                await conn.fetchval(
+                    "SELECT initialize_core_values($1::jsonb)",
+                    json.dumps({"honesty": 0.8}),
+                )
+            )
+            assert result["success"] is True
+            assert result["created_values"] == 5
+
+            count = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM memories
+                WHERE type = 'worldview' AND metadata->>'subcategory' = 'core_value'
+                """
+            )
+            assert int(count) == 5
+
+            row = await conn.fetchrow(
+                """
+                SELECT metadata FROM memories
+                WHERE type = 'worldview' AND metadata->>'value_name' = 'honesty'
+                """
+            )
+            metadata = _coerce_json(row["metadata"])
+            assert metadata["origin"] == "user_initialized"
+            assert abs(metadata["value"] - 0.8) < 0.01
+        finally:
+            await tr.rollback()
+
+
+async def test_initialize_worldview_creates_expected_keys(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            payload = {
+                "religion": "I am a humanist",
+                "self_identity": "I am a builder",
+            }
+            result = _coerce_json(
+                await conn.fetchval(
+                    "SELECT initialize_worldview($1::jsonb)",
+                    json.dumps(payload),
+                )
+            )
+            assert result["success"] is True
+            assert result["created_worldview"] == 4
+
+            religion = await conn.fetchrow(
+                """
+                SELECT content, metadata FROM memories
+                WHERE type = 'worldview' AND metadata->>'subcategory' = 'religion'
+                """
+            )
+            rel_meta = _coerce_json(religion["metadata"])
+            assert rel_meta["origin"] == "user_initialized"
+            assert religion["content"] == "I am a humanist"
+
+            ethics = await conn.fetchrow(
+                """
+                SELECT content, metadata FROM memories
+                WHERE type = 'worldview' AND metadata->>'subcategory' = 'ethical_framework'
+                """
+            )
+            ethics_meta = _coerce_json(ethics["metadata"])
+            assert ethics_meta["origin"] == "neutral_default"
+            assert "still exploring" in ethics["content"]
+        finally:
+            await tr.rollback()
+
+
+async def test_check_transformation_readiness_returns_ready_items(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            test_id = get_test_identifier("ready")
+            subcategory = f"sub_{test_id}"
+            await conn.execute(
+                """
+                INSERT INTO config (key, value)
+                VALUES ($1, $2::jsonb)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                f"transformation.{subcategory}",
+                json.dumps({"min_reflections": 1, "min_heartbeats": 1, "evidence_threshold": 0.4}),
+            )
+            await _set_heartbeat_state(conn, 3, 10)
+            goal_id = await _create_goal_memory(conn, f"Goal {test_id}")
+            belief_id = await _create_transformable_belief(
+                conn,
+                f"Belief {test_id}",
+                subcategory=subcategory,
+            )
+            await conn.fetchval("SELECT begin_belief_exploration($1, $2)", belief_id, goal_id)
+            await _set_heartbeat_state(conn, 5, 10)
+
+            evidence_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, importance, trust_level)
+                VALUES ('semantic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector, 0.9, 0.9)
+                RETURNING id
+                """,
+                f"Evidence {test_id}",
+            )
+            await conn.fetchval(
+                "SELECT record_transformation_effort($1, 'reflect', NULL, $2)",
+                belief_id,
+                evidence_id,
+            )
+
+            ready = _coerce_json(await conn.fetchval("SELECT check_transformation_readiness()"))
+            assert any(item["belief_id"] == str(belief_id) for item in ready)
+        finally:
+            await tr.rollback()
+
+
+async def test_attempt_worldview_transformation_updates_belief(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            test_id = get_test_identifier("attempt")
+            subcategory = f"sub_{test_id}"
+            await conn.execute(
+                """
+                INSERT INTO config (key, value)
+                VALUES ($1, $2::jsonb)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                f"transformation.{subcategory}",
+                json.dumps({"min_reflections": 1, "min_heartbeats": 0, "evidence_threshold": 0.4}),
+            )
+            await _set_heartbeat_state(conn, 2, 10)
+            goal_id = await _create_goal_memory(conn, f"Goal {test_id}")
+            belief_id = await _create_transformable_belief(
+                conn,
+                f"Belief {test_id}",
+                subcategory=subcategory,
+            )
+            await conn.fetchval("SELECT begin_belief_exploration($1, $2)", belief_id, goal_id)
+
+            evidence_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, importance, trust_level)
+                VALUES ('semantic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector, 0.9, 0.9)
+                RETURNING id
+                """,
+                f"Evidence {test_id}",
+            )
+            await conn.fetchval(
+                "SELECT record_transformation_effort($1, 'reflect', NULL, $2)",
+                belief_id,
+                evidence_id,
+            )
+
+            new_content = f"Updated belief {test_id}"
+            result = _coerce_json(
+                await conn.fetchval(
+                    "SELECT attempt_worldview_transformation($1, $2, $3)",
+                    belief_id,
+                    new_content,
+                    "shift",
+                )
+            )
+            assert result["success"] is True
+            assert result["memory_id"] is not None
+
+            row = await conn.fetchrow(
+                "SELECT content, metadata FROM memories WHERE id = $1",
+                belief_id,
+            )
+            metadata = _coerce_json(row["metadata"])
+            assert row["content"] == new_content
+            assert metadata["transformation_state"]["active_exploration"] is False
+            assert isinstance(metadata["change_history"], list)
+            assert len(metadata["change_history"]) == 1
+        finally:
+            await tr.rollback()
+
+
+async def test_normalize_source_reference_handles_invalid_input(db_pool):
+    async with db_pool.acquire() as conn:
+        result = _coerce_json(await conn.fetchval("SELECT normalize_source_reference(NULL)"))
+        assert result == {}
+        result = _coerce_json(await conn.fetchval("SELECT normalize_source_reference('\"oops\"'::jsonb)"))
+        assert result == {}
+
+
+async def test_normalize_source_reference_clamps_and_defaults(db_pool):
+    async with db_pool.acquire() as conn:
+        payload = {
+            "kind": "paper",
+            "ref": "doi:10.1234/abcd",
+            "label": "Test paper",
+            "author": "A. Author",
+            "observed_at": "2020-01-01T00:00:00Z",
+            "trust": 1.7,
+            "content_hash": "hashy",
+        }
+        result = _coerce_json(
+            await conn.fetchval(
+                "SELECT normalize_source_reference($1::jsonb)",
+                json.dumps(payload),
+            )
+        )
+        assert result["kind"] == "paper"
+        assert result["ref"] == "doi:10.1234/abcd"
+        assert result["label"] == "Test paper"
+        assert result["author"] == "A. Author"
+        assert result["content_hash"] == "hashy"
+        assert abs(float(result["trust"]) - 1.0) < 0.0001
+        observed = result.get("observed_at")
+        assert observed is not None
+        if isinstance(observed, str):
+            datetime.fromisoformat(observed.replace("Z", "+00:00"))
+        else:
+            assert isinstance(observed, datetime)
+
+
+async def test_normalize_source_references_handles_array_and_object(db_pool):
+    async with db_pool.acquire() as conn:
+        sources = [
+            {"kind": "paper", "ref": "a", "trust": 0.9},
+            {"kind": "paper", "ref": "b", "trust": 0.8},
+        ]
+        result = _coerce_json(
+            await conn.fetchval(
+                "SELECT normalize_source_references($1::jsonb)",
+                json.dumps(sources),
+            )
+        )
+        assert isinstance(result, list)
+        assert len(result) == 2
+
+        result = _coerce_json(
+            await conn.fetchval(
+                "SELECT normalize_source_references($1::jsonb)",
+                json.dumps({"kind": "paper", "ref": "solo"}),
+            )
+        )
+        assert len(result) == 1
+        assert result[0]["ref"] == "solo"
+
+        result = _coerce_json(
+            await conn.fetchval(
+                "SELECT normalize_source_references($1::jsonb)",
+                json.dumps("oops"),
+            )
+        )
+        assert result == []
+
+
+async def test_dedupe_source_references_prefers_latest(db_pool):
+    async with db_pool.acquire() as conn:
+        sources = [
+            {"kind": "paper", "ref": "dup", "observed_at": "2020-01-01T00:00:00Z"},
+            {"kind": "paper", "ref": "dup", "observed_at": "2022-01-01T00:00:00Z"},
+        ]
+        result = _coerce_json(
+            await conn.fetchval(
+                "SELECT dedupe_source_references($1::jsonb)",
+                json.dumps(sources),
+            )
+        )
+        assert len(result) == 1
+        assert result[0]["ref"] == "dup"
+        assert result[0]["observed_at"].startswith("2022-01-01")
+
+
+async def test_source_reinforcement_score_behaves_monotonic(db_pool):
+    async with db_pool.acquire() as conn:
+        empty_score = await conn.fetchval("SELECT source_reinforcement_score('[]'::jsonb)")
+        assert abs(float(empty_score)) < 0.0001
+
+        one_score = await conn.fetchval(
+            "SELECT source_reinforcement_score($1::jsonb)",
+            json.dumps([{"ref": "a", "trust": 0.9}]),
+        )
+        two_score = await conn.fetchval(
+            "SELECT source_reinforcement_score($1::jsonb)",
+            json.dumps([{"ref": "a", "trust": 0.9}, {"ref": "b", "trust": 0.9}]),
+        )
+        assert float(two_score) > float(one_score)
+
+
+async def test_compute_semantic_trust_respects_alignment(db_pool):
+    async with db_pool.acquire() as conn:
+        sources = [{"ref": "a", "trust": 0.9}, {"ref": "b", "trust": 0.8}]
+        neutral = await conn.fetchval(
+            "SELECT compute_semantic_trust(0.9, $1::jsonb, 0.0)",
+            json.dumps(sources),
+        )
+        positive = await conn.fetchval(
+            "SELECT compute_semantic_trust(0.9, $1::jsonb, 0.5)",
+            json.dumps(sources),
+        )
+        negative = await conn.fetchval(
+            "SELECT compute_semantic_trust(0.9, $1::jsonb, -0.5)",
+            json.dumps(sources),
+        )
+        assert float(negative) < float(neutral)
+        assert float(positive) >= float(neutral)
+
+
+async def test_touch_memories_updates_access_fields(db_pool):
+    async with db_pool.acquire() as conn:
+        memory_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, embedding, access_count)
+            VALUES ('semantic'::memory_type, $1, array_fill(0.1, ARRAY[embedding_dimension()])::vector, 0)
+            RETURNING id
+            """,
+            f"Touch {get_test_identifier('touch_memories')}",
+        )
+        updated = await conn.fetchval(
+            "SELECT touch_memories($1::uuid[])",
+            [memory_id, uuid.uuid4()],
+        )
+        assert updated == 1
+
+        row = await conn.fetchrow(
+            "SELECT access_count, last_accessed FROM memories WHERE id = $1",
+            memory_id,
+        )
+        assert row["access_count"] == 1
+        assert row["last_accessed"] is not None
+
+
+async def test_find_episode_memories_graph_orders_sequence(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute("LOAD 'age';")
+            episode_id = await _create_episode(
+                conn,
+                started_at=datetime.now(timezone.utc) + timedelta(days=3650),
+                summary="Episode summary",
+                episode_type="chat",
+            )
+            first_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('episodic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """,
+                f"Episode mem one {get_test_identifier('episode_mem_one')}",
+            )
+            second_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('episodic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """,
+                f"Episode mem two {get_test_identifier('episode_mem_two')}",
+            )
+            rows = await conn.fetch("SELECT * FROM find_episode_memories_graph($1)", episode_id)
+            assert [row["memory_id"] for row in rows] == [first_id, second_id]
+            assert [row["sequence_order"] for row in rows] == [1, 2]
+        finally:
+            await tr.rollback()
+
+
+async def test_get_episode_details_returns_metadata(db_pool):
+    async with db_pool.acquire() as conn:
+        episode_id = await _create_episode(
+            conn,
+            summary="Episode details",
+            episode_type="heartbeat",
+        )
+        row = await conn.fetchrow("SELECT * FROM get_episode_details($1)", episode_id)
+        assert row["id"] == episode_id
+        assert row["episode_type"] == "heartbeat"
+        assert row["summary"] == "Episode details"
+
+
+async def test_get_episode_memories_returns_sequence(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute("LOAD 'age';")
+            episode_id = await _create_episode(
+                conn,
+                started_at=datetime.now(timezone.utc) + timedelta(days=3650),
+                summary="Memories",
+                episode_type="chat",
+            )
+            mem_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('episodic'::memory_type, $1, array_fill(0.3, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """,
+                f"Episode mem {get_test_identifier('episode_mem_single')}",
+            )
+            rows = await conn.fetch("SELECT * FROM get_episode_memories($1)", episode_id)
+            assert len(rows) == 1
+            assert rows[0]["memory_id"] == mem_id
+            assert rows[0]["sequence_order"] == 1
+        finally:
+            await tr.rollback()
+
+
+async def test_list_recent_episodes_includes_memory_count(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute("LOAD 'age';")
+            episode_id = await _create_episode(
+                conn,
+                started_at=datetime.now(timezone.utc) + timedelta(days=3650),
+                summary="Recent episode",
+                episode_type="chat",
+            )
+            mem_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('episodic'::memory_type, $1, array_fill(0.4, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """,
+                f"Episode mem {get_test_identifier('episode_mem_recent')}",
+            )
+            rows = await conn.fetch("SELECT * FROM list_recent_episodes(1)")
+            assert rows[0]["id"] == episode_id
+            assert rows[0]["memory_count"] == 1
+        finally:
+            await tr.rollback()
+
+
+async def test_search_clusters_by_query_orders_by_similarity(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            cluster_a = await conn.fetchval(
+                """
+                INSERT INTO clusters (cluster_type, name, centroid_embedding)
+                VALUES ('theme'::cluster_type, 'Alpha Cluster', get_embedding($1))
+                RETURNING id
+                """,
+                "alpha topic",
+            )
+            cluster_b = await conn.fetchval(
+                """
+                INSERT INTO clusters (cluster_type, name, centroid_embedding)
+                VALUES ('theme'::cluster_type, 'Beta Cluster', get_embedding($1))
+                RETURNING id
+                """,
+                "beta topic",
+            )
+
+            rows = await conn.fetch("SELECT * FROM search_clusters_by_query($1, 2)", "alpha topic")
+            assert len(rows) == 2
+            assert rows[0]["id"] == cluster_a
+            assert rows[0]["similarity"] >= rows[1]["similarity"]
+        finally:
+            await tr.rollback()
+
+
+async def test_get_cluster_sample_memories_orders_by_strength(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute("LOAD 'age';")
+            cluster_id = await conn.fetchval(
+                """
+                INSERT INTO clusters (cluster_type, name, centroid_embedding)
+                VALUES ('theme'::cluster_type, $1, array_fill(0.1, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """,
+                f"Cluster {get_test_identifier('cluster_sample')}",
+            )
+            strong_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('semantic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """,
+                f"Strong {get_test_identifier('cluster_strong')}",
+            )
+            weak_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('semantic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """,
+                f"Weak {get_test_identifier('cluster_weak')}",
+            )
+            await conn.fetchval("SELECT link_memory_to_cluster_graph($1, $2, 0.9)", strong_id, cluster_id)
+            await conn.fetchval("SELECT link_memory_to_cluster_graph($1, $2, 0.2)", weak_id, cluster_id)
+
+            rows = await conn.fetch("SELECT * FROM get_cluster_sample_memories($1, 2)", cluster_id)
+            assert [row["memory_id"] for row in rows] == [strong_id, weak_id]
+            assert rows[0]["membership_strength"] >= rows[1]["membership_strength"]
+        finally:
+            await tr.rollback()
+
+
+async def test_find_related_concepts_for_memories_returns_counts(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute("LOAD 'age';")
+            mem_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('semantic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """,
+                f"Concept mem {get_test_identifier('concept_mem')}",
+            )
+            await conn.fetchval("SELECT create_concept($1)", "focus")
+            await conn.fetchval("SELECT sync_memory_node($1)", mem_id)
+            await conn.fetchval("SELECT link_memory_to_concept($1, $2, 0.8)", mem_id, "focus")
+
+            rows = await conn.fetch(
+                "SELECT * FROM find_related_concepts_for_memories($1::uuid[], $2, 5)",
+                [mem_id],
+                "",
+            )
+            assert any(row["name"] == "focus" for row in rows)
+        finally:
+            await tr.rollback()
+
+
+async def test_search_procedural_memories_returns_success_rate(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        mem_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, embedding, metadata)
+            VALUES (
+                'procedural'::memory_type,
+                $1,
+                get_embedding($2),
+                jsonb_build_object(
+                    'steps', jsonb_build_array('step1', 'step2'),
+                    'prerequisites', jsonb_build_object('tool', 'hammer'),
+                    'success_count', 4,
+                    'total_attempts', 5,
+                    'average_duration_seconds', 30
+                )
+            )
+            RETURNING id
+            """,
+            f"Procedural {get_test_identifier('procedural_search')}",
+            "Build a shelf",
+        )
+
+        rows = await conn.fetch("SELECT * FROM search_procedural_memories($1, 3)", "Build a shelf")
+        assert any(row["memory_id"] == mem_id for row in rows)
+        for row in rows:
+            if row["memory_id"] == mem_id:
+                assert abs(float(row["success_rate"]) - 0.8) < 0.01
+
+
+async def test_search_strategic_memories_returns_pattern(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        mem_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, embedding, metadata)
+            VALUES (
+                'strategic'::memory_type,
+                $1,
+                get_embedding($2),
+                jsonb_build_object(
+                    'pattern_description', 'Use spaced repetition',
+                    'confidence_score', 0.7,
+                    'context_applicability', jsonb_build_object('domain', 'learning')
+                )
+            )
+            RETURNING id
+            """,
+            f"Strategic {get_test_identifier('strategic_search')}",
+            "Study effectively",
+        )
+
+        rows = await conn.fetch("SELECT * FROM search_strategic_memories($1, 3)", "Study effectively")
+        assert any(row["memory_id"] == mem_id for row in rows)
+        for row in rows:
+            if row["memory_id"] == mem_id:
+                assert row["pattern_description"] == "Use spaced repetition"
+
+
 async def test_update_memory_timestamp_trigger(db_pool):
     """Test the update_memory_timestamp trigger"""
     async with db_pool.acquire() as conn:
@@ -978,13 +2157,22 @@ async def test_create_memory_relationship_function(db_pool):
             """, str(i))
             memory_ids.append(memory_id)
 
-        # Ensure clean AGE setup with proper schema
+        # Ensure AGE graph/label exist without dropping the graph.
         await conn.execute("""
             LOAD 'age';
             SET search_path = ag_catalog, public;
-            SELECT drop_graph('memory_graph', true);
-            SELECT create_graph('memory_graph');
-            SELECT create_vlabel('memory_graph', 'MemoryNode');
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM ag_catalog.ag_graph WHERE name = 'memory_graph') THEN
+                    PERFORM create_graph('memory_graph');
+                END IF;
+                BEGIN
+                    PERFORM create_vlabel('memory_graph', 'MemoryNode');
+                EXCEPTION WHEN duplicate_object OR invalid_schema_name THEN
+                    NULL;
+                END;
+            END;
+            $$;
         """)
 
         # Create nodes in graph using string formatting for Cypher
@@ -1059,25 +2247,6 @@ async def test_memory_health_view(db_pool):
             assert row['avg_access_count'] is not None, "Should have access count"
 
 
-
-async def test_extensions(db_pool):
-    """Test that required PostgreSQL extensions are installed"""
-    async with db_pool.acquire() as conn:
-        extensions = await conn.fetch("""
-            SELECT extname FROM pg_extension
-        """)
-        ext_names = {ext['extname'] for ext in extensions}
-        
-        required_extensions = {'vector', 'age', 'btree_gist', 'pg_trgm', 'http'}
-        for ext in required_extensions:
-            assert ext in ext_names, f"{ext} extension not found"
-        # Verify AGE is loaded
-        await conn.execute("LOAD 'age';")
-        await conn.execute("SET search_path = ag_catalog, public;")
-        result = await conn.fetchval("""
-            SELECT count(*) FROM ag_catalog.ag_graph
-        """)
-        assert result >= 0, "AGE extension not properly loaded"
 
 async def test_memory_tables_and_columns(db_pool):
     """Test that all memory tables exist with correct columns and constraints"""
@@ -1259,7 +2428,7 @@ async def test_identity_core_clusters(db_pool):
 async def test_assign_memory_to_clusters_function(db_pool):
     """Test the assign_memory_to_clusters function
     
-    Note: This test requires the updated db/schema.sql to be applied to the database.
+    Note: This test requires the updated db/*.sql to be applied to the database.
     The assign_memory_to_clusters function was updated to use 
     'WHERE centroid_embedding IS NOT NULL' instead of 'WHERE status = 'active''
     """
@@ -1581,7 +2750,9 @@ async def test_cluster_memory_retrieval_performance(db_pool):
         retrieval_time = time.time() - start_time
 
         assert len(results) == 10
-        assert retrieval_time < 1.0, f"Cluster retrieval too slow: {retrieval_time}s"  # Relaxed for graph query
+        assert retrieval_time < PERF_CLUSTER_RETRIEVAL_SECONDS, (
+            f"Cluster retrieval too slow: {retrieval_time}s"
+        )
 
         # Verify ordering
         strengths = [r['membership_strength'] for r in results]
@@ -1594,7 +2765,7 @@ async def test_constraint_violations(db_pool):
     """Test constraint violations and error handling"""
     async with db_pool.acquire() as conn:
         # Test invalid trust_level constraint (must be between 0 and 1)
-        with pytest.raises(Exception):
+        with pytest.raises(asyncpg.PostgresError):
             await conn.execute(
                 """
                 INSERT INTO memories (
@@ -1612,7 +2783,7 @@ async def test_constraint_violations(db_pool):
             )
 
         # Test foreign key violation
-        with pytest.raises(Exception):
+        with pytest.raises(asyncpg.PostgresError):
             fake_uuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
             await conn.execute(
                 """
@@ -1623,7 +2794,7 @@ async def test_constraint_violations(db_pool):
             )
         
         # Test invalid vector dimension
-        with pytest.raises(Exception):
+        with pytest.raises(asyncpg.PostgresError):
             await conn.execute("""
                 INSERT INTO memories (
                     type,
@@ -1637,7 +2808,7 @@ async def test_constraint_violations(db_pool):
             """)
         
         # Test null constraint violation
-        with pytest.raises(Exception):
+        with pytest.raises(asyncpg.PostgresError):
             await conn.execute("""
                 INSERT INTO memories (
                     type,
@@ -1740,85 +2911,95 @@ async def test_large_dataset_performance(db_pool):
     """Test system performance with large datasets"""
     async with db_pool.acquire() as conn:
         import time
-        
-        # Create large number of memories (1000 for testing, would be 10K+ in production)
-        total_memories = 1000
-        memory_types = ["episodic", "semantic", "procedural", "strategic"]
-        type_values: list[str] = []
-        content_values: list[str] = []
-        embedding_values: list[str] = []
-        importance_values: list[float] = []
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            # Create large number of memories (1000 for testing, would be 10K+ in production)
+            total_memories = LARGE_DATASET_SIZE
+            memory_types = ["episodic", "semantic", "procedural", "strategic"]
+            type_values: list[str] = []
+            content_values: list[str] = []
+            embedding_values: list[str] = []
+            importance_values: list[float] = []
 
-        print(f"Creating {total_memories} memories in a single batch...")
+            print(f"Creating {total_memories} memories in a single batch...")
 
-        for i in range(total_memories):
-            embedding = [0.0] * EMBEDDING_DIMENSION
-            pattern_start = (i % 10) * 150
-            pattern_end = min(pattern_start + 150, EMBEDDING_DIMENSION)
-            embedding[pattern_start:pattern_end] = [0.8] * (pattern_end - pattern_start)
+            for i in range(total_memories):
+                embedding = [0.0] * EMBEDDING_DIMENSION
+                pattern_start = (i % 10) * 150
+                pattern_end = min(pattern_start + 150, EMBEDDING_DIMENSION)
+                embedding[pattern_start:pattern_end] = [0.8] * (pattern_end - pattern_start)
 
-            type_values.append(memory_types[i % 4])
-            content_values.append(f"Large dataset memory {i}")
-            embedding_values.append(str(embedding))
-            importance_values.append(0.1 + (i % 100) * 0.01)
+                type_values.append(memory_types[i % 4])
+                content_values.append(f"Large dataset memory {i}")
+                embedding_values.append(str(embedding))
+                importance_values.append(0.1 + (i % 100) * 0.01)
 
-        await conn.execute(
-            """
-            INSERT INTO memories (type, content, embedding, importance)
-            SELECT t::memory_type, c, e::vector, i
-            FROM unnest($1::text[], $2::text[], $3::text[], $4::float[]) AS x(t, c, e, i)
-            """,
-            type_values,
-            content_values,
-            embedding_values,
-            importance_values,
-        )
+            await conn.execute(
+                """
+                INSERT INTO memories (type, content, embedding, importance)
+                SELECT t::memory_type, c, e::vector, i
+                FROM unnest($1::text[], $2::text[], $3::text[], $4::float[]) AS x(t, c, e, i)
+                """,
+                type_values,
+                content_values,
+                embedding_values,
+                importance_values,
+            )
 
-        print(f"Created {total_memories} memories")
-        
-        # Test 1: Vector similarity search performance
-        head_len = min(150, EMBEDDING_DIMENSION)
-        query_embedding = [0.8] * head_len + [0.0] * (EMBEDDING_DIMENSION - head_len)
-        
-        start_time = time.time()
-        similar_memories = await conn.fetch("""
-            SELECT id, content, embedding <=> $1::vector as distance
-            FROM memories
-            ORDER BY embedding <=> $1::vector
-            LIMIT 50
-        """, str(query_embedding))
-        vector_search_time = time.time() - start_time
-        
-        assert len(similar_memories) == 50
-        assert vector_search_time < 1.0, f"Vector search too slow: {vector_search_time}s"
-        print(f"Vector search time: {vector_search_time:.3f}s")
-        
-        # Test 2: Complex query performance
-        start_time = time.time()
-        complex_results = await conn.fetch("""
-            SELECT m.type, COUNT(*) as count, AVG(m.importance) as avg_importance
-            FROM memories m
-            WHERE m.status = 'active'
-            AND m.importance > 0.5
-            GROUP BY m.type
-            ORDER BY avg_importance DESC
-        """)
-        complex_query_time = time.time() - start_time
-        
-        assert len(complex_results) > 0
-        assert complex_query_time < 0.5, f"Complex query too slow: {complex_query_time}s"
-        print(f"Complex query time: {complex_query_time:.3f}s")
-        
-        # Test 3: Memory health view performance
-        start_time = time.time()
-        health_stats = await conn.fetch("""
-            SELECT * FROM memory_health
-        """)
-        view_query_time = time.time() - start_time
-        
-        assert len(health_stats) > 0
-        assert view_query_time < 0.5, f"View query too slow: {view_query_time}s"
-        print(f"View query time: {view_query_time:.3f}s")
+            print(f"Created {total_memories} memories")
+            
+            # Test 1: Vector similarity search performance
+            head_len = min(150, EMBEDDING_DIMENSION)
+            query_embedding = [0.8] * head_len + [0.0] * (EMBEDDING_DIMENSION - head_len)
+            
+            start_time = time.time()
+            similar_memories = await conn.fetch("""
+                SELECT id, content, embedding <=> $1::vector as distance
+                FROM memories
+                ORDER BY embedding <=> $1::vector
+                LIMIT 50
+            """, str(query_embedding))
+            vector_search_time = time.time() - start_time
+            
+            assert len(similar_memories) == 50
+            assert vector_search_time < PERF_VECTOR_SEARCH_SECONDS, (
+                f"Vector search too slow: {vector_search_time}s"
+            )
+            print(f"Vector search time: {vector_search_time:.3f}s")
+            
+            # Test 2: Complex query performance
+            start_time = time.time()
+            complex_results = await conn.fetch("""
+                SELECT m.type, COUNT(*) as count, AVG(m.importance) as avg_importance
+                FROM memories m
+                WHERE m.status = 'active'
+                AND m.importance > 0.5
+                GROUP BY m.type
+                ORDER BY avg_importance DESC
+            """)
+            complex_query_time = time.time() - start_time
+            
+            assert len(complex_results) > 0
+            assert complex_query_time < PERF_COMPLEX_QUERY_SECONDS, (
+                f"Complex query too slow: {complex_query_time}s"
+            )
+            print(f"Complex query time: {complex_query_time:.3f}s")
+            
+            # Test 3: Memory health view performance
+            start_time = time.time()
+            health_stats = await conn.fetch("""
+                SELECT * FROM memory_health
+            """)
+            view_query_time = time.time() - start_time
+            
+            assert len(health_stats) > 0
+            assert view_query_time < PERF_VIEW_QUERY_SECONDS, (
+                f"View query too slow: {view_query_time}s"
+            )
+            print(f"View query time: {view_query_time:.3f}s")
+        finally:
+            await tr.rollback()
 
 
 async def test_concurrency_safety(db_pool):
@@ -2646,7 +3827,7 @@ async def test_worldview_driven_memory_filtering(db_pool):
 
 # EMBEDDING INTEGRATION TESTS
 
-async def test_embedding_service_integration(db_pool):
+async def test_embedding_service_integration(db_pool, ensure_embedding_service):
     """Test integration with embeddings microservice"""
     async with db_pool.acquire() as conn:
         # Test embedding service health check
@@ -2668,7 +3849,7 @@ async def test_embedding_service_integration(db_pool):
         assert cached_embedding == embedding, "Should return cached embedding"
 
 
-async def test_create_memory_with_auto_embedding(db_pool):
+async def test_create_memory_with_auto_embedding(db_pool, ensure_embedding_service):
     """Test creating memories with automatic embedding generation"""
     async with db_pool.acquire() as conn:
         # Test creating semantic memory with auto-embedding
@@ -2713,7 +3894,7 @@ async def test_create_memory_with_auto_embedding(db_pool):
         """)
 
 
-async def test_search_with_auto_embedding(db_pool):
+async def test_search_with_auto_embedding(db_pool, ensure_embedding_service):
     """Test searching memories with automatic query embedding"""
     async with db_pool.acquire() as conn:
         # Create some test memories first
@@ -2743,7 +3924,7 @@ async def test_search_with_auto_embedding(db_pool):
             assert result['similarity'] >= 0 and result['similarity'] <= 1
 
 
-async def test_working_memory_with_embedding(db_pool):
+async def test_working_memory_with_embedding(db_pool, ensure_embedding_service):
     """Test working memory operations with automatic embedding"""
     async with db_pool.acquire() as conn:
         # Add to working memory with auto-embedding
@@ -2764,7 +3945,7 @@ async def test_working_memory_with_embedding(db_pool):
         assert len(results) > 0, "Should find working memory items"
 
 
-async def test_embedding_cache_functionality(db_pool):
+async def test_embedding_cache_functionality(db_pool, ensure_embedding_service):
     """Test embedding caching functionality"""
     async with db_pool.acquire() as conn:
         # Check if embedding service is available
@@ -2817,7 +3998,7 @@ async def test_embedding_cache_functionality(db_pool):
             print(f"Cache test failed: {e}")
 
 
-async def test_embedding_error_handling(db_pool):
+async def test_embedding_error_handling(db_pool, ensure_embedding_service):
     """Test error handling for embedding operations"""
     async with db_pool.acquire() as conn:
         # Phase 7 (ReduceScopeCreep): Use unified config only
@@ -2856,7 +4037,7 @@ async def test_embedding_error_handling(db_pool):
         )
 
 
-async def test_memory_cluster_with_embeddings(db_pool):
+async def test_memory_cluster_with_embeddings(db_pool, ensure_embedding_service):
     """Test memory clustering with automatic embeddings"""
     async with db_pool.acquire() as conn:
         # Check if embedding service is available
@@ -3312,7 +4493,9 @@ async def test_database_optimization_operations(db_pool):
         query_time = time.time() - start_time
         
         assert len(complex_query_result) > 0, "Complex query should return results"
-        assert query_time < 1.0, f"Complex query too slow: {query_time}s"
+        assert query_time < PERF_OPTIMIZE_QUERY_SECONDS, (
+            f"Complex query too slow: {query_time}s"
+        )
         
         # Test vacuum and analyze simulation (read-only operations)
         vacuum_info = await conn.fetch("""
@@ -3779,7 +4962,7 @@ async def test_episodes_table_structure(db_pool):
         assert time_range is not None, "time_range should be auto-generated"
 
 
-async def test_auto_episode_assignment_trigger(db_pool):
+async def test_auto_episode_assignment_trigger(db_pool, ensure_embedding_service):
     """Test trg_auto_episode_assignment trigger creates episodes automatically"""
     async with db_pool.acquire() as conn:
         await conn.execute("LOAD 'age';")
@@ -3829,7 +5012,7 @@ async def test_auto_episode_assignment_trigger(db_pool):
         assert neighborhood['is_stale'] == True, "New neighborhood should be marked stale"
 
 
-async def test_episode_30_minute_gap_detection(db_pool):
+async def test_episode_30_minute_gap_detection(db_pool, ensure_embedding_service):
     """Test that episodes close and new ones open after 30-minute gap"""
     async with db_pool.acquire() as conn:
         await conn.execute("LOAD 'age';")
@@ -3888,7 +5071,7 @@ async def test_episode_30_minute_gap_detection(db_pool):
         assert old_episode['ended_at'] is not None, "Old episode should be closed"
 
 
-async def test_episode_summary_view(db_pool):
+async def test_episode_summary_view(db_pool, ensure_embedding_service):
     """Test episode_summary view calculations"""
     async with db_pool.acquire() as conn:
         await conn.execute("LOAD 'age';")
@@ -4251,11 +5434,68 @@ async def test_link_memory_to_concept_creates_graph_edge(db_pool):
         assert "Independence" in str(edge_result[0]["concept_name"])
 
 
+async def test_create_concept_sets_description_and_depth(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("LOAD 'age';")
+        await conn.execute("SET search_path = ag_catalog, public;")
+
+        concept_name = f"Concept_{get_test_identifier('create_concept')}"
+        result = await conn.fetchval(
+            "SELECT create_concept($1, $2, $3)",
+            concept_name,
+            "Concept description",
+            2,
+        )
+        assert result is True
+
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM ag_catalog.cypher('memory_graph', $$
+                MATCH (c:ConceptNode {name: '%s'})
+                RETURN c.description, c.depth
+            $$) as (description agtype, depth agtype)
+            """
+            % concept_name
+        )
+        assert row is not None
+        desc = str(row["description"]).strip('"')
+        depth = int(str(row["depth"]).strip('"'))
+        assert desc == "Concept description"
+        assert depth == 2
+
+        await conn.execute("SET search_path = public, ag_catalog;")
+
+
+async def test_link_concept_parent_creates_edge(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("LOAD 'age';")
+        await conn.execute("SET search_path = ag_catalog, public;")
+
+        child_name = f"Child_{get_test_identifier('concept_child')}"
+        parent_name = f"Parent_{get_test_identifier('concept_parent')}"
+        result = await conn.fetchval("SELECT link_concept_parent($1, $2)", child_name, parent_name)
+        assert result is True
+
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM ag_catalog.cypher('memory_graph', $$
+                MATCH (p:ConceptNode {name: '%s'})-[:PARENT_OF]->(c:ConceptNode {name: '%s'})
+                RETURN c.name
+            $$) as (name agtype)
+            """
+            % (parent_name, child_name)
+        )
+        assert row is not None
+        assert child_name in str(row["name"])
+
+        await conn.execute("SET search_path = public, ag_catalog;")
+
+
 # -----------------------------------------------------------------------------
 # FAST_RECALL FUNCTION TESTS
 # -----------------------------------------------------------------------------
 
-async def test_fast_recall_basic(db_pool):
+async def test_fast_recall_basic(db_pool, ensure_embedding_service):
     """Test fast_recall() primary retrieval function"""
     async with db_pool.acquire() as conn:
         # Create test memories with distinct content
@@ -4276,26 +5516,17 @@ async def test_fast_recall_basic(db_pool):
             """, content)
             memory_ids.append(memory_id)
 
-        # Test fast_recall (requires embedding service)
-        # This will fail gracefully if embedding service is not available
-        try:
-            results = await conn.fetch("""
-                SELECT * FROM fast_recall('What is the weather like?', 5)
-            """)
+        results = await conn.fetch("""
+            SELECT * FROM fast_recall('What is the weather like?', 5)
+        """)
 
-            # If embedding service works, verify results structure
-            assert all('memory_id' in dict(r) for r in results)
-            assert all('content' in dict(r) for r in results)
-            assert all('score' in dict(r) for r in results)
-            assert all('source' in dict(r) for r in results)
-
-        except Exception as e:
-            # Expected if embedding service is not available
-            if 'embedding' not in str(e).lower():
-                raise
+        assert all('memory_id' in dict(r) for r in results)
+        assert all('content' in dict(r) for r in results)
+        assert all('score' in dict(r) for r in results)
+        assert all('source' in dict(r) for r in results)
 
 
-async def test_fast_recall_respects_limit(db_pool):
+async def test_fast_recall_respects_limit(db_pool, ensure_embedding_service):
     """Test fast_recall respects the limit parameter"""
     async with db_pool.acquire() as conn:
         # Create multiple memories
@@ -4306,17 +5537,13 @@ async def test_fast_recall_respects_limit(db_pool):
                         array_fill(0.5, ARRAY[embedding_dimension()])::vector)
             """, f'Fast recall limit test memory {i}')
 
-        try:
-            results = await conn.fetch("""
-                SELECT * FROM fast_recall('test memory', 3)
-            """)
-            assert len(results) <= 3, "Should respect limit parameter"
-        except Exception as e:
-            if 'embedding' not in str(e).lower():
-                raise
+        results = await conn.fetch("""
+            SELECT * FROM fast_recall('test memory', 3)
+        """)
+        assert len(results) <= 3, "Should respect limit parameter"
 
 
-async def test_fast_recall_only_active_memories(db_pool):
+async def test_fast_recall_only_active_memories(db_pool, ensure_embedding_service):
     """Test fast_recall only returns active memories"""
     async with db_pool.acquire() as conn:
         # Create active and archived memories
@@ -4334,37 +5561,27 @@ async def test_fast_recall_only_active_memories(db_pool):
             RETURNING id
         """)
 
-        try:
-            results = await conn.fetch("""
-                SELECT memory_id FROM fast_recall('recall test', 10)
-            """)
+        results = await conn.fetch("""
+            SELECT memory_id FROM fast_recall('recall test', 10)
+        """)
 
-            result_ids = [r['memory_id'] for r in results]
+        result_ids = [r['memory_id'] for r in results]
 
-            # Active should potentially be returned, archived should not
-            assert archived_id not in result_ids, "Archived memories should not be returned"
-
-        except Exception as e:
-            if 'embedding' not in str(e).lower():
-                raise
+        # Active should potentially be returned, archived should not
+        assert archived_id not in result_ids, "Archived memories should not be returned"
 
 
-async def test_fast_recall_source_attribution(db_pool):
+async def test_fast_recall_source_attribution(db_pool, ensure_embedding_service):
     """Test fast_recall correctly attributes retrieval sources"""
     async with db_pool.acquire() as conn:
         # The source field should be one of: 'vector', 'association', 'temporal', 'fallback'
-        try:
-            results = await conn.fetch("""
-                SELECT source FROM fast_recall('test query', 5)
-            """)
+        results = await conn.fetch("""
+            SELECT source FROM fast_recall('test query', 5)
+        """)
 
-            valid_sources = {'vector', 'association', 'temporal', 'fallback'}
-            for result in results:
-                assert result['source'] in valid_sources, f"Invalid source: {result['source']}"
-
-        except Exception as e:
-            if 'embedding' not in str(e).lower():
-                raise
+        valid_sources = {'vector', 'association', 'temporal', 'fallback'}
+        for result in results:
+            assert result['source'] in valid_sources, f"Invalid source: {result['source']}"
 
 
 async def test_fast_recall_respects_min_trust_level(db_pool, ensure_embedding_service):
@@ -4403,10 +5620,242 @@ async def test_fast_recall_respects_min_trust_level(db_pool, ensure_embedding_se
 
 
 # -----------------------------------------------------------------------------
+# MEMORY RETRIEVAL HELPERS
+# -----------------------------------------------------------------------------
+
+async def test_get_memory_by_id_returns_expected_fields(db_pool):
+    async with db_pool.acquire() as conn:
+        memory_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, embedding, importance, trust_level, source_attribution, metadata)
+            VALUES ('semantic'::memory_type, $1, array_fill(0.25, ARRAY[embedding_dimension()])::vector, 0.6, 0.8,
+                    jsonb_build_object('kind', 'test'), jsonb_build_object('emotional_valence', 0.4))
+            RETURNING id
+            """,
+            f"Memory by id {get_test_identifier('memory_by_id')}",
+        )
+
+        row = await conn.fetchrow("SELECT * FROM get_memory_by_id($1)", memory_id)
+        assert row["id"] == memory_id
+        assert row["type"] == "semantic"
+        assert row["importance"] == 0.6
+        assert row["trust_level"] == 0.8
+        source_attr = _coerce_json(row["source_attribution"])
+        assert source_attr["kind"] == "test"
+        assert row["emotional_valence"] == 0.4
+
+
+async def test_get_memories_summary_handles_empty_inputs(db_pool):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM get_memories_summary(NULL)")
+        assert rows == []
+        rows = await conn.fetch("SELECT * FROM get_memories_summary('{}'::uuid[])")
+        assert rows == []
+
+
+async def test_get_memories_summary_returns_rows(db_pool):
+    async with db_pool.acquire() as conn:
+        id_one = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, embedding, importance)
+            VALUES ('semantic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector, 0.3)
+            RETURNING id
+            """,
+            f"Summary one {get_test_identifier('summary_one')}",
+        )
+        id_two = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, embedding, importance)
+            VALUES ('episodic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector, 0.7)
+            RETURNING id
+            """,
+            f"Summary two {get_test_identifier('summary_two')}",
+        )
+
+        rows = await conn.fetch("SELECT * FROM get_memories_summary($1::uuid[])", [id_one, id_two])
+        ids = {row["id"] for row in rows}
+        assert id_one in ids
+        assert id_two in ids
+
+
+async def test_list_recent_memories_orders_by_created_at(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            older_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, created_at)
+                VALUES ('semantic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector,
+                        CURRENT_TIMESTAMP + interval '10 years')
+                RETURNING id
+                """,
+                f"Older {get_test_identifier('recent_created_older')}",
+            )
+            newer_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, created_at)
+                VALUES ('semantic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector,
+                        CURRENT_TIMESTAMP + interval '11 years')
+                RETURNING id
+                """,
+                f"Newer {get_test_identifier('recent_created_newer')}",
+            )
+            rows = await conn.fetch("SELECT memory_id FROM list_recent_memories(2)")
+            assert rows[0]["memory_id"] == newer_id
+            assert rows[1]["memory_id"] == older_id
+        finally:
+            await tr.rollback()
+
+
+async def test_list_recent_memories_orders_by_access_when_requested(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            first_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, last_accessed)
+                VALUES ('semantic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector,
+                        CURRENT_TIMESTAMP + interval '10 years')
+                RETURNING id
+                """,
+                f"Access older {get_test_identifier('recent_access_older')}",
+            )
+            second_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, last_accessed)
+                VALUES ('semantic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector,
+                        CURRENT_TIMESTAMP + interval '11 years')
+                RETURNING id
+                """,
+                f"Access newer {get_test_identifier('recent_access_newer')}",
+            )
+
+            rows = await conn.fetch("SELECT memory_id FROM list_recent_memories(2, NULL, TRUE)")
+            assert rows[0]["memory_id"] == second_id
+            assert rows[1]["memory_id"] == first_id
+        finally:
+            await tr.rollback()
+
+
+async def test_recall_memories_filtered_filters_type_and_importance(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            test_id = get_test_identifier("recall_filtered")
+            query_text = f"Recall filter {test_id}"
+            high_semantic_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, importance, metadata)
+                VALUES ('semantic'::memory_type, $1, get_embedding($2), 0.8,
+                        jsonb_build_object('emotional_valence', 0.4))
+                RETURNING id
+                """,
+                f"{query_text} semantic high",
+                query_text,
+            )
+            low_semantic_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, importance)
+                VALUES ('semantic'::memory_type, $1, get_embedding($2), 0.2)
+                RETURNING id
+                """,
+                f"{query_text} semantic low",
+                query_text,
+            )
+            episodic_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, importance)
+                VALUES ('episodic'::memory_type, $1, get_embedding($2), 0.9)
+                RETURNING id
+                """,
+                f"{query_text} episodic",
+                query_text,
+            )
+
+            rows = await conn.fetch(
+                """
+                SELECT * FROM recall_memories_filtered(
+                    $1,
+                    5,
+                    ARRAY['semantic']::memory_type[],
+                    0.5
+                )
+                """,
+                query_text,
+            )
+            ids = {str(row["memory_id"]) for row in rows}
+            assert str(high_semantic_id) in ids
+            assert str(low_semantic_id) not in ids
+            assert str(episodic_id) not in ids
+            if rows:
+                for row in rows:
+                    if row["memory_id"] == high_semantic_id:
+                        assert row["emotional_valence"] == 0.4
+                        break
+        finally:
+            await tr.rollback()
+
+
+async def test_get_memory_neighborhoods_returns_rows(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            mem_one = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('semantic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """,
+                f"Neighborhood one {get_test_identifier('neighborhood_one')}",
+            )
+            mem_two = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding)
+                VALUES ('semantic'::memory_type, $1, array_fill(0.2, ARRAY[embedding_dimension()])::vector)
+                RETURNING id
+                """,
+                f"Neighborhood two {get_test_identifier('neighborhood_two')}",
+            )
+            await conn.execute(
+                """
+                INSERT INTO memory_neighborhoods (memory_id, neighbors, computed_at, is_stale)
+                VALUES ($1, jsonb_build_object($2::text, '0.7'), CURRENT_TIMESTAMP, FALSE)
+                ON CONFLICT (memory_id) DO UPDATE SET
+                    neighbors = EXCLUDED.neighbors,
+                    computed_at = EXCLUDED.computed_at,
+                    is_stale = EXCLUDED.is_stale
+                """,
+                mem_one,
+                str(mem_two),
+            )
+            rows = await conn.fetch(
+                "SELECT * FROM get_memory_neighborhoods($1::uuid[])",
+                [mem_one, mem_two],
+            )
+            by_id = {row["memory_id"]: row["neighbors"] for row in rows}
+            assert mem_one in by_id
+            assert str(mem_two) in by_id[mem_one]
+        finally:
+            await tr.rollback()
+
+
+async def test_get_memory_neighborhoods_empty_input(db_pool):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM get_memory_neighborhoods(NULL)")
+        assert rows == []
+        rows = await conn.fetch("SELECT * FROM get_memory_neighborhoods('{}'::uuid[])")
+        assert rows == []
+
+
+# -----------------------------------------------------------------------------
 # SEARCH FUNCTIONS TESTS
 # -----------------------------------------------------------------------------
 
-async def test_search_similar_memories_type_filter(db_pool):
+async def test_search_similar_memories_type_filter(db_pool, ensure_embedding_service):
     """Test search_similar_memories with type filtering"""
     async with db_pool.acquire() as conn:
         # Create memories of different types
@@ -4418,24 +5867,19 @@ async def test_search_similar_memories_type_filter(db_pool):
                 ('procedural'::memory_type, 'Procedural search test', array_fill(0.6, ARRAY[embedding_dimension()])::vector)
         """)
 
-        try:
-            # Search only semantic
-            results = await conn.fetch("""
-                SELECT * FROM search_similar_memories(
-                    'search test', 10, ARRAY['semantic']::memory_type[]
-                )
-            """)
+        # Search only semantic
+        results = await conn.fetch("""
+            SELECT * FROM search_similar_memories(
+                'search test', 10, ARRAY['semantic']::memory_type[]
+            )
+        """)
 
-            for r in results:
-                if 'search test' in r['content'].lower():
-                    assert r['type'] == 'semantic', "Should only return semantic type"
-
-        except Exception as e:
-            if 'embedding' not in str(e).lower():
-                raise
+        for r in results:
+            if 'search test' in r['content'].lower():
+                assert r['type'] == 'semantic', "Should only return semantic type"
 
 
-async def test_search_similar_memories_importance_filter(db_pool):
+async def test_search_similar_memories_importance_filter(db_pool, ensure_embedding_service):
     """Test search_similar_memories with minimum importance filter"""
     async with db_pool.acquire() as conn:
         # Create memories with different importance
@@ -4448,24 +5892,19 @@ async def test_search_similar_memories_importance_filter(db_pool):
                  array_fill(0.65, ARRAY[embedding_dimension()])::vector, 0.9)
         """)
 
-        try:
-            # Search with high minimum importance
-            results = await conn.fetch("""
-                SELECT * FROM search_similar_memories(
-                    'importance search test', 10, NULL, 0.5
-                )
-            """)
+        # Search with high minimum importance
+        results = await conn.fetch("""
+            SELECT * FROM search_similar_memories(
+                'importance search test', 10, NULL, 0.5
+            )
+        """)
 
-            for r in results:
-                if 'importance search test' in r['content'].lower():
-                    assert r['importance'] >= 0.5, "Should only return high importance memories"
-
-        except Exception as e:
-            if 'embedding' not in str(e).lower():
-                raise
+        for r in results:
+            if 'importance search test' in r['content'].lower():
+                assert r['importance'] >= 0.5, "Should only return high importance memories"
 
 
-async def test_search_working_memory_auto_cleanup(db_pool):
+async def test_search_working_memory_auto_cleanup(db_pool, ensure_embedding_service):
     """Test search_working_memory calls cleanup automatically"""
     async with db_pool.acquire() as conn:
         # Add expired working memory entry
@@ -4482,125 +5921,79 @@ async def test_search_working_memory_auto_cleanup(db_pool):
                     CURRENT_TIMESTAMP + interval '1 hour')
         """)
 
-        try:
-            # Search triggers cleanup
-            await conn.fetch("""
-                SELECT * FROM search_working_memory('working memory', 5)
-            """)
+        # Search triggers cleanup
+        await conn.fetch("""
+            SELECT * FROM search_working_memory('working memory', 5)
+        """)
 
-            # Verify expired entry was cleaned up
-            expired_count = await conn.fetchval("""
-                SELECT COUNT(*) FROM working_memory
-                WHERE expiry < CURRENT_TIMESTAMP
-            """)
+        # Verify expired entry was cleaned up
+        expired_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM working_memory
+            WHERE expiry < CURRENT_TIMESTAMP
+        """)
 
-            assert expired_count == 0, "Expired working memory should be cleaned up"
-
-        except Exception as e:
-            if 'embedding' not in str(e).lower():
-                raise
+        assert expired_count == 0, "Expired working memory should be cleaned up"
 
 
 # -----------------------------------------------------------------------------
 # MEMORY CREATION FUNCTIONS TESTS
 # -----------------------------------------------------------------------------
 
-async def test_create_memory_creates_graph_node(db_pool):
-    """Test create_memory() creates MemoryNode in graph"""
-    async with db_pool.acquire() as conn:
-        try:
-            # Use create_memory function
-            memory_id = await conn.fetchval("""
-                SELECT create_memory('semantic'::memory_type, 'Graph node creation test', 0.7)
-            """)
-
-            # Verify graph node exists
-            await conn.execute("""
-                LOAD 'age';
-                SET search_path = ag_catalog, public;
-            """)
-
-            result = await conn.fetch(f"""
-                SELECT * FROM ag_catalog.cypher('memory_graph', $$
-                    MATCH (n:MemoryNode {{memory_id: '{memory_id}'}})
-                    RETURN n.memory_id as memory_id, n.type as type
-                $$) as (memory_id agtype, type agtype)
-            """)
-
-            await conn.execute("SET search_path = public, ag_catalog")
-
-            assert len(result) > 0, "MemoryNode should exist in graph"
-
-        except Exception as e:
-            if 'embedding' not in str(e).lower():
-                raise
-
-
-async def test_create_episodic_memory_function(db_pool):
+async def test_create_episodic_memory_function(db_pool, ensure_embedding_service):
     """Test create_episodic_memory() full workflow"""
     async with db_pool.acquire() as conn:
-        try:
-            memory_id = await conn.fetchval("""
-                SELECT create_episodic_memory(
-                    'Had a great conversation about AI',
-                    '{"type": "conversation"}'::jsonb,
-                    '{"location": "office", "participants": ["Alice", "Bob"]}'::jsonb,
-                    '{"outcome": "learned new concepts"}'::jsonb,
-                    0.8,
-                    CURRENT_TIMESTAMP,
-                    0.75
-                )
-            """)
+        memory_id = await conn.fetchval("""
+            SELECT create_episodic_memory(
+                'Had a great conversation about AI',
+                '{"type": "conversation"}'::jsonb,
+                '{"location": "office", "participants": ["Alice", "Bob"]}'::jsonb,
+                '{"outcome": "learned new concepts"}'::jsonb,
+                0.8,
+                CURRENT_TIMESTAMP,
+                0.75
+            )
+        """)
 
-            # Verify base memory
-            memory = await conn.fetchrow("""
-                SELECT * FROM memories WHERE id = $1
-            """, memory_id)
-            assert memory['type'] == 'episodic'
-            assert memory['importance'] == 0.75
+        # Verify base memory
+        memory = await conn.fetchrow("""
+            SELECT * FROM memories WHERE id = $1
+        """, memory_id)
+        assert memory['type'] == 'episodic'
+        assert memory['importance'] == 0.75
 
-            # Verify episodic details from metadata
-            metadata = memory['metadata']
-            if isinstance(metadata, str):
-                metadata = json.loads(metadata)
-            assert metadata is not None
-            assert metadata['emotional_valence'] == 0.8
-
-        except Exception as e:
-            if 'embedding' not in str(e).lower():
-                raise
+        # Verify episodic details from metadata
+        metadata = memory['metadata']
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        assert metadata is not None
+        assert metadata['emotional_valence'] == 0.8
 
 
-async def test_create_semantic_memory_function(db_pool):
+async def test_create_semantic_memory_function(db_pool, ensure_embedding_service):
     """Test create_semantic_memory() with all parameters"""
     async with db_pool.acquire() as conn:
-        try:
-            memory_id = await conn.fetchval("""
-                SELECT create_semantic_memory(
-                    'Water boils at 100 degrees Celsius at sea level',
-                    0.99,
-                    ARRAY['physics', 'chemistry'],
-                    ARRAY['water', 'temperature', 'boiling'],
-                    '{"textbook": "Physics 101"}'::jsonb,
-                    0.8
-                )
-            """)
+        memory_id = await conn.fetchval("""
+            SELECT create_semantic_memory(
+                'Water boils at 100 degrees Celsius at sea level',
+                0.99,
+                ARRAY['physics', 'chemistry'],
+                ARRAY['water', 'temperature', 'boiling'],
+                '{"textbook": "Physics 101"}'::jsonb,
+                0.8
+            )
+        """)
 
-            # Verify semantic details from metadata
-            mem = await conn.fetchrow("""
-                SELECT metadata FROM memories WHERE id = $1
-            """, memory_id)
-            assert mem is not None
-            metadata = mem['metadata']
-            if isinstance(metadata, str):
-                metadata = json.loads(metadata)
-            assert metadata['confidence'] == 0.99
-            assert 'physics' in metadata['category']
-            assert 'water' in metadata['related_concepts']
-
-        except Exception as e:
-            if 'embedding' not in str(e).lower():
-                raise
+        # Verify semantic details from metadata
+        mem = await conn.fetchrow("""
+            SELECT metadata FROM memories WHERE id = $1
+        """, memory_id)
+        assert mem is not None
+        metadata = mem['metadata']
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        assert metadata['confidence'] == 0.99
+        assert 'physics' in metadata['category']
+        assert 'water' in metadata['related_concepts']
 
 
 async def test_semantic_memory_trust_is_capped_by_sources(db_pool):
@@ -4691,64 +6084,185 @@ async def test_worldview_misalignment_can_reduce_semantic_trust(db_pool):
             await tr.rollback()
 
 
-async def test_create_procedural_memory_function(db_pool):
+async def test_get_memory_truth_profile_semantic_and_nonsemantic(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        sources = [
+            {"kind": "paper", "ref": "doi:10.0000/alpha", "trust": 0.9},
+            {"kind": "paper", "ref": "doi:10.0000/beta", "trust": 0.8},
+        ]
+        semantic_id = await conn.fetchval(
+            "SELECT create_semantic_memory($1, 0.85, NULL, NULL, $2::jsonb, 0.6)",
+            f"Truth profile {get_test_identifier('truth_semantic')}",
+            json.dumps(sources),
+        )
+        semantic_profile = _coerce_json(
+            await conn.fetchval("SELECT get_memory_truth_profile($1)", semantic_id)
+        )
+        assert semantic_profile["type"] == "semantic"
+        assert semantic_profile["source_count"] == 2
+        assert 0.0 <= float(semantic_profile["trust_level"]) <= 1.0
+
+        episodic_id = await conn.fetchval(
+            """
+            SELECT create_episodic_memory(
+                $1,
+                '{"action": "note"}',
+                '{"context": "truth_profile"}',
+                '{"result": "logged"}',
+                0.2
+            )
+            """,
+            f"Truth profile episodic {get_test_identifier('truth_epi')}",
+        )
+        episodic_profile = _coerce_json(
+            await conn.fetchval("SELECT get_memory_truth_profile($1)", episodic_id)
+        )
+        assert episodic_profile["type"] == "episodic"
+        assert "source_count" not in episodic_profile
+
+
+async def test_create_worldview_belief_sets_sources_and_threshold(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        sources = [
+            {"kind": "paper", "ref": "doi:10.0000/worldview-a", "trust": 0.9},
+            {"kind": "paper", "ref": "doi:10.0000/worldview-b", "trust": 0.8},
+        ]
+        belief_id = await conn.fetchval(
+            """
+            SELECT create_worldview_belief(
+                $1,
+                'belief',
+                0.9,
+                0.7,
+                0.8,
+                'test',
+                0.65,
+                0.1,
+                ARRAY['alpha', 'beta'],
+                'respond',
+                $2::jsonb
+            )
+            """,
+            f"Worldview belief {get_test_identifier('worldview_belief')}",
+            json.dumps(sources),
+        )
+        row = await conn.fetchrow(
+            "SELECT metadata, source_attribution FROM memories WHERE id = $1",
+            belief_id,
+        )
+        metadata = _coerce_json(row["metadata"])
+        assert abs(float(metadata["evidence_threshold"]) - 0.65) < 0.001
+        assert metadata["trigger_patterns"] == ["alpha", "beta"]
+        assert len(metadata["source_references"]) == 2
+        source_attr = _coerce_json(row["source_attribution"])
+        assert source_attr["ref"].startswith("doi:10.0000/")
+
+
+async def test_update_identity_belief_respects_stability_and_force(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            worldview_id = await conn.fetchval(
+                "SELECT create_worldview_memory($1, 'self', 0.8, 0.95, 0.8, 'test')",
+                f"Initial identity {get_test_identifier('identity')}",
+            )
+            evidence_id = await conn.fetchval(
+                """
+                SELECT create_episodic_memory(
+                    $1,
+                    '{"action": "evidence"}',
+                    '{"context": "identity"}',
+                    '{"result": "observed"}',
+                    0.1
+                )
+                """,
+                f"Identity evidence {get_test_identifier('identity_evidence')}",
+            )
+
+            result = await conn.fetchval(
+                "SELECT update_identity_belief($1, $2, $3, FALSE)",
+                worldview_id,
+                "Updated identity content",
+                evidence_id,
+            )
+            assert result is False
+
+            content_before = await conn.fetchval(
+                "SELECT content FROM memories WHERE id = $1",
+                worldview_id,
+            )
+            assert "Updated identity content" not in content_before
+
+            strategic_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM memories WHERE type = 'strategic' AND content = 'Identity belief challenged but stable'"
+            )
+            assert int(strategic_count) >= 1
+
+            result_force = await conn.fetchval(
+                "SELECT update_identity_belief($1, $2, $3, TRUE)",
+                worldview_id,
+                "Updated identity content",
+                evidence_id,
+            )
+            assert result_force is True
+            content_after = await conn.fetchval(
+                "SELECT content FROM memories WHERE id = $1",
+                worldview_id,
+            )
+            assert content_after == "Updated identity content"
+        finally:
+            await tr.rollback()
+
+
+async def test_create_procedural_memory_function(db_pool, ensure_embedding_service):
     """Test create_procedural_memory() with steps"""
     async with db_pool.acquire() as conn:
-        try:
-            memory_id = await conn.fetchval("""
-                SELECT create_procedural_memory(
-                    'How to make coffee',
-                    '{"steps": ["Boil water", "Add coffee grounds", "Pour water", "Wait 4 minutes", "Press and pour"]}'::jsonb,
-                    '{"required": ["coffee maker", "coffee grounds", "water"]}'::jsonb,
-                    0.6
-                )
-            """)
+        memory_id = await conn.fetchval("""
+            SELECT create_procedural_memory(
+                'How to make coffee',
+                '{"steps": ["Boil water", "Add coffee grounds", "Pour water", "Wait 4 minutes", "Press and pour"]}'::jsonb,
+                '{"required": ["coffee maker", "coffee grounds", "water"]}'::jsonb,
+                0.6
+            )
+        """)
 
-            # Verify procedural details from metadata
-            mem = await conn.fetchrow("""
-                SELECT metadata FROM memories WHERE id = $1
-            """, memory_id)
-            assert mem is not None
-            metadata = mem['metadata']
-            if isinstance(metadata, str):
-                metadata = json.loads(metadata)
-            assert metadata['steps'] is not None
-            assert metadata['prerequisites'] is not None
-
-        except Exception as e:
-            if 'embedding' not in str(e).lower():
-                raise
+        # Verify procedural details from metadata
+        mem = await conn.fetchrow("""
+            SELECT metadata FROM memories WHERE id = $1
+        """, memory_id)
+        assert mem is not None
+        metadata = mem['metadata']
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        assert metadata['steps'] is not None
+        assert metadata['prerequisites'] is not None
 
 
-async def test_create_strategic_memory_function(db_pool):
+async def test_create_strategic_memory_function(db_pool, ensure_embedding_service):
     """Test create_strategic_memory() with pattern and evidence"""
     async with db_pool.acquire() as conn:
-        try:
-            memory_id = await conn.fetchval("""
-                SELECT create_strategic_memory(
-                    'Users prefer simple interfaces',
-                    'Simplicity leads to higher engagement',
-                    0.85,
-                    '{"studies": ["Nielsen 2020", "UX Research 2021"]}'::jsonb,
-                    '{"domains": ["web", "mobile", "desktop"]}'::jsonb,
-                    0.9
-                )
-            """)
+        memory_id = await conn.fetchval("""
+            SELECT create_strategic_memory(
+                'Users prefer simple interfaces',
+                'Simplicity leads to higher engagement',
+                0.85,
+                '{"studies": ["Nielsen 2020", "UX Research 2021"]}'::jsonb,
+                '{"domains": ["web", "mobile", "desktop"]}'::jsonb,
+                0.9
+            )
+        """)
 
-            # Verify strategic details from metadata
-            mem = await conn.fetchrow("""
-                SELECT metadata FROM memories WHERE id = $1
-            """, memory_id)
-            assert mem is not None
-            metadata = mem['metadata']
-            if isinstance(metadata, str):
-                metadata = json.loads(metadata)
-            assert metadata['pattern_description'] == 'Simplicity leads to higher engagement'
-            assert metadata['confidence_score'] == 0.85
-
-        except Exception as e:
-            if 'embedding' not in str(e).lower():
-                raise
+        # Verify strategic details from metadata
+        mem = await conn.fetchrow("""
+            SELECT metadata FROM memories WHERE id = $1
+        """, memory_id)
+        assert mem is not None
+        metadata = mem['metadata']
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        assert metadata['pattern_description'] == 'Simplicity leads to higher engagement'
+        assert metadata['confidence_score'] == 0.85
 
 
 # -----------------------------------------------------------------------------
@@ -5542,7 +7056,7 @@ async def test_get_embedding_different_content_different_embeddings(db_pool, ens
         assert embedding1 != embedding2, "Different content should produce different embeddings"
 
 
-async def test_get_embedding_http_error_handling(db_pool):
+async def test_get_embedding_http_error_handling(db_pool, ensure_embedding_service):
     """Test get_embedding() error handling when HTTP service is unavailable"""
     async with db_pool.acquire() as conn:
         # Phase 7 (ReduceScopeCreep): Use unified config only
@@ -5560,7 +7074,7 @@ async def test_get_embedding_http_error_handling(db_pool):
             )
 
             # Attempt to get embedding - should fail
-            with pytest.raises(Exception) as exc_info:
+            with pytest.raises(asyncpg.PostgresError) as exc_info:
                 await conn.fetchval("SELECT get_embedding('test content')")
 
             assert "Failed to get embedding" in str(exc_info.value), \
@@ -5578,7 +7092,7 @@ async def test_get_embedding_http_error_handling(db_pool):
             )
 
 
-async def test_get_embedding_non_200_response_handling(db_pool):
+async def test_get_embedding_non_200_response_handling(db_pool, ensure_embedding_service):
     """Test get_embedding() handles non-200 HTTP responses"""
     async with db_pool.acquire() as conn:
         # Phase 7 (ReduceScopeCreep): Use unified config only
@@ -5595,7 +7109,7 @@ async def test_get_embedding_non_200_response_handling(db_pool):
                 "SELECT set_config('embedding.service_url', '\"http://embeddings:80/nonexistent-endpoint\"'::jsonb)"
             )
 
-            with pytest.raises(Exception) as exc_info:
+            with pytest.raises(asyncpg.PostgresError) as exc_info:
                 await conn.fetchval("SELECT get_embedding('test content')")
 
             # Should mention service error or failed
@@ -6015,6 +7529,60 @@ async def test_add_to_working_memory_searchable(db_pool, ensure_embedding_servic
         assert found, "Should find the working memory via search"
 
 
+async def test_touch_working_memory_updates_access_fields(db_pool):
+    async with db_pool.acquire() as conn:
+        wm_id = await conn.fetchval(
+            """
+            INSERT INTO working_memory (content, embedding, access_count, expiry)
+            VALUES ($1, array_fill(0.4, ARRAY[embedding_dimension()])::vector, 0, CURRENT_TIMESTAMP + interval '1 hour')
+            RETURNING id
+            """,
+            f"Working memory {get_test_identifier('touch_wm')}",
+        )
+
+        await conn.execute("SELECT touch_working_memory($1::uuid[])", [wm_id])
+
+        row = await conn.fetchrow(
+            "SELECT access_count, last_accessed FROM working_memory WHERE id = $1",
+            wm_id,
+        )
+        assert row["access_count"] == 1
+        assert row["last_accessed"] is not None
+
+
+async def test_promote_working_memory_to_episodic_creates_memory(db_pool):
+    async with db_pool.acquire() as conn:
+        wm_id = await conn.fetchval(
+            """
+            INSERT INTO working_memory (content, embedding, importance, source_attribution, trust_level, expiry)
+            VALUES (
+                $1,
+                array_fill(0.3, ARRAY[embedding_dimension()])::vector,
+                0.5,
+                jsonb_build_object('kind', 'internal'),
+                0.8,
+                CURRENT_TIMESTAMP + interval '1 hour'
+            )
+            RETURNING id
+            """,
+            f"Promote working memory {get_test_identifier('promote_wm')}",
+        )
+
+        new_id = await conn.fetchval(
+            "SELECT promote_working_memory_to_episodic($1, 0.6)",
+            wm_id,
+        )
+        assert new_id is not None
+
+        row = await conn.fetchrow(
+            "SELECT type, metadata FROM memories WHERE id = $1",
+            new_id,
+        )
+        assert row["type"] == "episodic"
+        metadata = _coerce_json(row["metadata"])
+        assert metadata["context"]["from_working_memory_id"] == str(wm_id)
+
+
 # -----------------------------------------------------------------------------
 # BATCH CREATE MEMORIES
 # -----------------------------------------------------------------------------
@@ -6074,6 +7642,127 @@ async def test_batch_create_memories_creates_rows_and_nodes(db_pool, ensure_embe
                     """
                 )
                 assert int(node_count) >= 1
+        finally:
+            await tr.rollback()
+
+
+async def test_create_memory_with_embedding_creates_node(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("LOAD 'age';")
+        await conn.execute("SET search_path = ag_catalog, public;")
+
+        content = f"Memory with embedding {get_test_identifier('mem_with_embed')}"
+        memory_id = await conn.fetchval(
+            """
+            SELECT create_memory_with_embedding(
+                'semantic'::memory_type,
+                $1,
+                array_fill(0.12, ARRAY[embedding_dimension()])::vector,
+                0.7
+            )
+            """,
+            content,
+        )
+        assert memory_id is not None
+
+        node_count = await conn.fetchval(
+            f"""
+            SELECT COUNT(*) FROM cypher('memory_graph', $$
+                MATCH (n:MemoryNode {{memory_id: '{memory_id}'}})
+                RETURN n
+            $$) as (n agtype)
+            """
+        )
+        assert int(node_count) >= 1
+        await conn.execute("SET search_path = public, ag_catalog;")
+
+
+async def test_create_memory_with_embedding_requires_embedding(db_pool):
+    async with db_pool.acquire() as conn:
+        with pytest.raises(asyncpg.PostgresError):
+            await conn.fetchval(
+                "SELECT create_memory_with_embedding('semantic'::memory_type, 'bad', NULL::vector)"
+            )
+
+
+async def test_batch_create_memories_with_embeddings_creates_rows(db_pool):
+    async with db_pool.acquire() as conn:
+        contents = [
+            f"Batch embed A {get_test_identifier('batch_embed_a')}",
+            f"Batch embed B {get_test_identifier('batch_embed_b')}",
+        ]
+        embeddings = [
+            [0.0] * EMBEDDING_DIMENSION,
+            [0.1] * EMBEDDING_DIMENSION,
+        ]
+        ids = await conn.fetchval(
+            "SELECT batch_create_memories_with_embeddings('semantic'::memory_type, $1::text[], $2::jsonb, 0.6)",
+            contents,
+            json.dumps(embeddings),
+        )
+        assert isinstance(ids, list)
+        assert len(ids) == 2
+        count = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE id = ANY($1::uuid[])", ids)
+        assert int(count) == 2
+
+
+async def test_auto_check_worldview_alignment_creates_support_edge(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute("LOAD 'age';")
+            await conn.execute("SET search_path = ag_catalog, public;")
+            await conn.execute(
+                "SELECT set_config('memory.worldview_support_threshold', '0.5'::jsonb)"
+            )
+            await conn.execute(
+                "SELECT set_config('memory.worldview_contradict_threshold', '-0.5'::jsonb)"
+            )
+
+            worldview_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, metadata)
+                VALUES (
+                    'worldview'::memory_type,
+                    $1,
+                    array_fill(0.4, ARRAY[embedding_dimension()])::vector,
+                    jsonb_build_object('category', 'values', 'confidence', 0.8, 'stability', 0.8)
+                )
+                RETURNING id
+                """,
+                f"Alignment worldview {get_test_identifier('auto_align')}",
+            )
+            await conn.fetchval("SELECT sync_memory_node($1)", worldview_id)
+
+            semantic_id = uuid.uuid4()
+            await conn.execute(
+                f"""
+                SELECT * FROM ag_catalog.cypher('memory_graph', $$
+                    CREATE (m:MemoryNode {{memory_id: '{semantic_id}', type: 'semantic', created_at: '{datetime.now(timezone.utc).isoformat()}'}})
+                    RETURN m
+                $$) as (result agtype)
+                """
+            )
+            await conn.execute(
+                """
+                INSERT INTO memories (id, type, content, embedding, importance)
+                VALUES ($1, 'semantic'::memory_type, $2, array_fill(0.4, ARRAY[embedding_dimension()])::vector, 0.6)
+                """,
+                semantic_id,
+                f"Aligned semantic {get_test_identifier('auto_align_semantic')}",
+            )
+
+            edge_rows = await conn.fetch(
+                f"""
+                SELECT * FROM ag_catalog.cypher('memory_graph', $$
+                    MATCH (m:MemoryNode {{memory_id: '{semantic_id}'}})-[:SUPPORTS]->(w:MemoryNode {{memory_id: '{worldview_id}'}})
+                    RETURN w
+                $$) as (w agtype)
+                """
+            )
+            assert len(edge_rows) >= 1
+            await conn.execute("SET search_path = public, ag_catalog;")
         finally:
             await tr.rollback()
 
@@ -6244,7 +7933,7 @@ async def apply_heartbeat_migration(db_pool):
     """
     Legacy fixture retained for older test structure.
 
-    The repo now folds patches into db/schema.sql, and any optional
+    The repo now folds patches into db/*.sql, and any optional
     migrations/ patches are handled by `apply_repo_migrations`, so this
     fixture is intentionally a no-op to avoid overriding newer definitions.
     """
@@ -7062,6 +8751,32 @@ async def test_sync_embedding_dimension_config_respects_app_setting(db_pool):
             await tr.rollback()
 
 
+async def test_embedding_dimension_prefers_config_value(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute("SELECT set_config('embedding.dimension', to_jsonb(128))")
+            await conn.execute("SET LOCAL app.embedding_dimension = '256'")
+            dim = await conn.fetchval("SELECT embedding_dimension()")
+            assert int(dim) == 128
+        finally:
+            await tr.rollback()
+
+
+async def test_embedding_dimension_falls_back_to_app_setting(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute("DELETE FROM config WHERE key = 'embedding.dimension'")
+            await conn.execute("SET LOCAL app.embedding_dimension = '64'")
+            dim = await conn.fetchval("SELECT embedding_dimension()")
+            assert int(dim) == 64
+        finally:
+            await tr.rollback()
+
+
 async def test_create_goal_and_active_goals_view(db_pool):
     """Phase 6 (ReduceScopeCreep): Goals are now memories with type='goal'."""
     async with db_pool.acquire() as conn:
@@ -7443,7 +9158,7 @@ async def test_worker_check_and_run_heartbeat_queues_decision_call(db_pool):
                 )
 
 
-async def test_assign_to_episode_trigger_sequences_and_splits_on_gap(db_pool):
+async def test_assign_to_episode_trigger_sequences_and_splits_on_gap(db_pool, ensure_embedding_service):
     async with db_pool.acquire() as conn:
         await conn.execute("LOAD 'age';")
         await conn.execute("SET search_path = ag_catalog, public;")

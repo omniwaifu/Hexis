@@ -59,8 +59,8 @@ async def temp_test_db():
     finally:
         await admin_conn.close()
 
-    schema_path = Path(__file__).resolve().parents[1] / "db" / "schema.sql"
-    schema_sql = schema_path.read_text(encoding="utf-8")
+    schema_dir = Path(__file__).resolve().parents[1] / "db"
+    schema_files = sorted(schema_dir.glob("*.sql"), key=lambda path: path.name)
     try:
         test_conn = await _connect_with_retry(
             _db_dsn(temp_db),
@@ -73,7 +73,8 @@ async def temp_test_db():
             f"(connect_timeout={connect_timeout}s): {exc!r}"
         )
     try:
-        await test_conn.execute(schema_sql)
+        for schema_path in schema_files:
+            await test_conn.execute(schema_path.read_text(encoding="utf-8"))
     finally:
         await test_conn.close()
 

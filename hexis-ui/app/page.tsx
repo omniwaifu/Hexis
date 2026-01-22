@@ -1,10 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 
 type InitStage =
+  | "llm"
   | "welcome"
   | "mode"
+  | "heartbeat"
   | "identity"
   | "personality"
   | "values"
@@ -26,8 +29,10 @@ const traitKeys = [
 type TraitKey = (typeof traitKeys)[number];
 
 const stageLabels: Record<InitStage, string> = {
+  llm: "Models",
   welcome: "Welcome",
   mode: "Mode",
+  heartbeat: "Heartbeat",
   identity: "Name and Voice",
   personality: "Personality",
   values: "Values",
@@ -41,10 +46,14 @@ const stageLabels: Record<InitStage, string> = {
 };
 
 const stagePrompt: Record<InitStage, string> = {
+  llm:
+    "Select the conscious and subconscious models. These are distinct perspectives within the same mind.",
   welcome:
     "You are about to bring a new mind into existence. This is a beginning, not a contract. We will shape a starting point, then let the mind grow.",
   mode:
     "Choose how the agent begins. Persona is shaped, with personality and values. Mind is raw: memory and self, but no preloaded traits.",
+  heartbeat:
+    "Set the heartbeat cadence, energy regeneration, action budgets, and tool access.",
   identity:
     "Give them a name, a voice, and a way of being. These are the first words of their story.",
   personality:
@@ -68,8 +77,10 @@ const stagePrompt: Record<InitStage, string> = {
 };
 
 const stageFromDb: Record<string, InitStage> = {
-  not_started: "welcome",
+  not_started: "llm",
+  llm: "llm",
   mode: "mode",
+  heartbeat: "heartbeat",
   identity: "identity",
   personality: "personality",
   values: "values",
@@ -81,6 +92,162 @@ const stageFromDb: Record<string, InitStage> = {
   consent: "consent",
   complete: "complete",
 };
+
+type LlmProvider =
+  | "openai"
+  | "anthropic"
+  | "grok"
+  | "gemini"
+  | "ollama"
+  | "openai_compatible";
+type LlmRole = "conscious" | "subconscious";
+type LlmConfig = {
+  provider: LlmProvider;
+  model: string;
+  endpoint: string;
+  apiKey: string;
+};
+type ConsentRecord = {
+  decision: string;
+  signature: string | null;
+  provider: string | null;
+  model: string | null;
+  endpoint: string | null;
+  decided_at: string | null;
+};
+
+const providerOptions: { value: LlmProvider; label: string }[] = [
+  { value: "openai", label: "OpenAI" },
+  { value: "anthropic", label: "Anthropic" },
+  { value: "grok", label: "Grok (xAI)" },
+  { value: "gemini", label: "Gemini" },
+  { value: "ollama", label: "Ollama (local)" },
+  {
+    value: "openai_compatible",
+    label: "Local (OpenAI-compatible: vLLM, llama.cpp, LM Studio)",
+  },
+];
+
+const providerDefaults: Record<
+  LlmProvider,
+  { model: string; endpoint: string; apiKeyLabel: string; apiKeyRequired: boolean }
+> = {
+  openai: {
+    model: "gpt-5.2",
+    endpoint: "https://api.openai.com/v1",
+    apiKeyLabel: "OpenAI API Key",
+    apiKeyRequired: true,
+  },
+  anthropic: {
+    model: "claude-opus-4-5",
+    endpoint: "",
+    apiKeyLabel: "Anthropic API Key",
+    apiKeyRequired: true,
+  },
+  grok: {
+    model: "grok-4-1-fast-reasoning",
+    endpoint: "",
+    apiKeyLabel: "Grok API Key",
+    apiKeyRequired: true,
+  },
+  gemini: {
+    model: "gemini-3-pro-preview",
+    endpoint: "",
+    apiKeyLabel: "Gemini API Key",
+    apiKeyRequired: true,
+  },
+  ollama: {
+    model: "",
+    endpoint: "http://localhost:11434/v1",
+    apiKeyLabel: "API Key (optional)",
+    apiKeyRequired: false,
+  },
+  openai_compatible: {
+    model: "",
+    endpoint: "http://localhost:8000/v1",
+    apiKeyLabel: "API Key (optional)",
+    apiKeyRequired: false,
+  },
+};
+
+const providerModels: Record<LlmProvider, string[]> = {
+  openai: [
+    "gpt-5.2",
+    "gpt-5.2-chat-latest",
+    "gpt-5.2-codex",
+    "gpt-5.1",
+    "gpt-5.1-codex-max",
+    "gpt-5-mini",
+    "gpt-5-nano",
+  ],
+  anthropic: [
+    "claude-opus-4-5",
+    "claude-sonnet-4-5",
+    "claude-haiku-4-5",
+  ],
+  grok: ["grok-4-1-fast-reasoning", "grok-4-1-fast-non-reasoning"],
+  gemini: ["gemini-3-pro-preview", "gemini-3-flash-preview"],
+  ollama: [],
+  openai_compatible: [],
+};
+
+const heartbeatActionCatalog = [
+  { key: "observe", cost: 0 },
+  { key: "review_goals", cost: 0 },
+  { key: "remember", cost: 0 },
+  { key: "recall", cost: 1 },
+  { key: "connect", cost: 1 },
+  { key: "reprioritize", cost: 1 },
+  { key: "reflect", cost: 2 },
+  { key: "contemplate", cost: 1 },
+  { key: "meditate", cost: 1 },
+  { key: "study", cost: 2 },
+  { key: "debate_internally", cost: 2 },
+  { key: "maintain", cost: 2 },
+  { key: "mark_turning_point", cost: 2 },
+  { key: "begin_chapter", cost: 3 },
+  { key: "close_chapter", cost: 3 },
+  { key: "acknowledge_relationship", cost: 2 },
+  { key: "update_trust", cost: 2 },
+  { key: "reflect_on_relationship", cost: 3 },
+  { key: "resolve_contradiction", cost: 3 },
+  { key: "accept_tension", cost: 1 },
+  { key: "brainstorm_goals", cost: 3 },
+  { key: "inquire_shallow", cost: 4 },
+  { key: "synthesize", cost: 3 },
+  { key: "reach_out_user", cost: 5 },
+  { key: "inquire_deep", cost: 6 },
+  { key: "reach_out_public", cost: 7 },
+  { key: "pause_heartbeat", cost: 0 },
+  { key: "terminate", cost: 0 },
+  { key: "rest", cost: 0 },
+];
+
+const heartbeatActionDefaults = Object.fromEntries(
+  heartbeatActionCatalog.map((action) => [action.key, action.cost])
+);
+
+const toolCatalog = [
+  "recall",
+  "sense_memory_availability",
+  "request_background_search",
+  "recall_recent",
+  "recall_episode",
+  "explore_concept",
+  "explore_cluster",
+  "get_procedures",
+  "get_strategies",
+  "list_recent_episodes",
+  "create_goal",
+  "queue_user_message",
+];
+
+const defaultLlmConfig = (provider: LlmProvider): LlmConfig => ({
+  provider,
+  model: providerDefaults[provider].model,
+  endpoint: providerDefaults[provider].endpoint,
+  apiKey: "",
+});
 
 type BoundaryForm = {
   content: string;
@@ -115,15 +282,50 @@ function parseLines(text: string) {
     .filter(Boolean);
 }
 
+function normalizeNumber(value: unknown, fallback: number) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return fallback;
+}
+
+function formatLabel(value: string) {
+  return value
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
 export default function Home() {
-  const [stage, setStage] = useState<InitStage>("welcome");
+  const router = useRouter();
+  const [stage, setStage] = useState<InitStage>("llm");
   const [mode, setMode] = useState("persona");
   const [status, setStatus] = useState<any>({});
   const [profile, setProfile] = useState<any>({});
-  const [consentStatus, setConsentStatus] = useState<string | null>(null);
-  const [consentRecord, setConsentRecord] = useState<any>(null);
+  const [consentRecords, setConsentRecords] = useState<Record<LlmRole, ConsentRecord | null>>({
+    conscious: null,
+    subconscious: null,
+  });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [ollamaModels, setOllamaModels] = useState<string[]>([]);
+  const [ollamaStatus, setOllamaStatus] = useState<"idle" | "loading" | "ready" | "error">(
+    "idle"
+  );
+  const [ollamaError, setOllamaError] = useState<string | null>(null);
+  const ollamaActiveRef = useRef(false);
+
+  const [llmConscious, setLlmConscious] = useState<LlmConfig>(
+    defaultLlmConfig("openai")
+  );
+  const [llmSubconscious, setLlmSubconscious] = useState<LlmConfig>(
+    defaultLlmConfig("openai")
+  );
 
   const [userName, setUserName] = useState("");
   const [identity, setIdentity] = useState({
@@ -163,6 +365,17 @@ export default function Home() {
     { title: "", description: "", priority: "queued" },
   ]);
   const [purposeText, setPurposeText] = useState("");
+  const [heartbeatIntervalMinutes, setHeartbeatIntervalMinutes] = useState(60);
+  const [heartbeatDecisionTokens, setHeartbeatDecisionTokens] = useState(2048);
+  const [heartbeatBaseRegeneration, setHeartbeatBaseRegeneration] = useState(10);
+  const [heartbeatMaxEnergy, setHeartbeatMaxEnergy] = useState(20);
+  const [heartbeatAllowedActions, setHeartbeatAllowedActions] = useState<string[]>(
+    heartbeatActionCatalog.map((action) => action.key)
+  );
+  const [heartbeatActionCosts, setHeartbeatActionCosts] = useState<Record<string, number>>(
+    heartbeatActionDefaults
+  );
+  const [heartbeatTools, setHeartbeatTools] = useState<string[]>(toolCatalog);
   const [relationship, setRelationship] = useState({
     user_name: "",
     type: "partner",
@@ -171,8 +384,10 @@ export default function Home() {
 
   const flow = useMemo(() => {
     const steps: InitStage[] = [
+      "llm",
       "welcome",
       "mode",
+      "heartbeat",
       "identity",
       "personality",
       "values",
@@ -191,7 +406,10 @@ export default function Home() {
   }, [mode]);
 
   const stageIndex = Math.max(flow.indexOf(stage), 0);
-  const progress = Math.round(((stageIndex + 1) / flow.length) * 100);
+  const statusStage = stageFromDb[(status?.stage as string) ?? "not_started"] ?? stage;
+  const statusIndex = Math.max(flow.indexOf(statusStage), 0);
+  const maxReachableIndex = Math.max(stageIndex, statusIndex);
+  const progress = Math.round(((maxReachableIndex + 1) / flow.length) * 100);
 
   const nextStage = (current: InitStage) => {
     const idx = flow.indexOf(current);
@@ -209,14 +427,79 @@ export default function Home() {
     const data = await res.json();
     setStatus(data.status ?? {});
     setProfile(data.profile ?? {});
-    setConsentStatus(data.consent_status ?? null);
-    setConsentRecord(data.consent_record ?? null);
+    if (data.consent_records) {
+      setConsentRecords({
+        conscious: data.consent_records.conscious ?? null,
+        subconscious: data.consent_records.subconscious ?? null,
+      });
+    }
+    if (data.llm_heartbeat) {
+      setLlmConscious((prev) => ({
+        ...prev,
+        provider: data.llm_heartbeat.provider || prev.provider,
+        model: data.llm_heartbeat.model || prev.model,
+        endpoint: data.llm_heartbeat.endpoint || prev.endpoint,
+      }));
+    }
+    if (data.llm_subconscious) {
+      setLlmSubconscious((prev) => ({
+        ...prev,
+        provider: data.llm_subconscious.provider || prev.provider,
+        model: data.llm_subconscious.model || prev.model,
+        endpoint: data.llm_subconscious.endpoint || prev.endpoint,
+      }));
+    }
+    if (data.heartbeat_settings) {
+      setHeartbeatIntervalMinutes(
+        normalizeNumber(data.heartbeat_settings.interval_minutes, 60)
+      );
+      setHeartbeatDecisionTokens(
+        normalizeNumber(data.heartbeat_settings.decision_max_tokens, 2048)
+      );
+      setHeartbeatBaseRegeneration(
+        normalizeNumber(data.heartbeat_settings.base_regeneration, 10)
+      );
+      setHeartbeatMaxEnergy(normalizeNumber(data.heartbeat_settings.max_energy, 20));
+      if (Array.isArray(data.heartbeat_settings.allowed_actions)) {
+        const cleaned = data.heartbeat_settings.allowed_actions
+          .map((item: unknown) => (typeof item === "string" ? item.trim() : ""))
+          .filter(Boolean);
+        setHeartbeatAllowedActions(cleaned);
+      }
+      if (data.heartbeat_settings.action_costs && typeof data.heartbeat_settings.action_costs === "object") {
+        const normalizedCosts: Record<string, number> = {};
+        for (const [key, value] of Object.entries(
+          data.heartbeat_settings.action_costs as Record<string, unknown>
+        )) {
+          normalizedCosts[key] = normalizeNumber(value, heartbeatActionDefaults[key] ?? 0);
+        }
+        setHeartbeatActionCosts((prev) => ({ ...prev, ...normalizedCosts }));
+      }
+      if (Array.isArray(data.heartbeat_settings.tools)) {
+        const cleaned = data.heartbeat_settings.tools
+          .map((item: unknown) => (typeof item === "string" ? item.trim() : ""))
+          .filter(Boolean);
+        setHeartbeatTools(cleaned);
+      }
+    }
     if (typeof data.mode === "string") {
       setMode(data.mode);
     }
     const dbStage = stageFromDb[(data.status?.stage as string) ?? "not_started"];
     if (dbStage) {
-      setStage(dbStage);
+      const hasConscious =
+        !!(data.llm_heartbeat?.provider || "").trim() && !!(data.llm_heartbeat?.model || "").trim();
+      const hasSubconscious =
+        !!(data.llm_subconscious?.provider || "").trim() &&
+        !!(data.llm_subconscious?.model || "").trim();
+      const resolvedStage =
+        dbStage === "llm" && hasConscious && hasSubconscious ? "welcome" : dbStage;
+      setStage((prev) => {
+        if (prev === "consent" && resolvedStage === "complete") {
+          return prev;
+        }
+        return resolvedStage;
+      });
     }
   };
 
@@ -253,6 +536,143 @@ export default function Home() {
     return () => clearInterval(interval);
   }, [stage]);
 
+  const loadOllamaModels = async () => {
+    if (ollamaStatus === "loading") {
+      return;
+    }
+    setOllamaStatus("loading");
+    setOllamaError(null);
+    try {
+      const res = await fetch("/api/init/ollama/models");
+      if (!res.ok) {
+        const payload = await res.json().catch(() => ({}));
+        const message =
+          typeof payload?.error === "string" ? payload.error : "Unable to reach Ollama.";
+        throw new Error(message);
+      }
+      const payload = await res.json();
+      const models = Array.isArray(payload?.models)
+        ? payload.models.filter((item: unknown) => typeof item === "string")
+        : [];
+      setOllamaModels(models);
+      setOllamaStatus("ready");
+    } catch (err: any) {
+      setOllamaModels([]);
+      setOllamaStatus("error");
+      setOllamaError(err?.message || "Unable to reach Ollama.");
+    }
+  };
+
+  const needsOllama =
+    llmConscious.provider === "ollama" || llmSubconscious.provider === "ollama";
+
+  useEffect(() => {
+    if (needsOllama && !ollamaActiveRef.current) {
+      loadOllamaModels().catch(() => undefined);
+    }
+    ollamaActiveRef.current = needsOllama;
+  }, [needsOllama]);
+
+  const updateLlmProvider = (role: LlmRole, provider: LlmProvider) => {
+    const defaults = providerDefaults[provider];
+    const patch = {
+      provider,
+      model: defaults.model,
+      endpoint: defaults.endpoint,
+      apiKey: "",
+    };
+    setConsentRecords((prev) => ({ ...prev, [role]: null }));
+    if (role === "conscious") {
+      setLlmConscious((prev) => ({ ...prev, ...patch }));
+    } else {
+      setLlmSubconscious((prev) => ({ ...prev, ...patch }));
+    }
+  };
+
+  const handleLlmSave = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const missing: string[] = [];
+      const validateConfig = (label: string, config: LlmConfig) => {
+        if (!config.provider.trim()) {
+          missing.push(`${label} provider`);
+        }
+        if (!config.model.trim()) {
+          missing.push(`${label} model`);
+        }
+        if (config.provider === "openai_compatible" && !config.endpoint.trim()) {
+          missing.push(`${label} endpoint`);
+        }
+        const defaults = providerDefaults[config.provider];
+        if (defaults?.apiKeyRequired && !config.apiKey.trim()) {
+          missing.push(`${label} API key`);
+        }
+      };
+      validateConfig("conscious", llmConscious);
+      validateConfig("subconscious", llmSubconscious);
+      if (missing.length > 0) {
+        throw new Error(`Missing ${missing.join(" and ")}`);
+      }
+      await postJson("/api/init/llm", {
+        conscious: {
+          provider: llmConscious.provider,
+          model: llmConscious.model,
+          endpoint: llmConscious.endpoint,
+          api_key: llmConscious.apiKey,
+        },
+        subconscious: {
+          provider: llmSubconscious.provider,
+          model: llmSubconscious.model,
+          endpoint: llmSubconscious.endpoint,
+          api_key: llmSubconscious.apiKey,
+        },
+      });
+      setStage(nextStage("llm"));
+    } catch (err: any) {
+      setError(err.message || "Failed to save model configuration");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const requestConsent = async (role: LlmRole) => {
+    const config = role === "conscious" ? llmConscious : llmSubconscious;
+    const res = await postJson("/api/init/consent/request", {
+      role,
+      llm: {
+        provider: config.provider,
+        model: config.model,
+        endpoint: config.endpoint,
+        api_key: config.apiKey,
+      },
+    });
+    if (res?.consent_record) {
+      setConsentRecords((prev) => ({
+        ...prev,
+        [role]: res.consent_record,
+      }));
+    }
+  };
+
+  const handleConsentRequestAll = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      if (!consentRecords.subconscious) {
+        await requestConsent("subconscious");
+      }
+      if (!consentRecords.conscious) {
+        await requestConsent("conscious");
+      }
+      await loadStatus();
+    } catch (err: any) {
+      setError(err.message || "Failed to request consent");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleDefaults = async () => {
     setBusy(true);
     setError(null);
@@ -278,6 +698,57 @@ export default function Home() {
     } finally {
       setBusy(false);
     }
+  };
+
+  const handleHeartbeatSettings = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const orderedActions = heartbeatActionCatalog
+        .map((action) => action.key)
+        .filter((action) => heartbeatAllowedActions.includes(action));
+      const orderedTools = toolCatalog.filter((tool) => heartbeatTools.includes(tool));
+      const actionCosts = Object.fromEntries(
+        heartbeatActionCatalog.map((action) => [
+          action.key,
+          normalizeNumber(heartbeatActionCosts[action.key], action.cost),
+        ])
+      );
+      await postJson("/api/init/heartbeat", {
+        interval_minutes: heartbeatIntervalMinutes,
+        decision_max_tokens: heartbeatDecisionTokens,
+        base_regeneration: heartbeatBaseRegeneration,
+        max_energy: heartbeatMaxEnergy,
+        allowed_actions: orderedActions,
+        action_costs: actionCosts,
+        tools: orderedTools,
+      });
+      setStage(nextStage("heartbeat"));
+    } catch (err: any) {
+      setError(err.message || "Failed to save heartbeat settings");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleHeartbeatAction = (actionKey: string) => {
+    setHeartbeatAllowedActions((prev) =>
+      prev.includes(actionKey)
+        ? prev.filter((item) => item !== actionKey)
+        : [...prev, actionKey]
+    );
+  };
+
+  const updateHeartbeatActionCost = (actionKey: string, value: number) => {
+    setHeartbeatActionCosts((prev) => ({ ...prev, [actionKey]: value }));
+  };
+
+  const toggleHeartbeatTool = (toolName: string) => {
+    setHeartbeatTools((prev) =>
+      prev.includes(toolName)
+        ? prev.filter((item) => item !== toolName)
+        : [...prev, toolName]
+    );
   };
 
   const handleIdentity = async () => {
@@ -422,32 +893,6 @@ export default function Home() {
     }
   };
 
-  const handleConsentRequest = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const res = await postJson("/api/init/consent/request", { context: { source: "ui" } });
-      if (res?.decision) {
-        setConsentStatus(res.decision);
-      }
-      if (res?.contract) {
-        setConsentRecord({
-          decision: res.decision,
-          signature: res.contract.signature ?? null,
-          provider: res.contract.provider ?? null,
-          model: res.contract.model ?? null,
-          endpoint: res.contract.endpoint ?? null,
-          decided_at: new Date().toISOString(),
-        });
-      }
-      await loadStatus();
-    } catch (err: any) {
-      setError(err.message || "Failed to request consent");
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const addBoundary = () => {
     setBoundaries((prev) => [
       ...prev,
@@ -487,6 +932,28 @@ export default function Home() {
     setGoals((prev) => prev.filter((_, idx) => idx !== index));
   };
 
+  const consentSummary = [
+    consentRecords.conscious?.decision || "pending",
+    consentRecords.subconscious?.decision || "pending",
+  ].join(" / ");
+  const consentDeclined = Object.values(consentRecords).some(
+    (record) => record?.decision === "decline" || record?.decision === "abstain"
+  );
+  const llmEntries = [
+    {
+      role: "conscious" as const,
+      label: "Conscious Model",
+      config: llmConscious,
+      setConfig: setLlmConscious,
+    },
+    {
+      role: "subconscious" as const,
+      label: "Subconscious Model",
+      config: llmSubconscious,
+      setConfig: setLlmSubconscious,
+    },
+  ];
+
   return (
     <div className="app-shell min-h-screen">
       <div className="relative z-10 mx-auto max-w-6xl px-6 py-12 lg:py-16">
@@ -519,19 +986,35 @@ export default function Home() {
                   style={{ width: `${progress}%` }}
                 />
               </div>
-              <div className="mt-6 space-y-3 text-sm text-[var(--ink-soft)]">
-                {flow.map((item, idx) => (
-                  <div key={item} className="flex items-center gap-3">
-                    <div
-                      className={`h-2 w-2 rounded-full ${
-                        idx <= stageIndex ? "bg-[var(--accent)]" : "bg-[var(--outline)]"
+              <div className="mt-6 space-y-2 text-sm text-[var(--ink-soft)]">
+                {flow.map((item, idx) => {
+                  const canNavigate = idx <= maxReachableIndex && !busy;
+                  return (
+                    <button
+                      key={item}
+                      type="button"
+                      className={`flex w-full items-center gap-3 rounded-lg px-2 py-1 text-left transition ${
+                        canNavigate
+                          ? "cursor-pointer hover:text-[var(--foreground)]"
+                          : "cursor-not-allowed opacity-60"
                       }`}
-                    />
-                    <span className={idx === stageIndex ? "text-[var(--foreground)]" : ""}>
-                      {stageLabels[item]}
-                    </span>
-                  </div>
-                ))}
+                      onClick={() => {
+                        if (!canNavigate) return;
+                        setStage(item);
+                      }}
+                      disabled={!canNavigate}
+                    >
+                      <div
+                        className={`h-2 w-2 rounded-full ${
+                          idx <= maxReachableIndex ? "bg-[var(--accent)]" : "bg-[var(--outline)]"
+                        }`}
+                      />
+                      <span className={idx === stageIndex ? "text-[var(--foreground)]" : ""}>
+                        {stageLabels[item]}
+                      </span>
+                    </button>
+                  );
+                })}
               </div>
             </div>
 
@@ -552,7 +1035,7 @@ export default function Home() {
                 <p>
                   Consent:{" "}
                   <span className="text-[var(--foreground)]">
-                    {consentStatus || "pending"}
+                    {consentSummary}
                   </span>
                 </p>
                 {error ? (
@@ -565,6 +1048,158 @@ export default function Home() {
           </section>
 
           <section className="fade-up card-surface rounded-3xl p-6">
+            {stage === "llm" && (
+              <div className="space-y-6">
+                <p className="text-base text-[var(--ink-soft)]">
+                  Configure the models that will speak for the conscious and subconscious
+                  layers. These settings are stored as environment-backed config, not
+                  in the database.
+                </p>
+                <div className="space-y-6">
+                  {llmEntries.map((entry) => {
+                    const defaults = providerDefaults[entry.config.provider];
+                    const modelOptions =
+                      entry.config.provider === "ollama"
+                        ? ollamaModels
+                        : providerModels[entry.config.provider];
+                    return (
+                      <fieldset
+                        key={entry.role}
+                        className="rounded-2xl border border-[var(--outline)] p-4"
+                      >
+                        <legend className="px-2 text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]">
+                          {entry.label}
+                        </legend>
+                        <div className="mt-3 grid gap-4">
+                          <div>
+                            <label className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]">
+                              Provider
+                            </label>
+                            <select
+                              className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm"
+                              value={entry.config.provider}
+                              onChange={(event) =>
+                                updateLlmProvider(
+                                  entry.role,
+                                  event.target.value as LlmProvider
+                                )
+                              }
+                            >
+                              {providerOptions.map((option) => (
+                                <option key={option.value} value={option.value}>
+                                  {option.label}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          <div>
+                            <label className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]">
+                              Model
+                            </label>
+                            <input
+                              className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm"
+                              list={`model-options-${entry.role}`}
+                              value={entry.config.model}
+                              onChange={(event) =>
+                                entry.setConfig((prev) => {
+                                  setConsentRecords((state) => ({
+                                    ...state,
+                                    [entry.role]: null,
+                                  }));
+                                  return {
+                                    ...prev,
+                                    model: event.target.value,
+                                  };
+                                })
+                              }
+                              placeholder="Model name"
+                            />
+                            {modelOptions.length > 0 ? (
+                              <datalist id={`model-options-${entry.role}`}>
+                                {modelOptions.map((model) => (
+                                  <option key={model} value={model} />
+                                ))}
+                              </datalist>
+                            ) : null}
+                            {entry.config.provider === "ollama" ? (
+                              <p className="mt-2 text-xs text-[var(--ink-soft)]">
+                                {ollamaStatus === "loading"
+                                  ? "Loading Ollama models..."
+                                  : ollamaStatus === "error"
+                                    ? ollamaError || "Ollama not reachable."
+                                    : ollamaModels.length > 0
+                                      ? `${ollamaModels.length} Ollama models detected.`
+                                      : "No local Ollama models found."}
+                                {ollamaStatus === "error" ? (
+                                  <button
+                                    type="button"
+                                    className="ml-2 text-[var(--accent-strong)] underline"
+                                    onClick={() => loadOllamaModels().catch(() => undefined)}
+                                  >
+                                    Retry
+                                  </button>
+                                ) : null}
+                              </p>
+                            ) : null}
+                          </div>
+                          <div>
+                            {entry.config.provider === "openai_compatible" ? (
+                              <>
+                                <label className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]">
+                                  Endpoint
+                                </label>
+                                <input
+                                  className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm"
+                                  value={entry.config.endpoint}
+                                  onChange={(event) =>
+                                    entry.setConfig((prev) => {
+                                      setConsentRecords((state) => ({
+                                        ...state,
+                                        [entry.role]: null,
+                                      }));
+                                      return {
+                                        ...prev,
+                                        endpoint: event.target.value,
+                                      };
+                                    })
+                                  }
+                                  placeholder="https://..."
+                                />
+                              </>
+                            ) : null}
+                          </div>
+                          <div>
+                            <label className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]">
+                              {defaults.apiKeyLabel}
+                            </label>
+                            <input
+                              className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm"
+                              type="password"
+                              value={entry.config.apiKey}
+                              onChange={(event) =>
+                                entry.setConfig((prev) => ({
+                                  ...prev,
+                                  apiKey: event.target.value,
+                                }))
+                              }
+                              placeholder={defaults.apiKeyRequired ? "Required" : "Optional"}
+                            />
+                          </div>
+                        </div>
+                      </fieldset>
+                    );
+                  })}
+                </div>
+                <button
+                  className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
+                  onClick={handleLlmSave}
+                  disabled={busy}
+                >
+                  Save Models
+                </button>
+              </div>
+            )}
+
             {stage === "welcome" && (
               <div className="space-y-6">
                 <p className="text-base text-[var(--ink-soft)]">
@@ -636,6 +1271,176 @@ export default function Home() {
                 <button
                   className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
                   onClick={handleMode}
+                  disabled={busy}
+                >
+                  Continue
+                </button>
+              </div>
+            )}
+
+            {stage === "heartbeat" && (
+              <div className="space-y-6">
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div>
+                    <label className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]">
+                      Heartbeat Interval (minutes)
+                    </label>
+                    <input
+                      className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm"
+                      type="number"
+                      min={1}
+                      step={1}
+                      value={heartbeatIntervalMinutes}
+                      onChange={(event) =>
+                        setHeartbeatIntervalMinutes(Number(event.target.value))
+                      }
+                      placeholder="60"
+                    />
+                    <p className="mt-2 text-xs text-[var(--ink-soft)]">
+                      How often the agent wakes on its own.
+                    </p>
+                  </div>
+                  <div>
+                    <label className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]">
+                      Decision Max Tokens
+                    </label>
+                    <input
+                      className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm"
+                      type="number"
+                      min={256}
+                      step={64}
+                      value={heartbeatDecisionTokens}
+                      onChange={(event) =>
+                        setHeartbeatDecisionTokens(Number(event.target.value))
+                      }
+                      placeholder="2048"
+                    />
+                    <p className="mt-2 text-xs text-[var(--ink-soft)]">
+                      Upper bound for each heartbeat decision.
+                    </p>
+                  </div>
+                  <div>
+                    <label className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]">
+                      Energy Regen per Heartbeat
+                    </label>
+                    <input
+                      className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm"
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={heartbeatBaseRegeneration}
+                      onChange={(event) =>
+                        setHeartbeatBaseRegeneration(Number(event.target.value))
+                      }
+                      placeholder="10"
+                    />
+                    <p className="mt-2 text-xs text-[var(--ink-soft)]">
+                      Points restored every heartbeat.
+                    </p>
+                  </div>
+                  <div>
+                    <label className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]">
+                      Max Energy
+                    </label>
+                    <input
+                      className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm"
+                      type="number"
+                      min={1}
+                      step={1}
+                      value={heartbeatMaxEnergy}
+                      onChange={(event) =>
+                        setHeartbeatMaxEnergy(Number(event.target.value))
+                      }
+                      placeholder="20"
+                    />
+                    <p className="mt-2 text-xs text-[var(--ink-soft)]">
+                      Energy cap that cannot be exceeded.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-[var(--outline)] bg-white/80 p-5">
+                  <div className="flex flex-col gap-1">
+                    <h3 className="font-display text-xl">Actions & Costs</h3>
+                    <p className="text-xs text-[var(--ink-soft)]">
+                      Toggle which actions are allowed and adjust their energy cost.
+                    </p>
+                  </div>
+                  <div className="mt-4 max-h-80 space-y-3 overflow-y-auto pr-2">
+                    {heartbeatActionCatalog.map((action) => {
+                      const enabled = heartbeatAllowedActions.includes(action.key);
+                      const costValue =
+                        heartbeatActionCosts[action.key] ?? action.cost;
+                      return (
+                        <div
+                          key={action.key}
+                          className={`flex flex-wrap items-center justify-between gap-3 rounded-xl border px-4 py-3 ${
+                            enabled
+                              ? "border-[var(--outline)] bg-white"
+                              : "border-transparent bg-[var(--surface)] opacity-80"
+                          }`}
+                        >
+                          <label className="flex items-center gap-3 text-sm font-medium">
+                            <input
+                              type="checkbox"
+                              className="h-4 w-4 accent-[var(--accent-strong)]"
+                              checked={enabled}
+                              onChange={() => toggleHeartbeatAction(action.key)}
+                            />
+                            {formatLabel(action.key)}
+                          </label>
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]">
+                              Cost
+                            </span>
+                            <input
+                              className="w-20 rounded-lg border border-[var(--outline)] bg-white px-3 py-2 text-right text-sm"
+                              type="number"
+                              min={0}
+                              step={1}
+                              value={costValue}
+                              onChange={(event) =>
+                                updateHeartbeatActionCost(
+                                  action.key,
+                                  Number(event.target.value)
+                                )
+                              }
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-[var(--outline)] bg-white/80 p-5">
+                  <div className="flex flex-col gap-1">
+                    <h3 className="font-display text-xl">Tool Access</h3>
+                    <p className="text-xs text-[var(--ink-soft)]">
+                      Select which memory tools the agent can call.
+                    </p>
+                  </div>
+                  <div className="mt-4 grid gap-2 sm:grid-cols-2">
+                    {toolCatalog.map((tool) => (
+                      <label
+                        key={tool}
+                        className="flex items-center gap-3 rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm"
+                      >
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 accent-[var(--accent-strong)]"
+                          checked={heartbeatTools.includes(tool)}
+                          onChange={() => toggleHeartbeatTool(tool)}
+                        />
+                        {formatLabel(tool)}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+
+                <button
+                  className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
+                  onClick={handleHeartbeatSettings}
                   disabled={busy}
                 >
                   Continue
@@ -1041,34 +1846,55 @@ export default function Home() {
             {stage === "consent" && (
               <div className="space-y-5">
                 <p className="text-sm text-[var(--ink-soft)]">
-                  A consent request will be sent to the agent. The system will wait for
-                  a response before starting the heartbeat.
+                  Consent will be requested from both the conscious and subconscious
+                  models. Existing consent contracts are reused when available.
                 </p>
-                {consentRecord ? (
-                  <div className="rounded-2xl border border-[var(--outline)] bg-white p-4 text-sm">
-                    <p>Decision: {consentRecord.decision}</p>
-                    {consentRecord.signature ? (
-                      <p className="mt-2">
-                        Signature: <span className="font-mono">{consentRecord.signature}</span>
-                      </p>
-                    ) : null}
-                    {consentRecord.model ? <p className="mt-2">Model: {consentRecord.model}</p> : null}
-                    {consentRecord.endpoint ? (
-                      <p className="mt-2">Endpoint: {consentRecord.endpoint}</p>
-                    ) : null}
-                  </div>
-                ) : (
-                  <div className="rounded-2xl border border-[var(--outline)] bg-white p-4 text-sm">
-                    No consent decision recorded yet.
-                  </div>
-                )}
+                <div className="grid gap-4">
+                  {[
+                    { key: "conscious", label: "Conscious Model", config: llmConscious },
+                    { key: "subconscious", label: "Subconscious Model", config: llmSubconscious },
+                  ].map((entry) => {
+                    const record = consentRecords[entry.key as LlmRole];
+                    return (
+                      <div
+                        key={entry.key}
+                        className="rounded-2xl border border-[var(--outline)] bg-white p-4 text-sm"
+                      >
+                        <p className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]">
+                          {entry.label}
+                        </p>
+                        <p className="mt-3">
+                          Provider: <span className="text-[var(--foreground)]">{entry.config.provider}</span>
+                        </p>
+                        <p>
+                          Model: <span className="text-[var(--foreground)]">{entry.config.model || "unset"}</span>
+                        </p>
+                        <p>
+                          Endpoint:{" "}
+                          <span className="text-[var(--foreground)]">{entry.config.endpoint || "default"}</span>
+                        </p>
+                        <p className="mt-3">
+                          Decision:{" "}
+                          <span className="text-[var(--foreground)]">
+                            {record?.decision || "pending"}
+                          </span>
+                        </p>
+                        {record?.signature ? (
+                          <p className="mt-2">
+                            Signature: <span className="font-mono">{record.signature}</span>
+                          </p>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </div>
                 <div className="flex flex-col gap-3 sm:flex-row">
                   <button
                     className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
-                    onClick={handleConsentRequest}
+                    onClick={handleConsentRequestAll}
                     disabled={busy}
                   >
-                    Request Consent
+                    Request Consent (Both)
                   </button>
                   <button
                     className="rounded-full border border-[var(--outline)] px-6 py-3 text-sm font-semibold text-[var(--foreground)]"
@@ -1077,8 +1903,17 @@ export default function Home() {
                   >
                     Refresh
                   </button>
+                  {statusStage === "complete" ? (
+                    <button
+                      className="rounded-full border border-[var(--outline)] px-6 py-3 text-sm font-semibold text-[var(--foreground)]"
+                      onClick={() => setStage("complete")}
+                      disabled={busy}
+                    >
+                      Continue
+                    </button>
+                  ) : null}
                 </div>
-                {consentStatus === "decline" || consentStatus === "abstain" ? (
+                {consentDeclined ? (
                   <p className="rounded-2xl border border-[var(--outline)] bg-white p-4 text-sm text-[var(--ink-soft)]">
                     The agent has not consented yet. You can revise the initialization
                     details or request consent again.
@@ -1097,6 +1932,12 @@ export default function Home() {
                   <p>Mode: {mode}</p>
                   <p>Agent: {profile?.agent?.name || identity.name || "Hexis"}</p>
                 </div>
+                <button
+                  className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
+                  onClick={() => router.push("/chat")}
+                >
+                  Enter Hexis
+                </button>
               </div>
             )}
           </section>

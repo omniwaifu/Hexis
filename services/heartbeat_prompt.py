@@ -21,6 +21,7 @@ def build_heartbeat_decision_prompt(context: dict[str, Any]) -> str:
     active_transformations = context.get("active_transformations", [])
     transformations_ready = context.get("transformations_ready", [])
     energy = context.get("energy", {})
+    allowed_actions = context.get("allowed_actions", [])
     action_costs = context.get("action_costs", {})
     hb_number = context.get("heartbeat_number", 0)
 
@@ -96,6 +97,9 @@ Issues:
 ## Energy
 Available: {energy.get('current', 0)}
 Max: {energy.get('max', 20)}
+
+## Allowed Actions
+{_format_allowed_actions(allowed_actions)}
 
 ## Action Costs
 {_format_costs(action_costs)}
@@ -355,3 +359,12 @@ def _format_costs(costs: dict[str, Any]) -> str:
         else:
             lines.append(f"  - {action}: {int(cost)}")
     return "\n".join(lines)
+
+
+def _format_allowed_actions(actions: Any) -> str:
+    if not isinstance(actions, list):
+        return "  (all actions enabled)"
+    if not actions:
+        return "  (none enabled)"
+    lines = [f"  - {action}" for action in actions if isinstance(action, str)]
+    return "\n".join(lines) if lines else "  (all actions enabled)"

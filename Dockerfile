@@ -3,6 +3,8 @@ FROM postgres:16-bullseye
 # 1. Install Build Dependencies
 RUN apt-get update && apt-get install -y \
     postgresql-server-dev-16 \
+    postgresql-16-pgtap \
+    postgresql-16-plpgsql-check \
     gcc \
     make \
     git \
@@ -48,4 +50,4 @@ RUN rm -rf /tmp/* && \
     rm -rf /var/lib/apt/lists/*
 
 # Run schema/init on first database startup.
-COPY db/schema.sql /docker-entrypoint-initdb.d/init.sql
+COPY db/*.sql /docker-entrypoint-initdb.d/

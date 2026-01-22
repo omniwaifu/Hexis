@@ -153,13 +153,32 @@ async def main():
 asyncio.run(main())
 ```
 
-## UI
+## UI (Next.js)
 
-Launch the UI with:
+The web UI lives in `hexis-ui/` and uses a Next.js BFF with Prisma to call DB functions directly.
+
+Setup:
 
 ```bash
-reflex run
+cd hexis-ui
+bun install
+bunx prisma generate
 ```
+
+Configure environment in `hexis-ui/.env.local`:
+
+- `DATABASE_URL` (Postgres connection string)
+- `OPENAI_API_KEY` (required for consent flow)
+- `OPENAI_MODEL` (optional, defaults to `gpt-4o-mini`)
+- `OPENAI_BASE_URL` (optional, defaults to `https://api.openai.com/v1`)
+
+Run the UI:
+
+```bash
+bun dev
+```
+
+Then open `http://localhost:3477`.
 
 ## Usage Scenarios
 
@@ -371,7 +390,7 @@ If `43815` is already taken (e.g., another local Postgres), set `POSTGRES_PORT` 
 
 ### Resetting The Database Volume
 
-Schema changes are applied on **fresh DB initialization**. If you already have a DB volume and want to re-initialize from `db/schema.sql`, reset the volume:
+Schema changes are applied on **fresh DB initialization**. If you already have a DB volume and want to re-initialize from `db/*.sql`, reset the volume:
 
 ```bash
 docker compose down -v

@@ -8,8 +8,15 @@ from core.cognitive_memory_api import CognitiveMemory, GoalPriority, GoalSource,
 from core.memory_tools import MEMORY_TOOLS
 
 
-def get_tool_definitions() -> list[dict[str, Any]]:
-    return MEMORY_TOOLS
+def get_tool_definitions(allowed: list[str] | None = None) -> list[dict[str, Any]]:
+    if allowed is None:
+        return MEMORY_TOOLS
+    allowed_set = {name for name in allowed if isinstance(name, str)}
+    return [
+        tool
+        for tool in MEMORY_TOOLS
+        if tool.get("function", {}).get("name") in allowed_set
+    ]
 
 
 async def execute_tool(

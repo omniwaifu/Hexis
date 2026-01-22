@@ -39,6 +39,8 @@ def normalize_endpoint(provider: str, endpoint: str | None) -> str | None:
         return endpoint.strip() or None
     if provider == "ollama":
         return "http://localhost:11434/v1"
+    if provider == "grok":
+        return "https://api.x.ai/v1"
     return None
 
 

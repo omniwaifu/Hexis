@@ -48,6 +48,13 @@ class ExternalCallProcessor:
     async def _process_heartbeat_decision_call(self, conn, call_input: dict[str, Any]) -> dict[str, Any]:
         context = call_input.get("context", {})
         heartbeat_id = call_input.get("heartbeat_id")
+        max_tokens_raw = call_input.get("max_tokens")
+        try:
+            max_tokens = int(max_tokens_raw)
+        except (TypeError, ValueError):
+            max_tokens = 2048
+        if max_tokens <= 0:
+            max_tokens = 2048
         user_prompt = build_heartbeat_decision_prompt(context)
         base_prompt = load_heartbeat_prompt().strip()
         system_prompt = (
@@ -68,7 +75,7 @@ class ExternalCallProcessor:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            max_tokens=2048,
+            max_tokens=max_tokens,
             response_format={"type": "json_object"},
             fallback=fallback,
         )

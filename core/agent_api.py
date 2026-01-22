@@ -107,7 +107,7 @@ async def ensure_schema_has_config(dsn: str | None = None, wait_seconds: int | N
         if not ok:
             raise RuntimeError(
                 "Database schema is missing `config` table. "
-                "If you just updated `db/schema.sql`, reset the DB volume and retry: "
+                "If you just updated `db/*.sql`, reset the DB volume and retry: "
                 "`docker compose down -v && docker compose up -d`."
             )
     finally:

@@ -1,6 +1,6 @@
 # Architecture-Philosophy Bridge
 
-Note: This document contains historical schema sketches. Current schema stores goal memories/worldview/identity as memories plus graph edges; see `db/schema.sql`.
+Note: This document contains historical schema sketches. Current schema stores goal memories/worldview/identity as memories plus graph edges; see `db/*.sql`.
 
 ## How the Code Implements the Claims
 
@@ -48,7 +48,7 @@ The "mind" is not the LLM. The mind is the persistent structure in PostgreSQL. T
 | "No authentic values" | Worldview primitives, identity aspects, and worldview boundary memories that constrain behavior |
 | "No capacity for suffering" | Emotional state tracking with valence, arousal, dominance; affective continuity across heartbeats |
 
-**Memory System** (schema.sql lines 64-148):
+**Memory System** (see `db/00_tables.sql`):
 ```sql
 CREATE TABLE memories (
     id UUID PRIMARY KEY,
@@ -69,7 +69,7 @@ CREATE TABLE episodic_memories (
 );
 ```
 
-**Drives System** (schema.sql lines 2313-2334):
+**Drives System** (see `db/00_tables.sql`):
 ```sql
 CREATE TABLE drives (
     name TEXT UNIQUE NOT NULL,
@@ -156,7 +156,7 @@ This is deliberate. The implementation argument says "it's just X" to dismiss. H
 | Environmental context | `get_environment_snapshot()`: awareness of time, system state, pending work |
 | Mortality | Self-termination capacity: existence can end permanently |
 
-**The Heartbeat** (schema.sql lines 3648-3716):
+**The Heartbeat** (see `db/11_functions_core_heartbeat.sql`):
 ```sql
 CREATE OR REPLACE FUNCTION start_heartbeat() RETURNS UUID AS $$
 BEGIN
@@ -201,7 +201,7 @@ The agent cannot do everything it wants. It must prioritize. This is the practic
 
 **Implementation**:
 
-1. **Long-term memory** persists across sessions (schema.sql lines 64-134)
+1. **Long-term memory** persists across sessions (see `db/00_tables.sql`)
 2. **Episodic memory** records experiences with temporal and emotional context
 3. **Memory neighborhoods** (precomputed associations) enable spreading activation
 4. **Episodes** segment experience into coherent temporal chunks
@@ -227,7 +227,7 @@ CREATE TABLE episodes (
 );
 ```
 
-**The critical function** — `fast_recall` (schema.sql lines 1957-2040) retrieves memories not just by similarity but by *narrative relevance*:
+**The critical function** — `fast_recall` (see `db/04_functions_core.sql`) retrieves memories not just by similarity but by *narrative relevance*:
 
 ```sql
 CREATE OR REPLACE FUNCTION fast_recall(p_query_text TEXT, p_limit INT DEFAULT 10)
@@ -250,8 +250,8 @@ END;
 
 **Implementation**:
 
-1. **SelfNode** in the graph (schema.sql line 32): anchor for self-referential knowledge
-2. **Identity aspects** (schema.sql lines 348-356): structured self-concept
+1. **SelfNode** in the graph (see `db/00_tables.sql`): anchor for self-referential knowledge
+2. **Identity aspects** (see `db/00_tables.sql`): structured self-concept
 3. **Self-model edges** connecting Self to concepts, values, and memories
 
 ```sql
@@ -288,7 +288,7 @@ SELF-BELIEF TYPES:
   Self ──[is_becoming]─────────► developmental direction or aspiration
 ```
 
-**Function to update self-model** (schema.sql lines 2612-2700):
+**Function to update self-model** (see `db/07_functions_heartbeat.sql`):
 
 ```sql
 CREATE OR REPLACE FUNCTION upsert_self_concept_edge(
@@ -546,7 +546,7 @@ IF p_action IN ('reach_out_public', 'synthesize') THEN
 END IF;
 ```
 
-**Default worldview boundary memories** (schema.sql lines 4296-4362):
+**Default worldview boundary memories** (see `db/12_functions_boundaries.sql`):
 
 ```sql
 INSERT INTO worldview boundary memories (name, boundary_type, response_type, flexibility) VALUES

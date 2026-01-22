@@ -92,6 +92,25 @@ def _estimate_importance(user_message: str, assistant_message: str) -> float:
     return max(0.15, min(float(importance), 1.0))
 
 
+def _extract_allowed_tools(raw_tools: Any) -> list[str] | None:
+    if raw_tools is None:
+        return None
+    if not isinstance(raw_tools, list):
+        return None
+    names: list[str] = []
+    for item in raw_tools:
+        if isinstance(item, str):
+            name = item.strip()
+            if name:
+                names.append(name)
+        elif isinstance(item, dict):
+            name = item.get("name") or item.get("tool")
+            enabled = item.get("enabled", True)
+            if isinstance(name, str) and name.strip() and enabled is not False:
+                names.append(name.strip())
+    return names
+
+
 async def _remember_conversation(
     mem_client: CognitiveMemory,
     *,
@@ -160,7 +179,8 @@ async def chat_turn(
         messages.extend(history)
         messages.append({"role": "user", "content": enriched_user_message})
 
-        tools = get_tool_definitions()
+        allowed_tools = _extract_allowed_tools(agent_profile.get("tools"))
+        tools = get_tool_definitions(allowed_tools)
 
         assistant_text = ""
         for _ in range(max_tool_iterations + 1):

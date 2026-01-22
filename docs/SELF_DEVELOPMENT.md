@@ -1,6 +1,6 @@
 # Self-Development Capabilities
 
-Note: The source of truth is `db/schema.sql`. This document explains how self-development works with the current architecture.
+Note: The source of truth is `db/*.sql`. This document explains how self-development works with the current architecture.
 
 ## What Develops Automatically (Subconscious)
 
@@ -51,4 +51,3 @@ The conscious layer (heartbeat + MCP tools) is responsible for deliberate choice
 - `maintenance.subconscious_enabled` — Toggle subconscious decider
 - `maintenance.subconscious_interval_seconds` — Decider cadence
 - `llm.subconscious` — Model configuration for subconscious pattern detection
-

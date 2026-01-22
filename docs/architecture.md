@@ -16,7 +16,7 @@ Hexis is a PostgreSQL-native cognitive architecture. The database is the brain, 
 
 ## System Topology
 
-- **PostgreSQL**: Primary storage + cognitive logic (`db/schema.sql`).
+- **PostgreSQL**: Primary storage + cognitive logic (`db/*.sql`).
 - **Embedding service**: HTTP endpoint used by `get_embedding()`.
 - **LLM provider**: External calls triggered by DB functions and executed by the app layer.
 - **Worker**: Periodic scheduler. Runs heartbeat/maintenance and executes external calls. No business logic.
@@ -24,7 +24,7 @@ Hexis is a PostgreSQL-native cognitive architecture. The database is the brain, 
 
 ## Source of Truth
 
-- Schema and behavior live in `db/schema.sql`.
+- Schema and behavior live in `db/*.sql`.
 - Python (or other language) is an adapter that calls DB functions and forwards payloads.
 
 ## Data Model
@@ -139,7 +139,7 @@ Key optimizations:
 
 ```
 hexis/
-├── db/schema.sql
+├── db/*.sql
 ├── core/
 ├── apps/
 ├── tests/

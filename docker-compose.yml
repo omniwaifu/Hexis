@@ -12,7 +12,7 @@ services:
       POSTGRES_HOST_AUTH_METHOD: trust 
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # db/schema.sql is baked into the image (see Dockerfile) to avoid bind-mount issues on macOS external drives.
+      # db/*.sql is baked into the image (see Dockerfile) to avoid bind-mount issues on macOS external drives.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-hexis_memory}"]
       interval: 10s

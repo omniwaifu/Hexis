@@ -4,7 +4,7 @@ Cognitive Memory API
 Thin async client for the Postgres-backed cognitive memory system.
 
 Design:
-- The database owns state and behavior (functions/views in db/schema.sql).
+- The database owns state and behavior (functions/views in db/*.sql).
 - This module is a convenience layer for application integration.
 """
 

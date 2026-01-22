@@ -17,7 +17,7 @@
 
 ```
 hexis/
-├── db/schema.sql           # Single source of truth for database schema
+├── db/*.sql                # Split schema files (tables, functions, views, triggers)
 ├── core/                   # Fundamental interfaces (DB + LLM + messaging)
 │   ├── cognitive_memory_api.py   # Main memory client (remember, recall, hydrate)
 │   ├── agent_api.py              # Agent status and configuration
@@ -53,7 +53,7 @@ hexis/
 
 | File | Purpose |
 |------|---------|
-| `db/schema.sql` | Database schema: tables, functions, triggers, views. Schema is applied on fresh DB init. |
+| `db/*.sql` | Database schema split across tables, functions, triggers, and views. Applied on fresh DB init. |
 | `core/cognitive_memory_api.py` | Primary Python interface - `CognitiveMemory` class with `remember()`, `recall()`, `hydrate()`, `connect()` |
 | `services/worker_service.py` | Stateless workers: `HeartbeatWorker` (conscious loop) + `MaintenanceWorker` (subconscious upkeep) |
 | `apps/hexis_mcp_server.py` | Exposes memory operations as MCP tools for LLM integration |
@@ -114,7 +114,7 @@ hexis mcp                 # Start MCP server
 ## Coding Style & Naming Conventions
 
 - **Python**: Follow Black formatting; prefer type hints and explicit names
-- **Database authority**: Add/modify SQL functions in `db/schema.sql` rather than duplicating logic in Python
+- **Database authority**: Add/modify SQL in `db/*.sql` rather than duplicating logic in Python
 - **Additive schema changes**: Prefer backwards-compatible changes; avoid renames unless necessary
 - **Stateless workers**: Workers can be killed/restarted without losing state; all state lives in Postgres
 
@@ -129,7 +129,7 @@ hexis mcp                 # Start MCP server
 
 - **Commits**: Short, imperative summaries (e.g., "Add MCP server tools", "Gate heartbeat on config")
 - **PRs**: Include rationale, how to run/verify, and any DB reset requirements
-- **Call out changes to**: `db/schema.sql`, `docker-compose.yml`, `README.md`
+- **Call out changes to**: `db/*.sql`, `docker-compose.yml`, `README.md`
 
 ## Configuration & Safety Notes
 

@@ -112,7 +112,7 @@ reset_db() {
         wait_for_db
         
         echo "✅ Database has been reset and reinitialized!"
-        echo "Schema has been automatically loaded from db/schema.sql"
+        echo "Schema has been automatically loaded from db/*.sql"
     else
         echo "Database reset cancelled."
     fi

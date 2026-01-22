@@ -16,11 +16,72 @@ export async function GET() {
     await prisma.$queryRaw<{ configured: boolean | null }[]>`SELECT is_agent_configured() as configured`;
   const llmRows =
     await prisma.$queryRaw<{ llm: unknown }[]>`SELECT get_config('llm.heartbeat') as llm`;
+  const llmSubRows =
+    await prisma.$queryRaw<{ llm: unknown }[]>`SELECT get_config('llm.subconscious') as llm`;
+  const heartbeatIntervalRows =
+    await prisma.$queryRaw<{ value: unknown }[]>`SELECT get_config('heartbeat.heartbeat_interval_minutes') as value`;
+  const heartbeatTokensRows =
+    await prisma.$queryRaw<{ value: unknown }[]>`SELECT get_config('heartbeat.max_decision_tokens') as value`;
+  const heartbeatRegenRows =
+    await prisma.$queryRaw<{ value: unknown }[]>`SELECT get_config('heartbeat.base_regeneration') as value`;
+  const heartbeatMaxEnergyRows =
+    await prisma.$queryRaw<{ value: unknown }[]>`SELECT get_config('heartbeat.max_energy') as value`;
+  const heartbeatAllowedRows =
+    await prisma.$queryRaw<{ value: unknown }[]>`SELECT get_config('heartbeat.allowed_actions') as value`;
+  const heartbeatCostRows =
+    await prisma.$queryRaw<{ costs: unknown }[]>`
+      SELECT jsonb_object_agg(
+        regexp_replace(key, '^heartbeat\\.cost_', ''),
+        value
+      ) as costs
+      FROM config
+      WHERE key LIKE 'heartbeat.cost_%'
+    `;
+  const toolsRows =
+    await prisma.$queryRaw<{ value: unknown }[]>`SELECT get_config('agent.tools') as value`;
   const llmConfig = normalizeJsonValue(llmRows[0]?.llm) as any;
+  const llmSubConfig = normalizeJsonValue(llmSubRows[0]?.llm) as any;
+  const consentRecords = {
+    conscious: await fetchConsentRecord(llmConfig),
+    subconscious: await fetchConsentRecord(llmSubConfig),
+  };
+
+  const status = normalizeJsonValue(statusRows[0]?.status) ?? {};
+  const mode = normalizeJsonValue(modeRows[0]?.mode);
+  const profile = normalizeJsonValue(profileRows[0]?.profile) ?? {};
+  const consentStatus = consentRows[0]?.consent ?? null;
+  const configured = Boolean(configuredRows[0]?.configured);
+  const heartbeatSettings = {
+    interval_minutes: normalizeJsonValue(heartbeatIntervalRows[0]?.value),
+    decision_max_tokens: normalizeJsonValue(heartbeatTokensRows[0]?.value),
+    base_regeneration: normalizeJsonValue(heartbeatRegenRows[0]?.value),
+    max_energy: normalizeJsonValue(heartbeatMaxEnergyRows[0]?.value),
+    allowed_actions: normalizeJsonValue(heartbeatAllowedRows[0]?.value) ?? [],
+    action_costs: normalizeJsonValue(heartbeatCostRows[0]?.costs) ?? {},
+    tools: normalizeJsonValue(toolsRows[0]?.value) ?? [],
+  };
+
+  return Response.json({
+    status,
+    mode,
+    profile,
+    consent_status: consentStatus,
+    configured,
+    llm_heartbeat: llmConfig ?? null,
+    llm_subconscious: llmSubConfig ?? null,
+    consent_records: consentRecords,
+    heartbeat_settings: heartbeatSettings,
+  });
+}
+
+async function fetchConsentRecord(llmConfig: any) {
   const provider = typeof llmConfig?.provider === "string" ? llmConfig.provider : null;
   const model = typeof llmConfig?.model === "string" ? llmConfig.model : null;
   const endpoint = typeof llmConfig?.endpoint === "string" ? llmConfig.endpoint : null;
-  const consentRecordRows = await prisma.$queryRaw<
+  if (!provider && !model && !endpoint) {
+    return null;
+  }
+  const rows = await prisma.$queryRaw<
     {
       decision: string;
       signature: string | null;
@@ -36,20 +97,5 @@ export async function GET() {
       AND (${endpoint}::text IS NULL OR endpoint = ${endpoint}::text)
     ORDER BY decided_at DESC
     LIMIT 1`;
-
-  const status = normalizeJsonValue(statusRows[0]?.status) ?? {};
-  const mode = normalizeJsonValue(modeRows[0]?.mode);
-  const profile = normalizeJsonValue(profileRows[0]?.profile) ?? {};
-  const consentStatus = consentRows[0]?.consent ?? null;
-  const configured = Boolean(configuredRows[0]?.configured);
-  const consentRecord = consentRecordRows[0] ?? null;
-
-  return Response.json({
-    status,
-    mode,
-    profile,
-    consent_status: consentStatus,
-    configured,
-    consent_record: consentRecord,
-  });
+  return rows[0] ?? null;
 }

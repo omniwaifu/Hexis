@@ -50,6 +50,8 @@ postgres_data/
 .coverage
 htmlcov/
 .tox/
+playwright-report/
+test-results/
 
 # Logs
 *.log
