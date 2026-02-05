@@ -24,6 +24,148 @@ OPENAI_COMPATIBLE = {
     "gemini",
 }
 
+# ---------------------------------------------------------------------------
+# Responses API capability detection
+# ---------------------------------------------------------------------------
+
+_HAS_RESPONSES_API: bool = False
+if openai is not None:
+    try:
+        from openai.resources import responses as _responses_mod  # noqa: F401
+        _HAS_RESPONSES_API = True
+    except ImportError:
+        pass
+
+# Per-endpoint cache: normalized URL -> True (supported) / False (unsupported)
+_endpoint_responses_support: dict[str, bool] = {}
+
+
+def _endpoint_cache_key(endpoint: str | None) -> str:
+    return (endpoint or "default").rstrip("/")
+
+
+def _should_try_responses(endpoint: str | None) -> bool:
+    if not _HAS_RESPONSES_API:
+        return False
+    key = _endpoint_cache_key(endpoint)
+    cached = _endpoint_responses_support.get(key)
+    if cached is False:
+        return False
+    return True
+
+
+def _cache_responses_support(endpoint: str | None, supported: bool) -> None:
+    _endpoint_responses_support[_endpoint_cache_key(endpoint)] = supported
+
+
+def _is_responses_unsupported_error(exc: Exception) -> bool:
+    """Return True if the error means the endpoint lacks Responses API support."""
+    if openai is None:
+        return False
+    if isinstance(exc, openai.NotFoundError):
+        return True
+    if isinstance(exc, (openai.BadRequestError, openai.UnprocessableEntityError)):
+        msg = str(exc).lower()
+        if "not found" in msg or "unknown" in msg or "unsupported" in msg:
+            return True
+    if isinstance(exc, openai.APIStatusError) and getattr(exc, "status_code", 0) == 501:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Responses API format converters
+# ---------------------------------------------------------------------------
+
+
+def _tools_to_responses(
+    tools: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Convert Chat Completions tools (nested function key) to Responses API flat format."""
+    if not tools:
+        return []
+    result: list[dict[str, Any]] = []
+    for tool in tools:
+        fn = tool.get("function", {})
+        result.append({
+            "type": "function",
+            "name": fn.get("name", ""),
+            "description": fn.get("description", ""),
+            "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+        })
+    return result
+
+
+def _messages_to_responses_input(
+    messages: list[dict[str, Any]],
+) -> tuple[str | None, list[dict[str, Any]]]:
+    """
+    Convert Chat Completions messages to Responses API (instructions, input_items).
+
+    System messages → instructions parameter.
+    Assistant tool_calls (nested OpenAI format) → function_call items.
+    Tool result messages → function_call_output items.
+    """
+    system_parts: list[str] = []
+    input_items: list[dict[str, Any]] = []
+
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "") or ""
+
+        if role == "system":
+            if content.strip():
+                system_parts.append(content)
+
+        elif role == "user":
+            input_items.append({"role": "user", "content": content})
+
+        elif role == "assistant":
+            if content:
+                input_items.append({"role": "assistant", "content": content})
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function", {})
+                args = fn.get("arguments", "{}")
+                if isinstance(args, dict):
+                    args = json.dumps(args)
+                input_items.append({
+                    "type": "function_call",
+                    "call_id": tc.get("id", ""),
+                    "name": fn.get("name", ""),
+                    "arguments": args,
+                })
+
+        elif role == "tool":
+            input_items.append({
+                "type": "function_call_output",
+                "call_id": msg.get("tool_call_id", ""),
+                "output": content,
+            })
+
+    instructions = "\n\n".join(p for p in system_parts if p.strip()) or None
+    return instructions, input_items
+
+
+def _extract_responses_result(response: Any) -> dict[str, Any]:
+    """Extract {content, tool_calls, raw} from a Responses API response object."""
+    content = getattr(response, "output_text", "") or ""
+    tool_calls: list[dict[str, Any]] = []
+
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) == "function_call":
+            raw_args = getattr(item, "arguments", "{}")
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except Exception:
+                args = {}
+            tool_calls.append({
+                "id": getattr(item, "call_id", None),
+                "name": getattr(item, "name", ""),
+                "arguments": args,
+            })
+
+    return {"content": content, "tool_calls": tool_calls, "raw": response}
+
 
 def normalize_provider(provider: str | None) -> str:
     if not provider:
@@ -114,6 +256,113 @@ def _anthropic_tools(openai_tools: list[dict[str, Any]] | None) -> list[dict[str
     return tools
 
 
+# ---------------------------------------------------------------------------
+# Responses API implementation
+# ---------------------------------------------------------------------------
+
+
+async def _responses_completion(
+    client: Any,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    temperature: float,
+    max_tokens: int,
+    response_format: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Non-streaming completion via the Responses API."""
+    instructions, input_items = _messages_to_responses_input(messages)
+    responses_tools = _tools_to_responses(tools)
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "temperature": temperature,
+        "max_output_tokens": max_tokens,
+    }
+    if instructions:
+        payload["instructions"] = instructions
+    payload["input"] = input_items or ""
+    if responses_tools:
+        payload["tools"] = responses_tools
+        payload["tool_choice"] = "auto"
+    if response_format:
+        fmt_type = response_format.get("type", "text")
+        if fmt_type == "json_object":
+            payload["text"] = {"format": {"type": "json_object"}}
+        elif fmt_type == "json_schema":
+            payload["text"] = {"format": response_format}
+
+    response = await client.responses.create(**payload)
+    return _extract_responses_result(response)
+
+
+async def _responses_stream_completion(
+    client: Any,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    temperature: float,
+    max_tokens: int,
+    on_text_delta: Any | None = None,
+) -> dict[str, Any]:
+    """Streaming completion via the Responses API."""
+    instructions, input_items = _messages_to_responses_input(messages)
+    responses_tools = _tools_to_responses(tools)
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "temperature": temperature,
+        "max_output_tokens": max_tokens,
+    }
+    if instructions:
+        payload["instructions"] = instructions
+    payload["input"] = input_items or ""
+    if responses_tools:
+        payload["tools"] = responses_tools
+        payload["tool_choice"] = "auto"
+
+    content_parts: list[str] = []
+    # Accumulate tool calls: item_id -> {call_id, name, arguments_parts}
+    tc_accum: dict[str, dict[str, Any]] = {}
+
+    async with client.responses.stream(**payload) as stream:
+        async for event in stream:
+            event_type = getattr(event, "type", "")
+
+            if event_type == "response.output_text.delta":
+                text = getattr(event, "delta", "")
+                content_parts.append(text)
+                if on_text_delta:
+                    import asyncio
+                    result = on_text_delta(text)
+                    if asyncio.iscoroutine(result):
+                        await result
+
+            elif event_type == "response.output_item.done":
+                item = getattr(event, "item", None)
+                if item and getattr(item, "type", None) == "function_call":
+                    raw_args = getattr(item, "arguments", "{}")
+                    try:
+                        args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    except Exception:
+                        args = {}
+                    tc_accum[getattr(item, "id", "")] = {
+                        "call_id": getattr(item, "call_id", None),
+                        "name": getattr(item, "name", ""),
+                        "arguments": args,
+                    }
+
+    tool_calls: list[dict[str, Any]] = []
+    for tc in tc_accum.values():
+        tool_calls.append({
+            "id": tc["call_id"],
+            "name": tc["name"],
+            "arguments": tc["arguments"],
+        })
+
+    return {"content": "".join(content_parts), "tool_calls": tool_calls, "raw": None}
+
+
 async def chat_completion(
     *,
     provider: str,
@@ -133,6 +382,21 @@ async def chat_completion(
         if openai is None:
             raise RuntimeError("openai package is required for OpenAI-compatible providers.")
         client = openai.AsyncOpenAI(api_key=api_key, base_url=endpoint)
+
+        # Try Responses API first, fall back to Chat Completions
+        if _should_try_responses(endpoint):
+            try:
+                result = await _responses_completion(
+                    client, model, messages, tools, temperature, max_tokens, response_format,
+                )
+                _cache_responses_support(endpoint, True)
+                return result
+            except Exception as exc:
+                if _is_responses_unsupported_error(exc):
+                    _cache_responses_support(endpoint, False)
+                else:
+                    raise
+
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -205,6 +469,21 @@ async def stream_chat_completion(
         if openai is None:
             raise RuntimeError("openai package is required for OpenAI-compatible providers.")
         client = openai.AsyncOpenAI(api_key=api_key, base_url=endpoint)
+
+        # Try Responses API first, fall back to Chat Completions
+        if _should_try_responses(endpoint):
+            try:
+                result = await _responses_stream_completion(
+                    client, model, messages, tools, temperature, max_tokens, on_text_delta,
+                )
+                _cache_responses_support(endpoint, True)
+                return result
+            except Exception as exc:
+                if _is_responses_unsupported_error(exc):
+                    _cache_responses_support(endpoint, False)
+                else:
+                    raise
+
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
