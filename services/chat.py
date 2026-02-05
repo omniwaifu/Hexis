@@ -7,7 +7,8 @@ from typing import Any, AsyncIterator
 
 from core.agent_api import db_dsn_from_env, get_agent_profile_context
 from core.cognitive_memory_api import CognitiveMemory, MemoryType, format_context_for_prompt
-from core.llm import chat_completion, normalize_llm_config
+from core.agent_loop import AgentEvent, AgentLoop, AgentLoopConfig
+from core.llm import normalize_llm_config
 from core.tools import create_default_registry, ToolContext, ToolExecutionContext, ToolRegistry
 from services.prompt_resources import compose_personhood_prompt
 
@@ -239,48 +240,22 @@ async def chat_turn(
             else:
                 enriched_user_message = user_message
 
-            messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
-            messages.extend(history)
-            messages.append({"role": "user", "content": enriched_user_message})
-
-            tools = await registry.get_specs(ToolContext.CHAT)
-
-            assistant_text = ""
-            for _ in range(max_tool_iterations + 1):
-                response = await chat_completion(
-                    provider=normalized["provider"],
-                    model=normalized["model"],
-                    endpoint=normalized["endpoint"],
-                    api_key=normalized["api_key"],
-                    messages=messages,
-                    tools=tools,
-                    temperature=0.7,
-                    max_tokens=1200,
-                )
-                assistant_text = response.get("content", "") or ""
-                tool_calls = response.get("tool_calls") or []
-
-                messages.append({"role": "assistant", "content": assistant_text})
-                if not tool_calls:
-                    break
-                for call in tool_calls:
-                    exec_ctx = await _build_execution_context(
-                        registry,
-                        call_id=call.get("id", str(uuid.uuid4())),
-                        session_id=session_id,
-                    )
-                    result = await registry.execute(
-                        call.get("name", ""),
-                        call.get("arguments", {}),
-                        exec_ctx,
-                    )
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call.get("id"),
-                            "content": result.to_model_output(),
-                        }
-                    )
+            loop_config = AgentLoopConfig(
+                tool_context=ToolContext.CHAT,
+                system_prompt=system_prompt,
+                llm_config=normalized,
+                registry=registry,
+                pool=pool,
+                energy_budget=None,
+                max_iterations=max_tool_iterations + 1,
+                timeout_seconds=120.0,
+                temperature=0.7,
+                max_tokens=1200,
+                session_id=session_id,
+            )
+            agent = AgentLoop(loop_config)
+            loop_result = await agent.run(enriched_user_message, history=history)
+            assistant_text = loop_result.text
 
             await _remember_conversation(mem_client, user_message=user_message, assistant_message=assistant_text)
 
@@ -307,15 +282,13 @@ async def stream_chat_turn(
     """
     Streaming variant of chat_turn().
 
-    Yields text tokens as they arrive from the LLM. If the LLM invokes
-    tools, the tool loop runs non-streaming and the final text is yielded
-    in one chunk at the end.
+    Yields text chunks as they arrive from the AgentLoop. During tool-use
+    cycles, text is emitted per-iteration (not token-by-token). Token-level
+    streaming will be added in a future phase via stream_chat_completion.
 
     The caller receives the same enriched conversation flow (hydrate +
     tools + memory formation) — just delivered as a stream.
     """
-    from core.llm import stream_text_completion
-
     dsn = dsn or db_dsn_from_env()
     normalized = normalize_llm_config(llm_config)
     history = history or []
@@ -352,108 +325,35 @@ async def stream_chat_turn(
             else:
                 enriched_user_message = user_message
 
-            messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
-            messages.extend(history)
-            messages.append({"role": "user", "content": enriched_user_message})
-
-            tools = await registry.get_specs(ToolContext.CHAT)
-
-            # First call: non-streaming with tools to check if tools are needed
-            response = await chat_completion(
-                provider=normalized["provider"],
-                model=normalized["model"],
-                endpoint=normalized["endpoint"],
-                api_key=normalized["api_key"],
-                messages=messages,
-                tools=tools,
+            loop_config = AgentLoopConfig(
+                tool_context=ToolContext.CHAT,
+                system_prompt=system_prompt,
+                llm_config=normalized,
+                registry=registry,
+                pool=pool,
+                energy_budget=None,
+                max_iterations=max_tool_iterations + 1,
+                timeout_seconds=120.0,
                 temperature=0.7,
                 max_tokens=1200,
+                session_id=session_id,
             )
 
-            tool_calls = response.get("tool_calls") or []
+            agent = AgentLoop(loop_config)
+            collected: list[str] = []
+            async for event in agent.stream(enriched_user_message, history=history):
+                if event.event == AgentEvent.TEXT_DELTA:
+                    text = event.data.get("text", "")
+                    if text:
+                        collected.append(text)
+                        yield text
 
-            if tool_calls:
-                # Tool loop: run non-streaming, then yield final text
-                assistant_text = response.get("content", "") or ""
-                messages.append({"role": "assistant", "content": assistant_text})
-
-                for iteration in range(max_tool_iterations):
-                    for call in tool_calls:
-                        exec_ctx = await _build_execution_context(
-                            registry,
-                            call_id=call.get("id", str(uuid.uuid4())),
-                            session_id=session_id,
-                        )
-                        tool_result = await registry.execute(
-                            call.get("name", ""),
-                            call.get("arguments", {}),
-                            exec_ctx,
-                        )
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": call.get("id"),
-                            "content": tool_result.to_model_output(),
-                        })
-
-                    response = await chat_completion(
-                        provider=normalized["provider"],
-                        model=normalized["model"],
-                        endpoint=normalized["endpoint"],
-                        api_key=normalized["api_key"],
-                        messages=messages,
-                        tools=tools,
-                        temperature=0.7,
-                        max_tokens=1200,
-                    )
-                    assistant_text = response.get("content", "") or ""
-                    tool_calls = response.get("tool_calls") or []
-                    messages.append({"role": "assistant", "content": assistant_text})
-                    if not tool_calls:
-                        break
-
-                # Yield the final text as one chunk
-                if assistant_text:
-                    yield assistant_text
-
-                await _remember_conversation(
-                    mem_client,
-                    user_message=user_message,
-                    assistant_message=assistant_text,
-                )
-            else:
-                # No tools needed — stream the response
-                initial_text = response.get("content", "") or ""
-
-                if initial_text:
-                    # The first non-streaming call already got text — yield it
-                    # and skip streaming
-                    yield initial_text
-                    await _remember_conversation(
-                        mem_client,
-                        user_message=user_message,
-                        assistant_message=initial_text,
-                    )
-                else:
-                    # Stream fresh (no content from first call, no tools)
-                    collected: list[str] = []
-                    async for token in stream_text_completion(
-                        provider=normalized["provider"],
-                        model=normalized["model"],
-                        endpoint=normalized["endpoint"],
-                        api_key=normalized["api_key"],
-                        messages=messages,
-                        temperature=0.7,
-                        max_tokens=1200,
-                    ):
-                        collected.append(token)
-                        yield token
-
-                    full_text = "".join(collected)
-                    await _remember_conversation(
-                        mem_client,
-                        user_message=user_message,
-                        assistant_message=full_text,
-                    )
+            full_text = collected[-1] if collected else ""
+            await _remember_conversation(
+                mem_client,
+                user_message=user_message,
+                assistant_message=full_text,
+            )
     finally:
         if own_pool:
             await pool.close()

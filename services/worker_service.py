@@ -18,6 +18,7 @@ from core.state import (
     should_run_subconscious_decider,
 )
 from services.external_calls import ExternalCallProcessor
+from services.heartbeat_agentic import finalize_heartbeat, run_agentic_heartbeat
 from services.heartbeat_runner import execute_heartbeat_decision
 from services.reconsolidation import run_reconsolidation_step
 from services.subconscious import run_subconscious_decider
@@ -104,6 +105,11 @@ class HeartbeatWorker:
             if isinstance(outbox_messages, list):
                 await self._publish_outbox(outbox_messages)
 
+            # Check if agentic heartbeat is enabled
+            if await self._is_agentic_heartbeat_enabled(conn) and self._tool_registry:
+                await self._run_agentic_heartbeat(conn, payload, heartbeat_id)
+                return
+
             external_calls = payload.get("external_calls")
             if not isinstance(external_calls, list):
                 return
@@ -148,6 +154,90 @@ class HeartbeatWorker:
                             logger.info("Termination executed; stopping workers.")
                             self.stop()
                     return
+
+    async def _is_agentic_heartbeat_enabled(self, conn) -> bool:
+        """Check if the agentic heartbeat loop is enabled via config."""
+        try:
+            val = await conn.fetchval("SELECT get_config('heartbeat.use_agentic_loop')")
+            if val is None:
+                return False
+            if isinstance(val, str):
+                return val.strip().lower() in ("true", "1", "yes", "on")
+            return bool(val)
+        except Exception:
+            return False
+
+    async def _run_agentic_heartbeat(self, conn, payload: dict, heartbeat_id: str | None) -> None:
+        """Run heartbeat using the unified AgentLoop instead of legacy external calls."""
+        if not heartbeat_id:
+            logger.warning("Agentic heartbeat: no heartbeat_id in payload")
+            return
+
+        # Extract context from the first think external call
+        context = self._extract_heartbeat_context(payload)
+
+        try:
+            result = await run_agentic_heartbeat(
+                conn,
+                pool=self.pool,
+                registry=self._tool_registry,
+                heartbeat_id=str(heartbeat_id),
+                context=context,
+            )
+            logger.info(
+                "Agentic heartbeat %s completed: %d tools, %d energy, reason=%s",
+                str(heartbeat_id)[:8],
+                len(result.get("tool_calls_made", [])),
+                result.get("energy_spent", 0),
+                result.get("stopped_reason", "?"),
+            )
+        except Exception as exc:
+            logger.error(f"Agentic heartbeat failed: {exc}")
+            result = {
+                "text": f"Heartbeat failed: {exc}",
+                "tool_calls_made": [],
+                "energy_spent": 0,
+                "stopped_reason": "error",
+            }
+
+        try:
+            fin = await finalize_heartbeat(
+                conn,
+                heartbeat_id=str(heartbeat_id),
+                result=result,
+            )
+            outbox_messages = fin.get("outbox_messages")
+            if isinstance(outbox_messages, list):
+                await self._publish_outbox(outbox_messages)
+        except Exception as exc:
+            logger.error(f"Heartbeat finalization failed: {exc}")
+
+    @staticmethod
+    def _extract_heartbeat_context(payload: dict) -> dict:
+        """Extract heartbeat context from the run_heartbeat() payload.
+
+        The DB function returns external_calls with the heartbeat context
+        embedded in the first think call's input.context field.
+        """
+        external_calls = payload.get("external_calls")
+        if not isinstance(external_calls, list):
+            return payload
+
+        for call in external_calls:
+            if not isinstance(call, dict):
+                continue
+            call_type = str(call.get("call_type") or "")
+            if call_type == "think":
+                call_input = call.get("input") or {}
+                if isinstance(call_input, dict):
+                    context = call_input.get("context")
+                    if isinstance(context, dict):
+                        return context
+                    # If context is not nested, the input itself may be the context
+                    return call_input
+
+        # Fallback: return the whole payload as context
+        return payload
 
     async def run(self) -> None:
         self.running = True

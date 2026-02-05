@@ -176,6 +176,148 @@ async def chat_completion(
     raise ValueError(f"Unsupported provider: {provider}")
 
 
+async def stream_chat_completion(
+    *,
+    provider: str,
+    model: str,
+    endpoint: str | None,
+    api_key: str | None,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    temperature: float = 0.7,
+    max_tokens: int = 1200,
+    on_text_delta: Any | None = None,
+) -> dict[str, Any]:
+    """
+    Streaming chat completion that supports tools.
+
+    Accumulates the full response while optionally calling ``on_text_delta(text)``
+    for each token. Returns the same shape as ``chat_completion()``:
+    ``{content, tool_calls, raw}``.
+
+    ``on_text_delta`` can be a sync or async callable accepting a single str
+    argument. It's called for each text token as it arrives.
+    """
+    provider = normalize_provider(provider)
+    endpoint = normalize_endpoint(provider, endpoint)
+
+    if provider in OPENAI_COMPATIBLE:
+        if openai is None:
+            raise RuntimeError("openai package is required for OpenAI-compatible providers.")
+        client = openai.AsyncOpenAI(api_key=api_key, base_url=endpoint)
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        response = await client.chat.completions.create(**payload)
+
+        content_parts: list[str] = []
+        # Accumulate tool calls: index -> {id, name, arguments_parts}
+        tc_accum: dict[int, dict[str, Any]] = {}
+
+        async for event in response:
+            delta = event.choices[0].delta
+            if delta and delta.content:
+                content_parts.append(delta.content)
+                if on_text_delta:
+                    import asyncio
+                    result = on_text_delta(delta.content)
+                    if asyncio.iscoroutine(result):
+                        await result
+            if delta and delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tc_accum:
+                        tc_accum[idx] = {
+                            "id": getattr(tc_delta, "id", None),
+                            "name": None,
+                            "arguments_parts": [],
+                        }
+                    if tc_delta.id:
+                        tc_accum[idx]["id"] = tc_delta.id
+                    fn = getattr(tc_delta, "function", None)
+                    if fn:
+                        if getattr(fn, "name", None):
+                            tc_accum[idx]["name"] = fn.name
+                        if getattr(fn, "arguments", None):
+                            tc_accum[idx]["arguments_parts"].append(fn.arguments)
+
+        # Build final tool calls
+        tool_calls: list[dict[str, Any]] = []
+        for idx in sorted(tc_accum.keys()):
+            tc = tc_accum[idx]
+            raw_args = "".join(tc["arguments_parts"])
+            try:
+                args = json.loads(raw_args) if raw_args else {}
+            except Exception:
+                args = {}
+            tool_calls.append({"id": tc["id"], "name": tc["name"], "arguments": args})
+
+        return {"content": "".join(content_parts), "tool_calls": tool_calls, "raw": None}
+
+    if provider == "anthropic":
+        if anthropic is None:
+            raise RuntimeError("anthropic package is required for Anthropic provider.")
+        client = anthropic.AsyncAnthropic(api_key=api_key)
+        system_prompt, rest = _extract_system_prompt(messages)
+        anthropic_tools = _anthropic_tools(tools)
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": rest,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if system_prompt:
+            kwargs["system"] = system_prompt
+        if anthropic_tools:
+            kwargs["tools"] = anthropic_tools
+        async with client.messages.stream(**kwargs) as stream:
+            text_parts: list[str] = []
+            tool_calls: list[dict[str, Any]] = []
+            current_tool: dict[str, Any] | None = None
+
+            async for event in stream:
+                if hasattr(event, "type"):
+                    if event.type == "content_block_start":
+                        block = event.content_block
+                        if block.type == "tool_use":
+                            current_tool = {"id": block.id, "name": block.name, "arguments_json": ""}
+                    elif event.type == "content_block_delta":
+                        delta = event.delta
+                        if delta.type == "text_delta":
+                            text_parts.append(delta.text)
+                            if on_text_delta:
+                                import asyncio
+                                result = on_text_delta(delta.text)
+                                if asyncio.iscoroutine(result):
+                                    await result
+                        elif delta.type == "input_json_delta" and current_tool is not None:
+                            current_tool["arguments_json"] += delta.partial_json
+                    elif event.type == "content_block_stop":
+                        if current_tool is not None:
+                            raw_args = current_tool["arguments_json"]
+                            try:
+                                args = json.loads(raw_args) if raw_args else {}
+                            except Exception:
+                                args = {}
+                            tool_calls.append({
+                                "id": current_tool["id"],
+                                "name": current_tool["name"],
+                                "arguments": args,
+                            })
+                            current_tool = None
+
+            return {"content": "".join(text_parts), "tool_calls": tool_calls, "raw": None}
+
+    raise ValueError(f"Unsupported provider: {provider}")
+
+
 async def stream_text_completion(
     *,
     provider: str,

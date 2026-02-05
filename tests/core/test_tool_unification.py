@@ -456,7 +456,7 @@ class TestChatTurnWithRegistry:
         mock_response = {"content": "Hello! How can I help?", "tool_calls": []}
 
         with (
-            patch("services.chat.chat_completion", new_callable=AsyncMock, return_value=mock_response),
+            patch("core.agent_loop.chat_completion", new_callable=AsyncMock, return_value=mock_response),
             patch("services.chat.get_agent_profile_context", new_callable=AsyncMock, return_value={}),
             patch("services.chat.format_context_for_prompt", return_value=""),
             patch("services.chat.CognitiveMemory") as MockMem,
@@ -504,7 +504,7 @@ class TestChatTurnWithRegistry:
             return second_response
 
         with (
-            patch("services.chat.chat_completion", side_effect=mock_chat_completion),
+            patch("core.agent_loop.chat_completion", side_effect=mock_chat_completion),
             patch("services.chat.get_agent_profile_context", new_callable=AsyncMock, return_value={}),
             patch("services.chat.format_context_for_prompt", return_value=""),
             patch("services.chat.CognitiveMemory") as MockMem,
@@ -543,7 +543,7 @@ class TestChatTurnWithRegistry:
             return tool_response
 
         with (
-            patch("services.chat.chat_completion", side_effect=always_tool),
+            patch("core.agent_loop.chat_completion", side_effect=always_tool),
             patch("services.chat.get_agent_profile_context", new_callable=AsyncMock, return_value={}),
             patch("services.chat.format_context_for_prompt", return_value=""),
             patch("services.chat.CognitiveMemory") as MockMem,
@@ -574,7 +574,7 @@ class TestChatTurnWithRegistry:
         mock_response = {"content": "ok", "tool_calls": []}
 
         with (
-            patch("services.chat.chat_completion", new_callable=AsyncMock, return_value=mock_response),
+            patch("core.agent_loop.chat_completion", new_callable=AsyncMock, return_value=mock_response),
             patch("services.chat.get_agent_profile_context", new_callable=AsyncMock, return_value={}),
             patch("services.chat.format_context_for_prompt", return_value=""),
             patch("services.chat.CognitiveMemory") as MockMem,

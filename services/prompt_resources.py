@@ -10,6 +10,7 @@ from typing import Literal
 PROMPT_RESOURCE_PATH = Path(__file__).resolve().parent / "prompts" / "personhood.md"
 CONSENT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "consent.md"
 HEARTBEAT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "heartbeat_system.md"
+HEARTBEAT_AGENTIC_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "heartbeat_agentic.md"
 TERMINATION_CONFIRM_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "termination_confirm.md"
 TERMINATION_REVIEW_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "termination_review.md"
 SUBCONSCIOUS_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "subconscious.md"
@@ -103,6 +104,15 @@ def load_heartbeat_prompt() -> str:
         return HEARTBEAT_PROMPT_PATH.read_text(encoding="utf-8")
     return (
         "Heartbeat system prompt missing. Respond with JSON including reasoning and actions."
+    )
+
+
+def load_heartbeat_agentic_prompt() -> str:
+    if HEARTBEAT_AGENTIC_PROMPT_PATH.exists():
+        return HEARTBEAT_AGENTIC_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        "You are an autonomous agent in a heartbeat cycle. "
+        "Use the tools provided to take actions within your energy budget."
     )
 
 

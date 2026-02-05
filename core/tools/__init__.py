@@ -156,6 +156,10 @@ from .dynamic import (
     CreateToolHandler,
     load_dynamic_tools,
 )
+from .goals import (
+    create_goal_tools,
+    ManageGoalsHandler,
+)
 
 __all__ = [
     # Base classes
@@ -260,4 +264,7 @@ __all__ = [
     "create_dynamic_tools",
     "CreateToolHandler",
     "load_dynamic_tools",
+    # Goal tools
+    "create_goal_tools",
+    "ManageGoalsHandler",
 ]

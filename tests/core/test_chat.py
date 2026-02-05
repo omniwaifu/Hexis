@@ -54,7 +54,7 @@ async def test_chat_turn_basic_flow(monkeypatch, db_pool):
         return {"content": "hello there", "tool_calls": []}
 
     monkeypatch.setattr(chat_mod.CognitiveMemory, "connect", fake_connect)
-    monkeypatch.setattr(chat_mod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr("core.agent_loop.chat_completion", fake_chat_completion)
     async def fake_agent_profile(_dsn):
         return {}
 
@@ -106,7 +106,7 @@ async def test_chat_turn_tool_loop(monkeypatch, db_pool):
         return responses.pop(0)
 
     monkeypatch.setattr(chat_mod.CognitiveMemory, "connect", fake_connect)
-    monkeypatch.setattr(chat_mod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr("core.agent_loop.chat_completion", fake_chat_completion)
     async def fake_agent_profile(_dsn):
         return {}
 
