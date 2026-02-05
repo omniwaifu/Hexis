@@ -47,6 +47,7 @@ Guidelines:
 
 function extractCardData(card: any): string {
   const data = card?.data ?? card;
+  const charName = data.name || "the character";
   const parts: string[] = [];
 
   if (data.name) parts.push(`Name: ${data.name}`);
@@ -54,7 +55,11 @@ function extractCardData(card: any): string {
   if (data.personality) parts.push(`Personality: ${data.personality}`);
   if (data.scenario) parts.push(`Scenario:\n${data.scenario}`);
   if (data.first_mes) parts.push(`First Message (voice sample):\n${data.first_mes}`);
-  if (data.mes_example) parts.push(`Example Messages:\n${data.mes_example}`);
+  if (data.mes_example) {
+    // Cap example messages — they're useful for voice/tone but can be very long
+    const trimmed = data.mes_example.slice(0, 1500);
+    parts.push(`Example Messages:\n${trimmed}`);
+  }
   if (data.system_prompt) parts.push(`System Prompt: ${data.system_prompt}`);
   if (data.creator_notes) parts.push(`Creator Notes: ${data.creator_notes}`);
   if (Array.isArray(data.tags) && data.tags.length > 0) {
@@ -76,7 +81,11 @@ function extractCardData(card: any): string {
     }
   }
 
-  return parts.join("\n\n");
+  // Replace chara_card template variables so the LLM produces clean narrative
+  return parts
+    .join("\n\n")
+    .replace(/\{\{char\}\}/gi, charName)
+    .replace(/\{\{user\}\}/gi, "the user");
 }
 
 export async function POST(request: Request) {
