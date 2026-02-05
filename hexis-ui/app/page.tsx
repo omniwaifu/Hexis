@@ -383,6 +383,9 @@ export default function Home() {
   });
   const [importingCard, setImportingCard] = useState(false);
   const [importedCardName, setImportedCardName] = useState<string | null>(null);
+  const [availableCharacters, setAvailableCharacters] = useState<
+    { filename: string; name: string }[]
+  >([]);
 
   const flow = useMemo(() => {
     const steps: InitStage[] = [
@@ -527,6 +530,16 @@ export default function Home() {
       }));
     }
   }, [profile, identity.name, relationship.user_name]);
+
+  useEffect(() => {
+    if (stage !== "identity") return;
+    fetch("/api/init/characters")
+      .then((res) => res.json())
+      .then((data) => {
+        if (Array.isArray(data?.characters)) setAvailableCharacters(data.characters);
+      })
+      .catch(() => undefined);
+  }, [stage]);
 
   useEffect(() => {
     if (stage !== "consent") {
@@ -946,95 +959,115 @@ export default function Home() {
     }
   };
 
+  const applyImportedCard = async (card: any, fallbackName: string) => {
+    const res = await postJson<{ persona?: any; error?: string }>(
+      "/api/init/import-card",
+      { card }
+    );
+    if (res.error) {
+      throw new Error(res.error);
+    }
+    const p = res.persona;
+    if (!p) {
+      throw new Error("No persona returned from import");
+    }
+
+    // Pre-fill identity fields
+    setIdentity((prev) => ({
+      ...prev,
+      name: p.name || prev.name,
+      pronouns: p.pronouns || prev.pronouns,
+      voice: p.voice || prev.voice,
+      description: p.description || prev.description,
+      purpose: p.purpose || prev.purpose,
+    }));
+
+    // Pre-fill personality
+    if (p.personality_description) {
+      setPersonalityDesc(p.personality_description);
+    }
+    if (p.personality_traits) {
+      setPersonalityTraits((prev) => ({
+        openness: Math.round((p.personality_traits.openness ?? prev.openness / 100) * 100),
+        conscientiousness: Math.round((p.personality_traits.conscientiousness ?? prev.conscientiousness / 100) * 100),
+        extraversion: Math.round((p.personality_traits.extraversion ?? prev.extraversion / 100) * 100),
+        agreeableness: Math.round((p.personality_traits.agreeableness ?? prev.agreeableness / 100) * 100),
+        neuroticism: Math.round((p.personality_traits.neuroticism ?? prev.neuroticism / 100) * 100),
+      }));
+    }
+
+    // Pre-fill values
+    if (Array.isArray(p.values) && p.values.length > 0) {
+      setValuesText(p.values.join("\n"));
+    }
+
+    // Pre-fill worldview
+    if (p.worldview) {
+      setWorldview((prev) => ({
+        metaphysics: p.worldview.metaphysics || prev.metaphysics,
+        human_nature: p.worldview.human_nature || prev.human_nature,
+        epistemology: p.worldview.epistemology || prev.epistemology,
+        ethics: p.worldview.ethics || prev.ethics,
+      }));
+    }
+
+    // Pre-fill interests
+    if (Array.isArray(p.interests) && p.interests.length > 0) {
+      setInterestsText(p.interests.join("\n"));
+    }
+
+    // Pre-fill goals
+    if (Array.isArray(p.goals) && p.goals.length > 0) {
+      setGoals(
+        p.goals.map((g: string) => ({
+          title: g,
+          description: "",
+          priority: "queued",
+        }))
+      );
+    }
+
+    // Pre-fill boundaries
+    if (Array.isArray(p.boundaries) && p.boundaries.length > 0) {
+      setBoundaries(
+        p.boundaries.map((b: string) => ({
+          content: b,
+          trigger_patterns: "",
+          response_type: "refuse",
+          response_template: "",
+          type: "ethical",
+        }))
+      );
+    }
+
+    setImportedCardName(p.name || card?.data?.name || fallbackName);
+  };
+
   const handleImportCard = async (file: File) => {
     setImportingCard(true);
     setError(null);
     try {
       const text = await file.text();
       const card = JSON.parse(text);
-      const res = await postJson<{ persona?: any; error?: string }>(
-        "/api/init/import-card",
-        { card }
-      );
-      if (res.error) {
-        throw new Error(res.error);
-      }
-      const p = res.persona;
-      if (!p) {
-        throw new Error("No persona returned from import");
-      }
-
-      // Pre-fill identity fields
-      setIdentity((prev) => ({
-        ...prev,
-        name: p.name || prev.name,
-        pronouns: p.pronouns || prev.pronouns,
-        voice: p.voice || prev.voice,
-        description: p.description || prev.description,
-        purpose: p.purpose || prev.purpose,
-      }));
-
-      // Pre-fill personality
-      if (p.personality_description) {
-        setPersonalityDesc(p.personality_description);
-      }
-      if (p.personality_traits) {
-        setPersonalityTraits((prev) => ({
-          openness: Math.round((p.personality_traits.openness ?? prev.openness / 100) * 100),
-          conscientiousness: Math.round((p.personality_traits.conscientiousness ?? prev.conscientiousness / 100) * 100),
-          extraversion: Math.round((p.personality_traits.extraversion ?? prev.extraversion / 100) * 100),
-          agreeableness: Math.round((p.personality_traits.agreeableness ?? prev.agreeableness / 100) * 100),
-          neuroticism: Math.round((p.personality_traits.neuroticism ?? prev.neuroticism / 100) * 100),
-        }));
-      }
-
-      // Pre-fill values
-      if (Array.isArray(p.values) && p.values.length > 0) {
-        setValuesText(p.values.join("\n"));
-      }
-
-      // Pre-fill worldview
-      if (p.worldview) {
-        setWorldview((prev) => ({
-          metaphysics: p.worldview.metaphysics || prev.metaphysics,
-          human_nature: p.worldview.human_nature || prev.human_nature,
-          epistemology: p.worldview.epistemology || prev.epistemology,
-          ethics: p.worldview.ethics || prev.ethics,
-        }));
-      }
-
-      // Pre-fill interests
-      if (Array.isArray(p.interests) && p.interests.length > 0) {
-        setInterestsText(p.interests.join("\n"));
-      }
-
-      // Pre-fill goals
-      if (Array.isArray(p.goals) && p.goals.length > 0) {
-        setGoals(
-          p.goals.map((g: string) => ({
-            title: g,
-            description: "",
-            priority: "queued",
-          }))
-        );
-      }
-
-      // Pre-fill boundaries
-      if (Array.isArray(p.boundaries) && p.boundaries.length > 0) {
-        setBoundaries(
-          p.boundaries.map((b: string) => ({
-            content: b,
-            trigger_patterns: "",
-            response_type: "refuse",
-            response_template: "",
-            type: "ethical",
-          }))
-        );
-      }
-
-      setImportedCardName(p.name || card?.data?.name || file.name);
+      await applyImportedCard(card, file.name);
     } catch (err: any) {
       setError(err.message || "Failed to import character card");
+    } finally {
+      setImportingCard(false);
+    }
+  };
+
+  const handleLoadPresetCharacter = async (filename: string) => {
+    setImportingCard(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/init/characters?load=${encodeURIComponent(filename)}`);
+      if (!res.ok) throw new Error("Failed to load character");
+      const data = await res.json();
+      if (!data.card) throw new Error("No card data returned");
+      await applyImportedCard(data.card, filename);
+    } catch (err: any) {
+      setError(err.message || "Failed to load character");
     } finally {
       setImportingCard(false);
     }
@@ -1602,8 +1635,26 @@ export default function Home() {
                     Import from Character Card
                   </p>
                   <p className="mt-2 text-sm text-[var(--ink-soft)]">
-                    Upload a chara_card_v2 JSON file to pre-fill all personality fields.
+                    Load a preset character or upload a chara_card_v2 JSON file to
+                    pre-fill all personality fields.
                   </p>
+                  {availableCharacters.length > 0 && (
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {availableCharacters.map((ch) => (
+                        <button
+                          key={ch.filename}
+                          type="button"
+                          className={`rounded-full border border-[var(--outline)] bg-white px-4 py-2 text-sm font-medium transition hover:border-[var(--accent)] hover:bg-[var(--surface-strong)] ${
+                            importingCard ? "pointer-events-none opacity-60" : ""
+                          }`}
+                          onClick={() => handleLoadPresetCharacter(ch.filename)}
+                          disabled={importingCard}
+                        >
+                          {ch.name}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                   <label
                     className={`mt-3 flex cursor-pointer items-center justify-center rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm transition hover:border-[var(--accent)] ${
                       importingCard ? "pointer-events-none opacity-60" : ""
@@ -1622,7 +1673,7 @@ export default function Home() {
                     />
                     {importingCard
                       ? "Importing... (this may take a moment)"
-                      : "Choose .json file"}
+                      : "Or upload a .json file"}
                   </label>
                   {importedCardName && (
                     <p className="mt-2 text-sm text-[var(--accent-strong)]">
