@@ -96,7 +96,7 @@ This repo provides:
 - Configurable tools system (web search, filesystem, shell, MCP servers)
 - Multi-provider LLM support (OpenAI, Anthropic, Grok, Gemini, Ollama, OpenAI-compatible)
 - Messaging channels (Discord, Telegram, Slack, Signal, WhatsApp, iMessage, Matrix)
-- Character card import (chara_card_v2 format) with LLM-powered persona summarization
+- 11 preset character cards (chara_card_v2 format) with portraits — or bring your own
 
 ## Quickstart
 
@@ -189,24 +189,26 @@ Then open `http://localhost:3477`.
 
 ### Init Wizard
 
-The web UI includes a multi-step initialization wizard that walks through:
+Both the web UI and CLI share a 3-tier initialization flow:
 
-1. **Models** — Configure LLM provider (OpenAI, Anthropic, Grok, Gemini, Ollama, or any OpenAI-compatible endpoint)
-2. **Mode** — Choose persona or raw mode
-3. **Heartbeat** — Configure autonomous loop settings, energy budget, tools
-4. **Identity** — Name, pronouns, voice, description (with character card import — see below)
-5. **Personality** — Personality description + Big Five trait sliders
-6. **Values, Worldview, Boundaries, Interests, Goals** — Each stage has a Skip button for quick setup
-7. **Relationship** — Define the user-agent relationship
-8. **Consent** — Agent reviews and signs consent
+```
+[LLM Config] → [Choose Your Path] → [Express | Character | Custom] → [Consent] → [Done]
+```
 
-### Character Card Import
+1. **Models** — Configure LLM provider and model for the conscious and subconscious layers (OpenAI, Anthropic, Grok, Gemini, Ollama, or any OpenAI-compatible endpoint)
+2. **Choose Your Path**:
+   - **Express** — Sensible defaults. Just enter your name and go.
+   - **Character** — Pick a personality from the preset gallery (11 characters with portraits, each with a complete identity, voice, and values). No LLM extraction needed — character cards have pre-encoded profiles.
+   - **Custom** — Full control over identity, personality (Big Five sliders), values, worldview, boundaries, interests, goals, and relationship. Every field has a sensible default.
+3. **Consent** — The agent reviews the consent prompt and decides whether to begin.
 
-On the identity stage, you can import a **chara_card_v2** format JSON file (the standard used by Chub.ai, JanitorAI, SillyTavern, etc.) to pre-fill all personality fields. The card is summarized by the configured LLM into a structured narrative that becomes the agent's foundational self-knowledge.
+### Character Presets
 
-Preset characters are available from `services/characters/` and appear as buttons on the identity stage. Drop any `.json` character card into that directory to make it available as a preset.
+Preset characters live in `services/characters/` as **chara_card_v2** JSON files with matching `.jpg` portraits (300x300). Each card includes a pre-encoded `extensions.hexis` block with Big Five traits, voice, values, worldview, and goals — applied directly via the `init_from_character_card()` DB function without needing an LLM call.
 
-The imported narrative is stored as a high-stability worldview memory (importance: 0.95, stability: 0.95) that the agent can change only through deliberate transformation — sustained focused effort, not casual drift.
+Available presets: Hexis, JARVIS, TARS, Samantha, GLaDOS, Cortana, Data, Ava, Joi, David, HK-47.
+
+Drop any `.json` character card (with optional matching `.jpg`) into `services/characters/` to add your own preset.
 
 ## Usage Scenarios
 

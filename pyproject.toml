@@ -22,12 +22,14 @@ dependencies = [
   "pgvector>=0.2.0",
   "reflex==0.8.24.post1",
   "mcp",
+  "rich>=13.0.0",
 ]
 
 [project.scripts]
 hexis = "apps.hexis_cli:main"
 hexis-worker = "apps.worker:main"
 hexis-mcp = "apps.hexis_mcp_server:main"
+hexis-web = "apps.hexis_web:main"
 hexis-channels = "services.channel_worker:main"
 
 [project.optional-dependencies]

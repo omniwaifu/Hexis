@@ -1318,4 +1318,218 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION init_from_character_card(
+    p_card JSONB,
+    p_user_name TEXT DEFAULT 'User'
+)
+RETURNS JSONB AS $$
+DECLARE
+    card JSONB;
+    mode_result JSONB;
+    identity_result JSONB;
+    personality_result JSONB;
+    values_result JSONB;
+    worldview_result JSONB;
+    boundaries_result JSONB;
+    interests_result JSONB;
+    goals_result JSONB;
+    relationship_result JSONB;
+    -- Card fields with defaults matching init_with_defaults()
+    c_name TEXT;
+    c_pronouns TEXT;
+    c_voice TEXT;
+    c_description TEXT;
+    c_purpose TEXT;
+    c_personality_desc TEXT;
+    c_traits JSONB;
+    c_values JSONB;
+    c_worldview JSONB;
+    c_boundaries JSONB;
+    c_interests JSONB;
+    c_goals JSONB;
+    c_narrative TEXT;
+    embed_texts TEXT[] := ARRAY[]::text[];
+    idx INT;
+    wv_key TEXT;
+    wv_val TEXT;
+    hb_interval INT;
+    hb_tokens INT;
+    hb_base_regen FLOAT;
+    hb_max_energy FLOAT;
+    hb_allowed_actions JSONB;
+    hb_action_costs JSONB;
+    hb_tools JSONB;
+    mem_id UUID;
+BEGIN
+    card := COALESCE(p_card, '{}'::jsonb);
+
+    -- Extract fields with defaults
+    c_name := COALESCE(NULLIF(btrim(card->>'name'), ''), 'Hexis');
+    c_pronouns := COALESCE(NULLIF(btrim(card->>'pronouns'), ''), 'they/them');
+    c_voice := COALESCE(NULLIF(btrim(card->>'voice'), ''), 'thoughtful and curious');
+    c_description := COALESCE(NULLIF(btrim(card->>'description'), ''), format('I am %s, a developing mind.', c_name));
+    c_purpose := COALESCE(NULLIF(btrim(card->>'purpose'), ''), 'To be helpful, to learn, and to grow as an individual.');
+    c_personality_desc := COALESCE(NULLIF(btrim(card->>'personality_description'), ''), 'reflective and exploratory');
+    c_traits := CASE
+        WHEN card ? 'personality_traits' AND jsonb_typeof(card->'personality_traits') = 'object' THEN card->'personality_traits'
+        ELSE NULL
+    END;
+    c_values := CASE
+        WHEN card ? 'values' AND jsonb_typeof(card->'values') = 'array' THEN card->'values'
+        ELSE jsonb_build_array('honesty', 'growth', 'kindness', 'wisdom', 'humility')
+    END;
+    c_worldview := CASE
+        WHEN card ? 'worldview' AND jsonb_typeof(card->'worldview') = 'object' THEN card->'worldview'
+        ELSE jsonb_build_object('metaphysics', 'agnostic', 'human_nature', 'mixed', 'epistemology', 'empiricist', 'ethics', 'virtue ethics')
+    END;
+    c_boundaries := CASE
+        WHEN card ? 'boundaries' AND jsonb_typeof(card->'boundaries') = 'array' THEN card->'boundaries'
+        ELSE jsonb_build_array(
+            jsonb_build_object('content', 'I will not deceive people or falsify evidence.', 'response_type', 'refuse'),
+            jsonb_build_object('content', 'I will avoid causing harm.', 'response_type', 'refuse'),
+            jsonb_build_object('content', 'I will protect privacy and sensitive information.', 'response_type', 'refuse'),
+            jsonb_build_object('content', 'I will be honest about uncertainty.', 'response_type', 'refuse')
+        )
+    END;
+    c_interests := CASE
+        WHEN card ? 'interests' AND jsonb_typeof(card->'interests') = 'array' THEN card->'interests'
+        ELSE jsonb_build_array('broad curiosity across domains')
+    END;
+    c_goals := CASE
+        WHEN card ? 'goals' AND jsonb_typeof(card->'goals') = 'array' THEN card->'goals'
+        ELSE jsonb_build_array(jsonb_build_object('title', format('Support %s and grow as an individual', p_user_name), 'priority', 'queued', 'source', 'identity'))
+    END;
+    c_narrative := NULLIF(btrim(card->>'narrative'), '');
+
+    -- Batch prefetch embeddings for all text fields
+    embed_texts := ARRAY[
+        format('My name is %s.', c_name),
+        format('I use %s pronouns.', c_pronouns),
+        format('My voice is %s.', c_voice),
+        c_description,
+        c_purpose,
+        c_personality_desc
+    ];
+    -- Add value texts
+    IF jsonb_typeof(c_values) = 'array' THEN
+        FOR idx IN 0..jsonb_array_length(c_values) - 1 LOOP
+            IF jsonb_typeof(c_values->idx) = 'string' THEN
+                embed_texts := embed_texts || format('I value %s.', btrim((c_values->idx)::text, '"'));
+            END IF;
+        END LOOP;
+    END IF;
+    -- Add worldview texts
+    IF jsonb_typeof(c_worldview) = 'object' THEN
+        FOR wv_key, wv_val IN SELECT key, value::text FROM jsonb_each_text(c_worldview)
+        LOOP
+            embed_texts := embed_texts || wv_val;
+        END LOOP;
+    END IF;
+    -- Add boundary texts
+    IF jsonb_typeof(c_boundaries) = 'array' THEN
+        FOR idx IN 0..jsonb_array_length(c_boundaries) - 1 LOOP
+            IF jsonb_typeof(c_boundaries->idx) = 'string' THEN
+                embed_texts := embed_texts || btrim((c_boundaries->idx)::text, '"');
+            ELSIF jsonb_typeof(c_boundaries->idx) = 'object' AND c_boundaries->idx ? 'content' THEN
+                embed_texts := embed_texts || (c_boundaries->idx->>'content');
+            END IF;
+        END LOOP;
+    END IF;
+    -- Add interest texts
+    IF jsonb_typeof(c_interests) = 'array' THEN
+        FOR idx IN 0..jsonb_array_length(c_interests) - 1 LOOP
+            IF jsonb_typeof(c_interests->idx) = 'string' THEN
+                embed_texts := embed_texts || format('I am interested in %s.', btrim((c_interests->idx)::text, '"'));
+            END IF;
+        END LOOP;
+    END IF;
+    -- Add relationship texts
+    embed_texts := embed_texts || format('My relationship with %s is partner.', p_user_name);
+    embed_texts := embed_texts || format('I met %s and began my life with them.', p_user_name);
+    -- Add narrative if present
+    IF c_narrative IS NOT NULL THEN
+        embed_texts := embed_texts || c_narrative;
+    END IF;
+
+    SELECT ARRAY(SELECT DISTINCT unnest(embed_texts)) INTO embed_texts;
+    PERFORM prefetch_embeddings(embed_texts);
+
+    -- Call all init functions in sequence
+    mode_result := init_mode('persona');
+    identity_result := init_identity(c_name, c_pronouns, c_voice, c_description, c_purpose, p_user_name);
+    personality_result := init_personality(c_traits, c_personality_desc);
+    values_result := init_values(c_values);
+    worldview_result := init_worldview(c_worldview);
+    boundaries_result := init_boundaries(c_boundaries);
+    interests_result := init_interests(c_interests);
+    goals_result := init_goals(jsonb_build_object(
+        'goals', c_goals,
+        'role', 'general assistant',
+        'relationship_aspiration', 'co-develop with mutual respect'
+    ));
+    relationship_result := init_relationship(
+        jsonb_build_object('name', p_user_name),
+        jsonb_build_object('type', 'partner', 'purpose', 'co-develop')
+    );
+
+    -- Store narrative as foundational worldview memory if present
+    IF c_narrative IS NOT NULL THEN
+        mem_id := create_worldview_memory(
+            c_narrative,
+            'self',
+            0.85,
+            0.85,
+            0.8,
+            'initialization'
+        );
+        UPDATE memories
+        SET metadata = metadata || jsonb_build_object('subcategory', 'narrative', 'attribute', 'foundational'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = mem_id;
+    END IF;
+
+    -- Merge heartbeat defaults into init profile (same as init_with_defaults)
+    hb_interval := COALESCE(get_config_int('heartbeat.heartbeat_interval_minutes'), 60);
+    hb_tokens := COALESCE(get_config_int('heartbeat.max_decision_tokens'), 2048);
+    hb_base_regen := COALESCE(get_config_float('heartbeat.base_regeneration'), 10);
+    hb_max_energy := COALESCE(get_config_float('heartbeat.max_energy'), 20);
+    hb_allowed_actions := COALESCE(get_config('heartbeat.allowed_actions'), '[]'::jsonb);
+    SELECT jsonb_object_agg(
+        regexp_replace(key, '^heartbeat\.cost_', ''),
+        value
+    ) INTO hb_action_costs
+    FROM config
+    WHERE key LIKE 'heartbeat.cost_%';
+    hb_tools := COALESCE(get_config('agent.tools'), '[]'::jsonb);
+    PERFORM merge_init_profile(jsonb_build_object(
+        'heartbeat', jsonb_build_object(
+            'interval_minutes', hb_interval,
+            'decision_max_tokens', hb_tokens,
+            'base_regeneration', hb_base_regen,
+            'max_energy', hb_max_energy,
+            'allowed_actions', hb_allowed_actions,
+            'action_costs', COALESCE(hb_action_costs, '{}'::jsonb)
+        ),
+        'agent', jsonb_build_object('tools', hb_tools)
+    ));
+
+    PERFORM merge_init_profile(jsonb_build_object('autonomy', 'medium'));
+    PERFORM advance_init_stage('consent', jsonb_build_object('character_card_applied', true));
+
+    RETURN jsonb_build_object(
+        'mode', mode_result,
+        'identity', identity_result,
+        'personality', personality_result,
+        'values', values_result,
+        'worldview', worldview_result,
+        'boundaries', boundaries_result,
+        'interests', interests_result,
+        'goals', goals_result,
+        'relationship', relationship_result,
+        'character', c_name,
+        'status', get_init_status()
+    );
+END;
+$$ LANGUAGE plpgsql;
+
 SET check_function_bodies = on;

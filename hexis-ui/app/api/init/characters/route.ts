@@ -34,10 +34,28 @@ export async function GET(request: Request) {
           try {
             const content = await readFile(path.join(CHARACTERS_DIR, filename), "utf-8");
             const card = JSON.parse(content);
-            const name = card?.data?.name ?? card?.name ?? filename.replace(/\.json$/, "");
-            return { filename, name };
+            const hexisExt = card?.data?.extensions?.hexis ?? {};
+            const name = hexisExt.name ?? card?.data?.name ?? filename.replace(/\.json$/, "");
+            const description =
+              hexisExt.description ?? (card?.data?.description ?? "").slice(0, 120);
+            const voice = hexisExt.voice ?? "";
+            const values: string[] = Array.isArray(hexisExt.values)
+              ? hexisExt.values.slice(0, 3)
+              : [];
+            const personality = hexisExt.personality_description ?? "";
+            const stem = filename.replace(/\.json$/, "");
+            const hasImage = files.includes(`${stem}.jpg`);
+            return { filename, name, description, voice, values, personality, image: hasImage ? stem : null };
           } catch {
-            return { filename, name: filename.replace(/\.json$/, "") };
+            return {
+              filename,
+              name: filename.replace(/\.json$/, ""),
+              description: "",
+              voice: "",
+              values: [] as string[],
+              personality: "",
+              image: null as string | null,
+            };
           }
         })
     );

@@ -147,6 +147,34 @@ services:
       - private
       - public
 
+  web:
+    build:
+      context: .
+      dockerfile: ops/Dockerfile.worker
+    container_name: hexis_web
+    profiles:
+      - active
+    command: ["hexis-web", "--host", "0.0.0.0", "--port", "3478"]
+    depends_on:
+      db:
+        condition: service_healthy
+      embeddings:
+        condition: service_healthy
+    ports:
+      - "${HEXIS_BIND_ADDRESS:-127.0.0.1}:${HEXIS_WEB_PORT:-3478}:3478"
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-hexis_memory}
+      POSTGRES_USER: ${POSTGRES_USER:-hexis_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hexis_password}
+      EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
+      HEXIS_CORS_ORIGINS: ${HEXIS_CORS_ORIGINS:-http://localhost:3477,http://localhost:3000}
+    networks:
+      - private
+      - public
+
   channel_worker:
     build:
       context: .

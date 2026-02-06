@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Fraunces, Sora } from "next/font/google";
 import "./globals.css";
+import { Shell } from "./components/nav/shell";
 
 const displayFont = Fraunces({
   subsets: ["latin"],
@@ -15,8 +16,8 @@ const bodyFont = Sora({
 });
 
 export const metadata: Metadata = {
-  title: "Hexis Initialization",
-  description: "Bring a new mind into being.",
+  title: "Hexis",
+  description: "Persistent identity for AI.",
 };
 
 export default function RootLayout({
@@ -27,7 +28,7 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={`${displayFont.variable} ${bodyFont.variable} antialiased`}>
-        {children}
+        <Shell>{children}</Shell>
       </body>
     </html>
   );

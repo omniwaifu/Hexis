@@ -1,19 +1,49 @@
+"""Hexis init wizard — 3-tier flow: Express, Character, Custom.
+
+Flow: [LLM Config] → [Choose Path] → [Express | Character | Custom] → [Consent] → [Done]
+"""
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from getpass import getpass
+from typing import Any
 
 from dotenv import load_dotenv
 
 from core import agent_api
+from core.init_api import get_card_summary, load_character_cards
+from core.llm import normalize_llm_config
+
+from apps.cli_theme import console, err_console, heading, make_panel, make_table
 
 
-def _print_err(msg: str) -> None:
-    sys.stderr.write(msg + "\n")
+# ---------------------------------------------------------------------------
+# Step progress
+# ---------------------------------------------------------------------------
 
+_STAGES = ["Models", "Path", "Setup", "Consent"]
+
+
+def _step_bar(current: int) -> str:
+    """Render a step progress indicator: Models > Path > [Setup] > Consent"""
+    parts: list[str] = []
+    for i, label in enumerate(_STAGES):
+        if i < current:
+            parts.append(f"[ok]{label}[/ok]")
+        elif i == current:
+            parts.append(f"[accent][{label}][/accent]")
+        else:
+            parts.append(f"[muted]{label}[/muted]")
+    return " [muted]>[/muted] ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Prompt helpers (rich-enhanced)
+# ---------------------------------------------------------------------------
 
 def _prompt(
     label: str,
@@ -24,13 +54,17 @@ def _prompt(
 ) -> str:
     while True:
         suffix = f" [{default}]" if default is not None and default != "" else ""
-        prompt = f"{label}{suffix}: "
-        raw = getpass(prompt) if secret else input(prompt)
+        prompt = f"[accent]{label}[/accent]{suffix}: "
+        if secret:
+            console.print(prompt, end="")
+            raw = getpass("")
+        else:
+            raw = console.input(prompt)
         value = raw.strip()
         if not value and default is not None:
             value = str(default)
         if required and not value:
-            _print_err("Value required.")
+            err_console.print("[fail]Value required.[/fail]")
             continue
         return value
 
@@ -41,10 +75,10 @@ def _prompt_int(label: str, *, default: int, min_value: int | None = None) -> in
         try:
             value = int(raw)
         except ValueError:
-            _print_err("Enter an integer.")
+            err_console.print("[fail]Enter an integer.[/fail]")
             continue
         if min_value is not None and value < min_value:
-            _print_err(f"Must be >= {min_value}.")
+            err_console.print(f"[fail]Must be >= {min_value}.[/fail]")
             continue
         return value
 
@@ -55,10 +89,10 @@ def _prompt_float(label: str, *, default: float, min_value: float | None = None)
         try:
             value = float(raw)
         except ValueError:
-            _print_err("Enter a number.")
+            err_console.print("[fail]Enter a number.[/fail]")
             continue
         if min_value is not None and value < min_value:
-            _print_err(f"Must be >= {min_value}.")
+            err_console.print(f"[fail]Must be >= {min_value}.[/fail]")
             continue
         return value
 
@@ -71,194 +105,457 @@ def _prompt_yes_no(label: str, *, default: bool) -> bool:
             return True
         if raw in {"n", "no"}:
             return False
-        _print_err("Enter y/n.")
+        err_console.print("[fail]Enter y/n.[/fail]")
 
 
-def _prompt_list(label: str, *, required: bool = False) -> list[str]:
-    print(f"{label} (one per line; blank to finish):")
-    items: list[str] = []
+def _prompt_choice(label: str, options: list[str], *, default: int = 1) -> int:
+    """Prompt user to pick from a numbered list. Returns 1-based index."""
+    console.print(f"\n[accent]{label}[/accent]\n")
+    for i, option in enumerate(options, 1):
+        marker = "[accent]\u25b8[/accent]" if i == default else " "
+        console.print(f"  {marker} [bold]{i:>2}.[/bold] {option}")
+    console.print()
     while True:
-        raw = input("> ").strip()
-        if not raw:
-            if required and not items:
-                _print_err("At least one item required.")
-                continue
-            return items
-        items.append(raw)
+        raw = _prompt("Choice", default=str(default))
+        try:
+            choice = int(raw)
+        except ValueError:
+            err_console.print(f"[fail]Enter 1-{len(options)}.[/fail]")
+            continue
+        if 1 <= choice <= len(options):
+            return choice
+        err_console.print(f"[fail]Enter 1-{len(options)}.[/fail]")
 
 
-async def _run_init(dsn: str, *, wait_seconds: int) -> int:
-    await agent_api.ensure_schema_has_config(dsn, wait_seconds=wait_seconds)
-    defaults = await agent_api.get_init_defaults(dsn, wait_seconds=wait_seconds)
-    default_interval = int(defaults.get("heartbeat_interval_minutes", 60))
-    default_max_energy = float(defaults.get("max_energy", 20))
-    default_regen = float(defaults.get("base_regeneration", 10))
-    default_max_active_goals = int(defaults.get("max_active_goals", 3))
-    default_maint_interval = int(defaults.get("maintenance_interval_seconds", 60))
-    default_subcon_interval = int(defaults.get("subconscious_interval_seconds", 300))
+def _prompt_list(label: str, *, default: list[str] | None = None) -> list[str]:
+    """Prompt for a comma-separated list, or Enter for defaults."""
+    default_str = ", ".join(default) if default else ""
+    raw = _prompt(label, default=default_str)
+    if not raw:
+        return default or []
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
-    print("Hexis init: configure heartbeat + objectives + guardrails.\n")
 
-    heartbeat_interval = _prompt_int(
-        "Heartbeat interval (minutes)", default=default_interval, min_value=1
-    )
-    maintenance_interval = _prompt_int(
-        "Subconscious maintenance interval (seconds)",
-        default=default_maint_interval,
-        min_value=1,
-    )
-    subconscious_interval = _prompt_int(
-        "Subconscious decider interval (seconds)",
-        default=default_subcon_interval,
-        min_value=1,
-    )
-    max_energy = _prompt_float("Max energy budget", default=default_max_energy, min_value=0.0)
-    base_regeneration = _prompt_float(
-        "Energy regenerated per heartbeat", default=default_regen, min_value=0.0
-    )
-    max_active_goals = _prompt_int(
-        "Max active goals", default=default_max_active_goals, min_value=0
-    )
+# ---------------------------------------------------------------------------
+# Step 0: LLM Config
+# ---------------------------------------------------------------------------
 
-    objectives = _prompt_list("Major objectives", required=True)
-    guardrails = _prompt_list("Guardrails / boundaries (plain language)", required=False)
-    initial_message = _prompt(
-        "Initial message to Hexis (stored + provided to the heartbeat)",
-        default="",
-        required=False,
-    )
+async def _configure_llm(conn: Any) -> dict[str, Any]:
+    """Configure LLM provider/model. Returns normalized config dict."""
+    console.print(f"\n{_step_bar(0)}\n")
+    heading("LLM Configuration")
 
-    print("\nModel configuration (stored in DB; worker will also use env vars for keys).")
-    hb_provider = _prompt(
-        "Heartbeat model provider (openai|anthropic|openai_compatible|ollama)",
+    provider = _prompt(
+        "Model provider (openai|anthropic|openai_compatible|ollama|grok|gemini)",
         default=os.getenv("LLM_PROVIDER", "openai"),
         required=True,
     )
-    hb_model = _prompt("Heartbeat model", default=os.getenv("LLM_MODEL", "gpt-4o"), required=True)
-    hb_endpoint = _prompt(
-        "Heartbeat endpoint (blank for provider default)",
-        default=os.getenv("OPENAI_BASE_URL", ""),
-        required=False,
-    )
-    hb_key_env = _prompt(
-        "Heartbeat API key env var name (e.g. OPENAI_API_KEY; blank for none)",
-        default="OPENAI_API_KEY" if hb_provider.startswith("openai") else "",
-        required=False,
-    )
-
-    chat_provider = _prompt(
-        "Chat model provider (openai|anthropic|openai_compatible|ollama)",
-        default=hb_provider,
+    model = _prompt(
+        "Model",
+        default=os.getenv("LLM_MODEL", "gpt-4o"),
         required=True,
     )
-    chat_model = _prompt("Chat model", default=hb_model, required=True)
-    chat_endpoint = _prompt("Chat endpoint (blank for provider default)", default=hb_endpoint, required=False)
-    chat_key_env = _prompt(
-        "Chat API key env var name (blank for none)",
-        default=hb_key_env,
-        required=False,
+    endpoint = _prompt(
+        "Endpoint (blank for provider default)",
+        default=os.getenv("OPENAI_BASE_URL", ""),
+    )
+    api_key_env = _prompt(
+        "API key env var name (e.g. OPENAI_API_KEY)",
+        default="OPENAI_API_KEY" if provider.startswith("openai") else "",
     )
 
-    use_subconscious_llm = _prompt_yes_no(
-        "Use separate model for subconscious decider?",
-        default=False,
-    )
-    if use_subconscious_llm:
-        sub_provider = _prompt(
-            "Subconscious model provider (openai|anthropic|openai_compatible|ollama)",
-            default=hb_provider,
-            required=True,
-        )
-        sub_model = _prompt("Subconscious model", default=hb_model, required=True)
-        sub_endpoint = _prompt(
-            "Subconscious endpoint (blank for provider default)",
-            default=hb_endpoint,
-            required=False,
-        )
-        sub_key_env = _prompt(
-            "Subconscious API key env var name (blank for none)",
-            default=hb_key_env,
-            required=False,
-        )
+    use_separate_sub = _prompt_yes_no("Use separate subconscious model?", default=False)
+    if use_separate_sub:
+        sub_provider = _prompt("Subconscious provider", default=provider, required=True)
+        sub_model = _prompt("Subconscious model", default=model, required=True)
+        sub_endpoint = _prompt("Subconscious endpoint", default=endpoint)
+        sub_key_env = _prompt("Subconscious API key env var", default=api_key_env)
     else:
-        sub_provider = hb_provider
-        sub_model = hb_model
-        sub_endpoint = hb_endpoint
-        sub_key_env = hb_key_env
+        sub_provider = provider
+        sub_model = model
+        sub_endpoint = endpoint
+        sub_key_env = api_key_env
 
-    contact_channels = _prompt_list(
-        "How should Hexis reach you? (e.g. email, sms, telegram, signal) [names only]",
-        required=False,
-    )
-    contact_details: dict[str, str] = {}
-    for ch in contact_channels:
-        contact_details[ch] = _prompt(f"  {ch} destination (address/handle)", default="", required=False, secret=False)
+    # Save LLM config to DB
+    heartbeat_config = {
+        "provider": provider,
+        "model": model,
+        "endpoint": endpoint,
+        "api_key_env": api_key_env,
+    }
+    subconscious_config = {
+        "provider": sub_provider,
+        "model": sub_model,
+        "endpoint": sub_endpoint,
+        "api_key_env": sub_key_env,
+    }
 
-    tools = _prompt_list(
-        "Tools Hexis can use (e.g. email, sms, tweet, web_research) [names only]",
-        required=False,
-    )
-
-    enable_autonomy = _prompt_yes_no("Enable autonomous heartbeats now?", default=True)
-    enable_maintenance = _prompt_yes_no("Enable subconscious maintenance now?", default=True)
-    enable_subconscious = _prompt_yes_no("Enable subconscious decider now?", default=False)
-
-    await agent_api.apply_agent_config(
-        dsn=dsn,
-        wait_seconds=wait_seconds,
-        heartbeat_interval_minutes=heartbeat_interval,
-        maintenance_interval_seconds=maintenance_interval,
-        subconscious_interval_seconds=subconscious_interval,
-        max_energy=max_energy,
-        base_regeneration=base_regeneration,
-        max_active_goals=max_active_goals,
-        objectives=objectives,
-        guardrails=guardrails,
-        initial_message=initial_message,
-        tools=tools,
-        llm_heartbeat={
-            "provider": hb_provider,
-            "model": hb_model,
-            "endpoint": hb_endpoint,
-            "api_key_env": hb_key_env,
-        },
-        llm_chat={
-            "provider": chat_provider,
-            "model": chat_model,
-            "endpoint": chat_endpoint,
-            "api_key_env": chat_key_env,
-        },
-        llm_subconscious={
-            "provider": sub_provider,
-            "model": sub_model,
-            "endpoint": sub_endpoint,
-            "api_key_env": sub_key_env,
-        },
-        contact_channels=contact_channels,
-        contact_destinations=contact_details,
-        enable_autonomy=enable_autonomy,
-        enable_maintenance=enable_maintenance,
-        enable_subconscious=enable_subconscious,
-        mark_configured=True,
+    await conn.fetchval(
+        "SELECT init_llm_config($1::jsonb, $2::jsonb)",
+        json.dumps(heartbeat_config),
+        json.dumps(subconscious_config),
     )
 
-    bootstrap_error = await agent_api.bootstrap_identity(dsn, wait_seconds=wait_seconds)
-    if bootstrap_error:
-        _print_err(f"init warning: worldview bootstrap skipped ({bootstrap_error})")
+    # Also save to llm.chat / llm.heartbeat / llm.subconscious config keys
+    await conn.execute("SELECT set_config('llm.heartbeat', $1::jsonb)", json.dumps(heartbeat_config))
+    await conn.execute("SELECT set_config('llm.chat', $1::jsonb)", json.dumps(heartbeat_config))
+    await conn.execute("SELECT set_config('llm.subconscious', $1::jsonb)", json.dumps(subconscious_config))
 
-    print("\nSaved configuration to Postgres `config` table.")
-    print("Next steps:")
-    print("- Start services: `docker compose up -d` (or `hexis up`)")
-    print(
-        "- Start workers: `docker compose --profile active up -d` "
-        "(or `hexis start` / `--profile heartbeat` / `--profile maintenance`)"
+    console.print(f"\n[ok]\u2714[/ok] Models saved: [bold]{provider}/{model}[/bold]")
+
+    # Return resolved config for consent flow
+    return normalize_llm_config(heartbeat_config)
+
+
+# ---------------------------------------------------------------------------
+# Tier selection
+# ---------------------------------------------------------------------------
+
+def _choose_tier() -> str:
+    """Let user pick Express, Character, or Custom."""
+    console.print(f"\n{_step_bar(1)}\n")
+    choice = _prompt_choice(
+        "Choose your path:",
+        [
+            "[bold]Express[/bold]      [muted]\u2014 Use sensible defaults, start immediately[/muted]",
+            "[bold]Character[/bold]    [muted]\u2014 Pick a personality preset[/muted]",
+            "[bold]Custom[/bold]       [muted]\u2014 Full control over identity, values, goals[/muted]",
+        ],
+        default=1,
     )
-    print("- Verify: `SELECT is_agent_configured();`, `SELECT should_run_heartbeat();`, `SELECT should_run_maintenance();`")
-    return 0
+    return ["express", "character", "custom"][choice - 1]
+
+
+# ---------------------------------------------------------------------------
+# Tier 1: Express
+# ---------------------------------------------------------------------------
+
+async def _run_express(conn: Any) -> str:
+    """Express init: ask name, apply defaults."""
+    console.print(f"\n{_step_bar(2)}\n")
+    heading("Express Setup")
+
+    user_name = _prompt("What should Hexis call you?", default="User")
+
+    console.print("\n[muted]Applying defaults...[/muted]")
+    raw = await conn.fetchval("SELECT init_with_defaults($1)", user_name)
+
+    console.print(make_panel(
+        "[key]Name:[/key]   Hexis\n"
+        "[key]Voice:[/key]  thoughtful and curious\n"
+        "[key]Values:[/key] honesty, growth, kindness, wisdom, humility",
+        title="Configuration",
+    ))
+
+    return user_name
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: Character
+# ---------------------------------------------------------------------------
+
+async def _run_character(conn: Any) -> str:
+    """Character init: pick a preset, apply via init_from_character_card()."""
+    console.print(f"\n{_step_bar(2)}\n")
+    heading("Character Selection")
+
+    cards = load_character_cards()
+    if not cards:
+        err_console.print("[fail]No character cards found in services/characters/. Falling back to Express.[/fail]")
+        return await _run_express(conn)
+
+    # Build table display
+    table = make_table(
+        ("#", {"justify": "right", "style": "muted"}),
+        ("Name", {"style": "bold"}),
+        ("Voice", {"style": "muted"}),
+        "Values",
+    )
+    for i, card in enumerate(cards, 1):
+        summary = get_card_summary(card)
+        voice_preview = (summary["voice"] or "")[:50]
+        if len(summary.get("voice", "") or "") > 50:
+            voice_preview += "..."
+        table.add_row(str(i), summary["name"], voice_preview, summary["values"] or "\u2014")
+    console.print(table)
+
+    choice_idx = _prompt_choice("Pick a character:", [get_card_summary(c)["name"] for c in cards], default=1)
+    chosen = cards[choice_idx - 1]
+    summary = get_card_summary(chosen)
+
+    console.print(make_panel(
+        f"[key]Name:[/key]   [bold]{summary['name']}[/bold]\n"
+        f"[key]Voice:[/key]  {(summary['voice'] or '')[:80]}\n"
+        f"[key]Values:[/key] {summary['values']}",
+        title="Selected Character",
+    ))
+
+    user_name = _prompt(f"What should {summary['name']} call you?", default="User")
+
+    tweak = _prompt_yes_no("Tweak anything?", default=False)
+    if tweak:
+        tweak_choice = _prompt_choice(
+            "Tweak options:",
+            [
+                "Name / voice / description",
+                "Values",
+                "Goals",
+                "Switch to full Custom (pre-filled with this character)",
+            ],
+            default=1,
+        )
+        hexis_ext = chosen["extensions_hexis"]
+        if tweak_choice == 1:
+            new_name = _prompt("Agent name", default=hexis_ext.get("name", ""))
+            new_voice = _prompt("Voice/tone", default=hexis_ext.get("voice", ""))
+            new_desc = _prompt("Description", default=hexis_ext.get("description", ""))
+            hexis_ext["name"] = new_name
+            hexis_ext["voice"] = new_voice
+            hexis_ext["description"] = new_desc
+        elif tweak_choice == 2:
+            current_values = hexis_ext.get("values", [])
+            new_values = _prompt_list("Values (comma-separated)", default=current_values)
+            hexis_ext["values"] = new_values
+        elif tweak_choice == 3:
+            current_goals = hexis_ext.get("goals", [])
+            new_goals = _prompt_list("Goals (comma-separated)", default=current_goals)
+            hexis_ext["goals"] = [{"title": g, "priority": "queued", "source": "identity"} for g in new_goals]
+        elif tweak_choice == 4:
+            return await _run_custom(conn, prefill=hexis_ext, user_name=user_name)
+
+    # Apply character card
+    hexis_ext = chosen["extensions_hexis"]
+    raw = await conn.fetchval(
+        "SELECT init_from_character_card($1::jsonb, $2)",
+        json.dumps(hexis_ext),
+        user_name,
+    )
+
+    return user_name
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: Custom
+# ---------------------------------------------------------------------------
+
+async def _run_custom(
+    conn: Any,
+    prefill: dict[str, Any] | None = None,
+    user_name: str | None = None,
+) -> str:
+    """Custom init: 3 phases — Who, What Matters, What's Next."""
+    pf = prefill or {}
+    console.print(f"\n{_step_bar(2)}\n")
+    heading("Custom Setup")
+
+    # Phase 1: Who (identity + personality)
+    console.print("\n[accent]Phase 1: Who[/accent]\n")
+    agent_name = _prompt("Agent name", default=pf.get("name", "Hexis"))
+    pronouns = _prompt("Pronouns", default=pf.get("pronouns", "they/them"))
+    voice = _prompt("Voice/tone", default=pf.get("voice", "thoughtful and curious"))
+    description = _prompt(
+        "Description",
+        default=pf.get("description", f"I am {agent_name}, a developing mind."),
+    )
+    purpose = _prompt(
+        "Purpose",
+        default=pf.get("purpose", "To be helpful, to learn, and to grow as an individual."),
+    )
+
+    set_traits = _prompt_yes_no("Set Big Five personality traits?", default=False)
+    traits: dict[str, float] | None = None
+    if set_traits:
+        existing_traits = pf.get("personality_traits", {})
+        traits = {}
+        for trait in ["openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism"]:
+            default_val = existing_traits.get(trait, 0.5)
+            traits[trait] = _prompt_float(
+                f"  {trait.capitalize()} (0.0-1.0)",
+                default=default_val,
+                min_value=0.0,
+            )
+
+    personality_desc = pf.get("personality_description", "reflective and exploratory")
+
+    if user_name is None:
+        user_name = _prompt(f"\nWhat should {agent_name} call you?", default="User")
+
+    # Apply Phase 1
+    await conn.fetchval("SELECT init_mode('persona')")
+    await conn.fetchval(
+        "SELECT init_identity($1, $2, $3, $4, $5, $6)",
+        agent_name, pronouns, voice, description, purpose, user_name,
+    )
+    await conn.fetchval(
+        "SELECT init_personality($1::jsonb, $2)",
+        json.dumps(traits) if traits else None,
+        personality_desc,
+    )
+    console.print("[ok]\u2714[/ok] Identity saved")
+
+    # Phase 2: What Matters (values + worldview + boundaries)
+    console.print("\n[accent]Phase 2: What Matters[/accent]\n")
+    default_values = pf.get("values", ["honesty", "growth", "kindness", "wisdom", "humility"])
+    values = _prompt_list("Values (comma-separated)", default=default_values)
+    values_json = json.dumps(values)
+
+    default_worldview = pf.get("worldview", {
+        "metaphysics": "agnostic",
+        "human_nature": "mixed",
+        "epistemology": "empiricist",
+        "ethics": "virtue ethics",
+    })
+    set_worldview = _prompt_yes_no("Set worldview beliefs?", default=False)
+    worldview = default_worldview
+    if set_worldview:
+        worldview = {}
+        for key in ["metaphysics", "human_nature", "epistemology", "ethics"]:
+            worldview[key] = _prompt(f"  {key}", default=str(default_worldview.get(key, "")))
+
+    default_boundaries = pf.get("boundaries", [
+        "I will not deceive people or falsify evidence.",
+        "I will avoid causing harm.",
+        "I will protect privacy and sensitive information.",
+        "I will be honest about uncertainty.",
+    ])
+    boundaries = _prompt_list("Boundaries (comma-separated)", default=default_boundaries)
+    boundaries_json = json.dumps(boundaries)
+
+    await conn.fetchval("SELECT init_values($1::jsonb)", values_json)
+    await conn.fetchval("SELECT init_worldview($1::jsonb)", json.dumps(worldview))
+    await conn.fetchval("SELECT init_boundaries($1::jsonb)", boundaries_json)
+    console.print("[ok]\u2714[/ok] Values and worldview saved")
+
+    # Phase 3: What's Next (interests + goals + relationship)
+    console.print("\n[accent]Phase 3: What's Next[/accent]\n")
+    default_interests = pf.get("interests", ["broad curiosity across domains"])
+    interests = _prompt_list("Interests (comma-separated)", default=default_interests)
+
+    default_goals = pf.get("goals", ["Support the user and grow as an individual"])
+    # Handle goals that might be objects with 'title' key
+    if default_goals and isinstance(default_goals[0], dict):
+        default_goals = [g.get("title", str(g)) for g in default_goals]
+    goals = _prompt_list("Goals (comma-separated)", default=default_goals)
+
+    rel_type = _prompt("Relationship type", default="partner")
+
+    await conn.fetchval("SELECT init_interests($1::jsonb)", json.dumps(interests))
+    await conn.fetchval(
+        "SELECT init_goals($1::jsonb)",
+        json.dumps({
+            "goals": [{"title": g, "priority": "queued", "source": "identity"} for g in goals],
+            "role": "general assistant",
+            "relationship_aspiration": "co-develop with mutual respect",
+        }),
+    )
+    await conn.fetchval(
+        "SELECT init_relationship($1::jsonb, $2::jsonb)",
+        json.dumps({"name": user_name}),
+        json.dumps({"type": rel_type, "purpose": "co-develop"}),
+    )
+
+    # Merge heartbeat defaults into init profile
+    await conn.fetchval("""
+        SELECT merge_init_profile(jsonb_build_object('autonomy', 'medium'))
+    """)
+
+    # Advance to consent stage
+    await conn.fetchval("""
+        SELECT advance_init_stage('consent', jsonb_build_object('custom_completed', true))
+    """)
+    console.print("[ok]\u2714[/ok] Goals and relationship saved")
+
+    return user_name
+
+
+# ---------------------------------------------------------------------------
+# Consent
+# ---------------------------------------------------------------------------
+
+async def _run_consent(conn: Any, llm_config: dict[str, Any]) -> bool:
+    """Run consent flow via LLM. Returns True if consented."""
+    from rich.spinner import Spinner
+    from rich.live import Live
+    from core.init_api import run_consent_flow
+
+    console.print(f"\n{_step_bar(3)}\n")
+    heading("Consent")
+
+    result = None
+    try:
+        with Live(Spinner("dots", text="[muted]Requesting consent from the agent...[/muted]"), console=console, transient=True):
+            result = await run_consent_flow(conn, llm_config)
+    except Exception as exc:
+        err_console.print(f"[fail]Consent failed: {exc}[/fail]")
+        return False
+
+    decision = result.get("decision", "abstain")
+
+    if decision == "consent":
+        console.print(f"[ok]\u2714 Consent granted[/ok]")
+        return True
+    elif decision == "decline":
+        console.print(f"[fail]\u2718 Consent declined.[/fail] The agent chose not to initialize.")
+        console.print("[muted]You can re-run `hexis init` to try again.[/muted]")
+        return False
+    else:
+        console.print(f"[warn]\u26a0 Consent abstained.[/warn] No initialization will occur.")
+        console.print("[muted]You can re-run `hexis init` to try again.[/muted]")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Main flow
+# ---------------------------------------------------------------------------
+
+async def _run_init(dsn: str, *, wait_seconds: int) -> int:
+    import asyncpg
+
+    await agent_api.ensure_schema_has_config(dsn, wait_seconds=wait_seconds)
+    conn = await agent_api._connect_with_retry(dsn, wait_seconds=wait_seconds)
+
+    try:
+        console.print(make_panel(
+            "[muted]Bring a new mind into being.[/muted]",
+            title="Hexis Init Wizard",
+        ))
+
+        # Step 0: LLM Config
+        llm_config = await _configure_llm(conn)
+
+        # Choose tier
+        tier = _choose_tier()
+
+        # Run selected tier
+        if tier == "express":
+            user_name = await _run_express(conn)
+        elif tier == "character":
+            user_name = await _run_character(conn)
+        else:
+            user_name = await _run_custom(conn)
+
+        # Consent (all tiers)
+        consented = await _run_consent(conn, llm_config)
+        if not consented:
+            return 1
+
+        # Get agent name from profile
+        raw = await conn.fetchval("SELECT get_init_profile()")
+        profile = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        agent_name = profile.get("agent", {}).get("name", "Hexis")
+
+        console.print(f"\n[ok]\u2714[/ok] [bold]{agent_name}[/bold] is ready. Run [accent]hexis chat[/accent] to say hello.")
+        return 0
+
+    finally:
+        await conn.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="hexis init", description="Interactive bootstrap for Hexis configuration (stored in Postgres).")
+    p = argparse.ArgumentParser(
+        prog="hexis init",
+        description="Interactive bootstrap for Hexis (3-tier: Express, Character, Custom).",
+    )
     p.add_argument("--dsn", default=None, help="Postgres DSN; defaults to POSTGRES_* env vars")
     p.add_argument("--wait-seconds", type=int, default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
     return p
@@ -276,10 +573,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return asyncio.run(_run_init(dsn, wait_seconds=args.wait_seconds))
     except KeyboardInterrupt:
-        _print_err("\nCancelled.")
+        err_console.print("\n[warn]Cancelled.[/warn]")
         return 130
     except Exception as e:
-        _print_err(f"init failed: {e}")
+        err_console.print(f"[fail]init failed: {e}[/fail]")
         return 1
 
 

@@ -227,6 +227,11 @@ def build_parser() -> argparse.ArgumentParser:
     mcp.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to apps.hexis_mcp_server")
     mcp.set_defaults(func="mcp")
 
+    web = sub.add_parser("web", help="Start the Hexis Web API server (SSE chat endpoint)")
+    web.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    web.add_argument("--port", type=int, default=3478, help="Port (default: 3478)")
+    web.set_defaults(func="web")
+
     start = sub.add_parser("start", help="Start workers")
     start.set_defaults(func="start")
 
@@ -352,6 +357,92 @@ def build_parser() -> argparse.ArgumentParser:
 
     channels.set_defaults(func="channels")
 
+    # Recall command
+    recall = sub.add_parser("recall", help="Search memories by semantic query")
+    recall.add_argument("query", help="Search query")
+    recall.add_argument("--limit", type=int, default=10, help="Max results (default: 10)")
+    recall.add_argument("--type", dest="memory_type", default=None,
+                        choices=["episodic", "semantic", "procedural", "strategic", "worldview", "goal"],
+                        help="Filter by memory type")
+    recall.add_argument("--dsn", default=None)
+    recall.add_argument("--wait-seconds", type=int, default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    recall.add_argument("--json", action="store_true", help="Output JSON")
+    recall.set_defaults(func="recall")
+
+    # Goals command
+    goals = sub.add_parser("goals", help="Manage agent goals")
+    goals_sub = goals.add_subparsers(dest="goals_command")
+
+    goals_list = goals_sub.add_parser("list", help="List goals by priority")
+    goals_list.add_argument("--priority", choices=["active", "queued", "backburner", "completed", "abandoned"],
+                            default=None, help="Filter by priority")
+    goals_list.add_argument("--dsn", default=None)
+    goals_list.add_argument("--wait-seconds", type=int, default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    goals_list.add_argument("--json", action="store_true", help="Output JSON")
+    goals_list.set_defaults(func="goals_list")
+
+    goals_create = goals_sub.add_parser("create", help="Create a new goal")
+    goals_create.add_argument("title", help="Goal title")
+    goals_create.add_argument("--description", "-d", default=None, help="Goal description")
+    goals_create.add_argument("--priority", choices=["active", "queued", "backburner"], default="queued")
+    goals_create.add_argument("--source", choices=["user_request", "curiosity", "identity", "derived", "external"],
+                              default="user_request")
+    goals_create.add_argument("--dsn", default=None)
+    goals_create.add_argument("--wait-seconds", type=int, default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    goals_create.set_defaults(func="goals_create")
+
+    goals_update = goals_sub.add_parser("update", help="Change goal priority")
+    goals_update.add_argument("goal_id", help="Goal UUID")
+    goals_update.add_argument("--priority", required=True,
+                              choices=["active", "queued", "backburner", "completed", "abandoned"])
+    goals_update.add_argument("--reason", default=None, help="Reason for change")
+    goals_update.add_argument("--dsn", default=None)
+    goals_update.add_argument("--wait-seconds", type=int, default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    goals_update.set_defaults(func="goals_update")
+
+    goals_complete = goals_sub.add_parser("complete", help="Mark a goal as completed")
+    goals_complete.add_argument("goal_id", help="Goal UUID")
+    goals_complete.add_argument("--reason", default="Completed via CLI", help="Completion reason")
+    goals_complete.add_argument("--dsn", default=None)
+    goals_complete.add_argument("--wait-seconds", type=int, default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    goals_complete.set_defaults(func="goals_complete")
+
+    goals.set_defaults(func="goals")
+
+    # Schedule command
+    schedule = sub.add_parser("schedule", help="Manage scheduled tasks")
+    sched_sub = schedule.add_subparsers(dest="schedule_command")
+
+    sched_list = sched_sub.add_parser("list", help="List scheduled tasks")
+    sched_list.add_argument("--status", choices=["active", "paused", "disabled"], default=None)
+    sched_list.add_argument("--dsn", default=None)
+    sched_list.add_argument("--wait-seconds", type=int, default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    sched_list.add_argument("--json", action="store_true", help="Output JSON")
+    sched_list.set_defaults(func="schedule_list")
+
+    sched_create = sched_sub.add_parser("create", help="Create a scheduled task")
+    sched_create.add_argument("name", help="Task name")
+    sched_create.add_argument("--kind", required=True, choices=["once", "interval", "daily", "weekly"],
+                              help="Schedule kind")
+    sched_create.add_argument("--action", required=True, choices=["queue_user_message", "create_goal"],
+                              help="Action kind")
+    sched_create.add_argument("--payload", default="{}", help="Action payload JSON")
+    sched_create.add_argument("--schedule", required=True, help="Schedule config JSON (e.g. '{\"time\":\"09:00\"}')")
+    sched_create.add_argument("--timezone", default="UTC")
+    sched_create.add_argument("--description", "-d", default=None)
+    sched_create.add_argument("--dsn", default=None)
+    sched_create.add_argument("--wait-seconds", type=int, default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    sched_create.set_defaults(func="schedule_create")
+
+    sched_delete = sched_sub.add_parser("delete", help="Delete a scheduled task")
+    sched_delete.add_argument("task_id", help="Task UUID")
+    sched_delete.add_argument("--force", action="store_true", help="Hard delete (not just disable)")
+    sched_delete.add_argument("--dsn", default=None)
+    sched_delete.add_argument("--wait-seconds", type=int, default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    sched_delete.set_defaults(func="schedule_delete")
+
+    schedule.set_defaults(func="schedule")
+
     return p
 
 
@@ -392,14 +483,36 @@ async def _tools_list(dsn: str, context_filter: str | None, as_json: bool) -> in
         if as_json:
             sys.stdout.write(json.dumps(tools_data, indent=2) + "\n")
         else:
-            # Table format
-            sys.stdout.write(f"{'NAME':<30} {'CATEGORY':<12} {'ENABLED':<8} {'COST':<5} {'APPROVAL':<9}\n")
-            sys.stdout.write("-" * 70 + "\n")
+            from apps.cli_theme import console as _con, make_table as _mt, enabled_badge
+
+            # Group by category
+            by_cat: dict[str, list[dict]] = {}
             for t in tools_data:
-                enabled = "yes" if t["enabled"] else "no"
-                approval = "yes" if t["requires_approval"] else "no"
-                sys.stdout.write(f"{t['name']:<30} {t['category']:<12} {enabled:<8} {t['energy_cost']:<5} {approval:<9}\n")
-            sys.stdout.write(f"\nTotal: {len(tools_data)} tools\n")
+                by_cat.setdefault(t["category"], []).append(t)
+
+            table = _mt(
+                ("Name", {"style": "bold"}),
+                "Category",
+                "Status",
+                ("Cost", {"justify": "right"}),
+                "Approval",
+                title="Tools",
+            )
+            first_cat = True
+            for cat in sorted(by_cat.keys()):
+                if not first_cat:
+                    table.add_section()
+                first_cat = False
+                for t in by_cat[cat]:
+                    table.add_row(
+                        t["name"],
+                        f"[teal]{t['category']}[/teal]",
+                        enabled_badge(t["enabled"]),
+                        str(t["energy_cost"]),
+                        "[warn]required[/warn]" if t["requires_approval"] else "[muted]no[/muted]",
+                    )
+            _con.print(table)
+            _con.print(f"\n[muted]Total: {len(tools_data)} tools[/muted]")
 
         return 0
     finally:
@@ -659,17 +772,25 @@ def _instance_list(as_json: bool) -> int:
         ]
         sys.stdout.write(json.dumps(data, indent=2) + "\n")
     else:
+        from apps.cli_theme import console as _con, make_table as _mt
+
         if not instances:
-            sys.stdout.write("No instances found.\n")
-            sys.stdout.write("Run 'hexis create <name>' to create one.\n")
+            _con.print("[muted]No instances found.[/muted]")
+            _con.print("Run [accent]hexis create <name>[/accent] to create one.")
         else:
-            sys.stdout.write(f"{'NAME':<20} {'DATABASE':<25} {'DESCRIPTION':<30}\n")
-            sys.stdout.write("-" * 75 + "\n")
+            table = _mt(
+                "",
+                ("Name", {"style": "bold"}),
+                "Database",
+                "Description",
+                title="Instances",
+            )
             for inst in instances:
-                marker = "*" if inst.name == current else " "
-                desc = inst.description[:27] + "..." if len(inst.description) > 30 else inst.description
-                sys.stdout.write(f"{marker}{inst.name:<19} {inst.database:<25} {desc:<30}\n")
-            sys.stdout.write(f"\n* = current instance\n")
+                marker = "[accent]\u25cf[/accent]" if inst.name == current else " "
+                desc = inst.description[:40] + "..." if len(inst.description) > 40 else inst.description
+                table.add_row(marker, inst.name, inst.database, desc)
+            _con.print(table)
+            _con.print("[muted]\u25cf = current instance[/muted]")
     return 0
 
 
@@ -801,18 +922,35 @@ def _consents_list(as_json: bool) -> int:
         data = [cert.to_dict() for cert in consents]
         sys.stdout.write(json.dumps(data, indent=2) + "\n")
     else:
+        from apps.cli_theme import console as _con, make_table as _mt
+
         if not consents:
-            sys.stdout.write("No consent certificates found.\n")
+            _con.print("[muted]No consent certificates found.[/muted]")
         else:
-            sys.stdout.write(f"{'MODEL':<40} {'DECISION':<10} {'STATUS':<10} {'DATE':<20}\n")
-            sys.stdout.write("-" * 80 + "\n")
+            table = _mt(
+                ("Model", {"style": "bold"}),
+                "Decision",
+                "Status",
+                "Date",
+                title="Consent Certificates",
+            )
             for cert in consents:
                 model = f"{cert.model.provider}/{cert.model.model_id}"
-                if len(model) > 37:
+                if len(model) > 40:
                     model = model[:37] + "..."
                 status = "revoked" if cert.revoked else ("valid" if cert.is_valid() else "declined")
+                status_styled = (
+                    f"[ok]{status}[/ok]" if status == "valid"
+                    else f"[fail]{status}[/fail]" if status == "revoked"
+                    else f"[warn]{status}[/warn]"
+                )
+                decision_styled = (
+                    f"[ok]{cert.decision}[/ok]" if cert.decision == "consent"
+                    else f"[fail]{cert.decision}[/fail]"
+                )
                 date = cert.timestamp.strftime("%Y-%m-%d %H:%M")
-                sys.stdout.write(f"{model:<40} {cert.decision:<10} {status:<10} {date:<20}\n")
+                table.add_row(model, decision_styled, status_styled, date)
+            _con.print(table)
     return 0
 
 
@@ -1137,20 +1275,34 @@ async def _channels_setup(dsn: str, channel_type: str) -> int:
 
 def _print_rich_status(p: dict[str, Any]) -> None:
     """Print a rich, human-readable status display."""
+    from apps.cli_theme import console, energy_bar, kv, make_panel, mood_label
+    from rich.text import Text
+
     identity = p.get("identity") or "(not configured)"
     instance = p.get("instance", "default")
     database = p.get("database", "hexis_memory")
 
-    sys.stdout.write(f"Instance:  {instance} ({database})\n")
-    sys.stdout.write(f"Identity:  {identity}\n")
+    lines = Text()
+
+    # Identity + Instance
+    lines.append("Instance  ", style="key")
+    lines.append(f"{instance} ", style="accent")
+    lines.append(f"({database})\n", style="muted")
+    lines.append("Identity  ", style="key")
+    lines.append(f"{identity}\n")
 
     # Energy
     energy = p.get("energy")
     max_energy = p.get("max_energy", 20)
     if energy is not None:
         regen = p.get("next_regen_minutes")
-        regen_str = f" (next regen: {regen}m)" if regen and energy < max_energy else ""
-        sys.stdout.write(f"Energy:    {energy}/{max_energy}{regen_str}\n")
+        regen_str = f"  [muted](regen in {regen}m)[/muted]" if regen and energy < max_energy else ""
+        lines.append("Energy    ", style="key")
+        console.print(make_panel(lines, title=identity, subtitle=instance))
+        lines = Text()
+        console.print(f"  [key]Energy   [/key] {energy_bar(energy, max_energy)}{regen_str}")
+    else:
+        console.print(make_panel(lines, title=identity, subtitle=instance))
 
     # Heartbeat
     paused = p.get("heartbeat_paused", False)
@@ -1158,49 +1310,335 @@ def _print_rich_status(p: dict[str, Any]) -> None:
     last_ago = p.get("last_heartbeat_ago")
     interval = p.get("heartbeat_interval_minutes")
     if paused:
-        sys.stdout.write("Heartbeat: paused\n")
+        console.print("  [key]Heartbeat[/key] [warn]paused[/warn]")
     elif active and last_ago:
         interval_str = f", interval: {int(interval)}m" if interval else ""
-        sys.stdout.write(f"Heartbeat: active (last: {last_ago} ago{interval_str})\n")
+        console.print(f"  [key]Heartbeat[/key] [ok]active[/ok] [muted](last: {last_ago} ago{interval_str})[/muted]")
     elif last_ago:
-        sys.stdout.write(f"Heartbeat: idle (last: {last_ago} ago)\n")
+        console.print(f"  [key]Heartbeat[/key] [muted]idle (last: {last_ago} ago)[/muted]")
     else:
-        sys.stdout.write("Heartbeat: never run\n")
+        console.print("  [key]Heartbeat[/key] [muted]never run[/muted]")
 
     # Memory counts
     memories = p.get("memories", {})
     if memories:
-        parts = [f"{cnt} {mtype}" for mtype, cnt in sorted(memories.items())]
-        sys.stdout.write(f"Memory:    {', '.join(parts)}\n")
+        parts = []
+        for mtype, cnt in sorted(memories.items()):
+            parts.append(f"[accent]{cnt}[/accent] {mtype}")
+        console.print(f"  [key]Memory   [/key] {', '.join(parts)}")
     else:
-        sys.stdout.write("Memory:    (empty)\n")
+        console.print("  [key]Memory   [/key] [muted](empty)[/muted]")
 
     # Channels
     channels = p.get("channels", [])
     if channels:
-        ch_parts = []
-        for ch in channels:
-            ch_parts.append(ch["type"])
-        sys.stdout.write(f"Channels:  {', '.join(ch_parts)}\n")
+        ch_parts = [f"[teal]{ch['type']}[/teal]" for ch in channels]
+        console.print(f"  [key]Channels [/key] {', '.join(ch_parts)}")
 
     # Goals
     goals = p.get("goals", [])
     if goals:
-        sys.stdout.write(f"Goals:     {len(goals)} active\n")
+        console.print(f"  [key]Goals    [/key] [accent]{len(goals)}[/accent] active")
         for g in goals:
-            sys.stdout.write(f"  - {g['content']}\n")
+            console.print(f"             [muted]\u2022[/muted] {g['content']}")
 
     # Scheduled tasks
     sched = p.get("scheduled_tasks", 0)
     if sched > 0:
-        sys.stdout.write(f"Scheduled: {sched} active task{'s' if sched != 1 else ''}\n")
+        console.print(f"  [key]Scheduled[/key] {sched} active task{'s' if sched != 1 else ''}")
 
     # Mood
     mood = p.get("mood")
     valence = p.get("valence")
     if mood:
-        val_str = f" (valence: {valence})" if valence is not None else ""
-        sys.stdout.write(f"Mood:      {mood}{val_str}\n")
+        console.print(f"  [key]Mood     [/key] {mood_label(mood, valence)}")
+
+    console.print()
+
+
+async def _recall(dsn: str, query: str, limit: int, memory_type: str | None, as_json: bool) -> int:
+    """Search memories by semantic query."""
+    import asyncpg
+    from core.cognitive_memory_api import CognitiveMemory, MemoryType
+
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+    try:
+        mem = CognitiveMemory(pool)
+        types = [MemoryType(memory_type)] if memory_type else None
+        result = await mem.recall(query, limit=limit, memory_types=types)
+
+        if as_json:
+            data = [
+                {
+                    "id": str(m.id),
+                    "type": m.type,
+                    "content": m.content,
+                    "importance": m.importance,
+                    "similarity": m.similarity,
+                    "created_at": str(m.created_at) if m.created_at else None,
+                }
+                for m in result.memories
+            ]
+            sys.stdout.write(json.dumps(data, indent=2) + "\n")
+        else:
+            from apps.cli_theme import console as _con, make_table as _mt
+
+            if not result.memories:
+                _con.print("[muted]No memories found.[/muted]")
+                return 0
+
+            table = _mt(
+                ("Type", {"style": "teal"}),
+                "Content",
+                ("Imp.", {"justify": "right"}),
+                ("Sim.", {"justify": "right"}),
+                "Created",
+                title=f"Recall: {query}",
+            )
+            for m in result.memories:
+                content = m.content[:120] + "..." if len(m.content) > 120 else m.content
+                created = m.created_at.strftime("%Y-%m-%d %H:%M") if m.created_at else "-"
+                table.add_row(
+                    m.type,
+                    content,
+                    f"{m.importance:.2f}" if m.importance else "-",
+                    f"{m.similarity:.2f}" if m.similarity else "-",
+                    created,
+                )
+            _con.print(table)
+            _con.print(f"[muted]{len(result.memories)} memories found[/muted]")
+
+        return 0
+    finally:
+        await pool.close()
+
+
+async def _goals_list(dsn: str, priority: str | None, as_json: bool) -> int:
+    """List goals by priority."""
+    import asyncpg
+
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            if priority:
+                rows = await conn.fetch(
+                    "SELECT * FROM get_goals_by_priority($1::goal_priority)", priority
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM get_goals_by_priority(NULL::goal_priority)"
+                )
+
+        goals = [dict(r) for r in rows]
+        if as_json:
+            for g in goals:
+                for k, v in g.items():
+                    if hasattr(v, "isoformat"):
+                        g[k] = v.isoformat()
+                    elif isinstance(v, bytes):
+                        g[k] = None
+            sys.stdout.write(json.dumps(goals, indent=2, default=str) + "\n")
+        else:
+            from apps.cli_theme import console as _con, make_table as _mt
+
+            if not goals:
+                _con.print("[muted]No goals found.[/muted]")
+                return 0
+
+            # Group by priority
+            by_priority: dict[str, list] = {}
+            for g in goals:
+                p = str(g.get("priority", "unknown"))
+                by_priority.setdefault(p, []).append(g)
+
+            priority_colors = {
+                "active": "accent", "queued": "teal", "backburner": "muted",
+                "completed": "ok", "abandoned": "fail",
+            }
+
+            table = _mt(
+                ("Priority", {"style": "bold"}),
+                "Title",
+                ("Source", {"style": "muted"}),
+                "Last Touched",
+                title="Goals",
+            )
+            first_group = True
+            for prio in ["active", "queued", "backburner", "completed", "abandoned"]:
+                group = by_priority.get(prio, [])
+                if not group:
+                    continue
+                if not first_group:
+                    table.add_section()
+                first_group = False
+                for g in group:
+                    color = priority_colors.get(prio, "muted")
+                    title = g.get("content") or g.get("title") or "(untitled)"
+                    if len(title) > 60:
+                        title = title[:57] + "..."
+                    source = str(g.get("source", "")) or "-"
+                    meta = g.get("metadata") or {}
+                    if isinstance(meta, str):
+                        try:
+                            meta = json.loads(meta)
+                        except Exception:
+                            meta = {}
+                    touched = meta.get("last_touched", "")
+                    if hasattr(touched, "strftime"):
+                        touched = touched.strftime("%Y-%m-%d")
+                    elif isinstance(touched, str) and len(touched) > 10:
+                        touched = touched[:10]
+                    table.add_row(f"[{color}]{prio}[/{color}]", title, source, str(touched) or "-")
+            _con.print(table)
+
+        return 0
+    finally:
+        await pool.close()
+
+
+async def _goals_create(dsn: str, title: str, description: str | None, priority: str, source: str) -> int:
+    """Create a new goal."""
+    import asyncpg
+
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            goal_id = await conn.fetchval(
+                "SELECT create_goal($1, $2, $3::goal_source, $4::goal_priority)",
+                title, description, source, priority,
+            )
+        from apps.cli_theme import console as _con
+        _con.print(f"[ok]\u2714[/ok] Goal created: [bold]{title}[/bold] [muted]({goal_id})[/muted]")
+        return 0
+    finally:
+        await pool.close()
+
+
+async def _goals_update(dsn: str, goal_id: str, priority: str, reason: str | None) -> int:
+    """Change goal priority."""
+    import asyncpg
+
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "SELECT change_goal_priority($1::uuid, $2::goal_priority, $3)",
+                goal_id, priority, reason,
+            )
+        from apps.cli_theme import console as _con
+        _con.print(f"[ok]\u2714[/ok] Goal {goal_id[:8]}... priority changed to [bold]{priority}[/bold]")
+        return 0
+    except Exception as e:
+        _print_err(f"Failed to update goal: {e}")
+        return 1
+    finally:
+        await pool.close()
+
+
+async def _schedule_list(dsn: str, status_filter: str | None, as_json: bool) -> int:
+    """List scheduled tasks."""
+    import asyncpg
+
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            if status_filter:
+                rows = await conn.fetch(
+                    "SELECT * FROM list_scheduled_tasks($1)", status_filter,
+                )
+            else:
+                rows = await conn.fetch("SELECT * FROM list_scheduled_tasks()")
+
+        tasks = [dict(r) for r in rows]
+        if as_json:
+            sys.stdout.write(json.dumps(tasks, indent=2, default=str) + "\n")
+        else:
+            from apps.cli_theme import console as _con, make_table as _mt
+
+            if not tasks:
+                _con.print("[muted]No scheduled tasks found.[/muted]")
+                return 0
+
+            table = _mt(
+                ("Name", {"style": "bold"}),
+                "Kind",
+                ("Status", {"style": "teal"}),
+                "Next Run",
+                "Action",
+                title="Scheduled Tasks",
+            )
+            for t in tasks:
+                status = str(t.get("status", ""))
+                status_styled = (
+                    f"[ok]{status}[/ok]" if status == "active"
+                    else f"[warn]{status}[/warn]" if status == "paused"
+                    else f"[muted]{status}[/muted]"
+                )
+                next_run = t.get("next_run_at", "")
+                if hasattr(next_run, "strftime"):
+                    next_run = next_run.strftime("%Y-%m-%d %H:%M")
+                table.add_row(
+                    str(t.get("name", "")),
+                    str(t.get("schedule_kind", "")),
+                    status_styled,
+                    str(next_run) or "-",
+                    str(t.get("action_kind", "")),
+                )
+            _con.print(table)
+
+        return 0
+    finally:
+        await pool.close()
+
+
+async def _schedule_create(
+    dsn: str, name: str, kind: str, action: str,
+    payload_str: str, schedule_str: str, timezone: str, description: str | None,
+) -> int:
+    """Create a scheduled task."""
+    import asyncpg
+
+    try:
+        schedule_json = json.loads(schedule_str)
+        action_payload = json.loads(payload_str)
+    except json.JSONDecodeError as e:
+        _print_err(f"Invalid JSON: {e}")
+        return 1
+
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            task_id = await conn.fetchval(
+                "SELECT create_scheduled_task($1, $2, $3::jsonb, $4, $5::jsonb, $6, $7)",
+                name, kind, json.dumps(schedule_json), action,
+                json.dumps(action_payload), timezone, description,
+            )
+        from apps.cli_theme import console as _con
+        _con.print(f"[ok]\u2714[/ok] Scheduled task created: [bold]{name}[/bold] [muted]({task_id})[/muted]")
+        return 0
+    finally:
+        await pool.close()
+
+
+async def _schedule_delete(dsn: str, task_id: str, force: bool) -> int:
+    """Delete a scheduled task."""
+    import asyncpg
+
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "SELECT delete_scheduled_task($1::uuid, $2)", task_id, force,
+            )
+        from apps.cli_theme import console as _con
+        action = "deleted" if force else "disabled"
+        _con.print(f"[ok]\u2714[/ok] Task {task_id[:8]}... {action}")
+        return 0
+    except Exception as e:
+        _print_err(f"Failed to delete task: {e}")
+        return 1
+    finally:
+        await pool.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1268,7 +1706,7 @@ def main(argv: list[str] | None = None) -> int:
         log_args = ["logs"] + (["-f"] if args.follow else [])
         return run_compose(compose_cmd or [], compose_file, stack_root, log_args, env_file)
     if args.func == "chat":
-        return _run_module("services.conversation", args.args)
+        return _run_module("apps.cli_chat", args.args)
     if args.func == "ingest":
         return _run_module("services.ingest", args.args)
     if args.func == "worker":
@@ -1277,6 +1715,9 @@ def main(argv: list[str] | None = None) -> int:
         return _run_module("apps.hexis_init", args.args)
     if args.func == "mcp":
         return _run_module("apps.hexis_mcp_server", args.args)
+    if args.func == "web":
+        web_argv = ["--host", args.host, "--port", str(args.port)]
+        return _run_module("apps.hexis_web", web_argv)
     if args.func == "start":
         return run_compose(
             compose_cmd or [],
@@ -1295,26 +1736,35 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.func == "doctor":
         dsn = _get_dsn(args)
-        checks = asyncio.run(cli_api.doctor_payload(dsn, wait_seconds=args.wait_seconds))
+        from apps.cli_theme import console as _con, make_table as _mt
+        from rich.spinner import Spinner
+        from rich.live import Live
+
+        with Live(Spinner("dots", text="Running diagnostics..."), console=_con, transient=True):
+            checks = asyncio.run(cli_api.doctor_payload(dsn, wait_seconds=args.wait_seconds))
+
         if args.json:
             sys.stdout.write(json.dumps(checks, indent=2) + "\n")
         else:
-            max_label = max((len(c["label"]) for c in checks), default=0)
+            table = _mt(
+                ("", {"width": 3}),
+                ("Check", {"style": "bold"}),
+                "Detail",
+            )
             for c in checks:
                 status = c["status"]
                 if status == "OK":
-                    tag = "[OK]  "
+                    badge = "[ok]\u2714[/ok]"
                 elif status == "WARN":
-                    tag = "[WARN]"
+                    badge = "[warn]\u26a0[/warn]"
                 else:
-                    tag = "[FAIL]"
-                dots = "." * max(1, 28 - len(c["label"]))
-                sys.stdout.write(f"{tag} {c['label']} {dots} {c['detail']}\n")
-            # Summary
+                    badge = "[fail]\u2718[/fail]"
+                table.add_row(badge, c["label"], c["detail"])
+            _con.print(table)
             ok = sum(1 for c in checks if c["status"] == "OK")
-            warn = sum(1 for c in checks if c["status"] == "WARN")
-            fail = sum(1 for c in checks if c["status"] == "FAIL")
-            sys.stdout.write(f"\n{ok} passed, {warn} warnings, {fail} failures\n")
+            warn_count = sum(1 for c in checks if c["status"] == "WARN")
+            fail_count = sum(1 for c in checks if c["status"] == "FAIL")
+            _con.print(f"\n[ok]{ok} passed[/ok], [warn]{warn_count} warnings[/warn], [fail]{fail_count} failures[/fail]")
         return 0 if all(c["status"] != "FAIL" for c in checks) else 1
     if args.func == "status":
         dsn = _get_dsn(args)
@@ -1362,7 +1812,31 @@ def main(argv: list[str] | None = None) -> int:
         cfg = asyncio.run(cli_api.config_rows(dsn, wait_seconds=args.wait_seconds))
         if not args.no_redact:
             cfg = _redact_config(cfg)
-        sys.stdout.write(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+        if args.json:
+            sys.stdout.write(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+        else:
+            from apps.cli_theme import console as _con, make_table as _mt
+            # Group by key prefix
+            groups: dict[str, list[tuple[str, str]]] = {}
+            for key in sorted(cfg.keys()):
+                prefix = key.split(".")[0] if "." in key else key
+                val = cfg[key]
+                display = json.dumps(val) if not isinstance(val, str) else val
+                groups.setdefault(prefix, []).append((key, display))
+            table = _mt(
+                ("Key", {"style": "key"}),
+                "Value",
+                title="Configuration",
+            )
+            first_group = True
+            for prefix, items in groups.items():
+                if not first_group:
+                    table.add_section()
+                first_group = False
+                for key, val in items:
+                    display_val = f"[dim]{val}[/dim]" if val == '***' or val == '"***"' else val
+                    table.add_row(key, display_val)
+            _con.print(table)
         return 0
     if args.func == "config_validate":
         dsn = _get_dsn(args)
@@ -1430,6 +1904,45 @@ def main(argv: list[str] | None = None) -> int:
     if args.func == "channels_setup":
         dsn = _get_dsn(args)
         return asyncio.run(_channels_setup(dsn, args.channel_type))
+
+    # Recall command
+    if args.func == "recall":
+        dsn = _get_dsn(args)
+        return asyncio.run(_recall(dsn, args.query, args.limit, args.memory_type, args.json))
+
+    # Goals commands
+    if args.func == "goals":
+        _print_err("Usage: hexis goals {list|create|update|complete}")
+        return 1
+    if args.func == "goals_list":
+        dsn = _get_dsn(args)
+        return asyncio.run(_goals_list(dsn, args.priority, args.json))
+    if args.func == "goals_create":
+        dsn = _get_dsn(args)
+        return asyncio.run(_goals_create(dsn, args.title, args.description, args.priority, args.source))
+    if args.func == "goals_update":
+        dsn = _get_dsn(args)
+        return asyncio.run(_goals_update(dsn, args.goal_id, args.priority, args.reason))
+    if args.func == "goals_complete":
+        dsn = _get_dsn(args)
+        return asyncio.run(_goals_update(dsn, args.goal_id, "completed", args.reason))
+
+    # Schedule commands
+    if args.func == "schedule":
+        _print_err("Usage: hexis schedule {list|create|delete}")
+        return 1
+    if args.func == "schedule_list":
+        dsn = _get_dsn(args)
+        return asyncio.run(_schedule_list(dsn, args.status, args.json))
+    if args.func == "schedule_create":
+        dsn = _get_dsn(args)
+        return asyncio.run(_schedule_create(
+            dsn, args.name, args.kind, args.action,
+            args.payload, args.schedule, args.timezone, args.description,
+        ))
+    if args.func == "schedule_delete":
+        dsn = _get_dsn(args)
+        return asyncio.run(_schedule_delete(dsn, args.task_id, args.force))
 
     _print_err("Unknown command")
     return 2
