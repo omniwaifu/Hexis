@@ -232,6 +232,15 @@ def build_parser() -> argparse.ArgumentParser:
     web.add_argument("--port", type=int, default=3478, help="Port (default: 3478)")
     web.set_defaults(func="web")
 
+    ui = sub.add_parser("ui", help="Start the web dashboard")
+    ui.add_argument("--no-open", action="store_true", help="Don't open browser automatically")
+    ui.add_argument("--port", type=int, default=3477, help="Port (default: 3477)")
+    ui.set_defaults(func="ui")
+
+    open_cmd = sub.add_parser("open", help="Open the web dashboard in your browser")
+    open_cmd.add_argument("--port", type=int, default=3477, help="Port (default: 3477)")
+    open_cmd.set_defaults(func="open")
+
     start = sub.add_parser("start", help="Start workers")
     start.set_defaults(func="start")
 
@@ -1641,6 +1650,69 @@ async def _schedule_delete(dsn: str, task_id: str, force: bool) -> int:
         await pool.close()
 
 
+def _handle_ui(stack_root: Path, port: int, no_open: bool) -> int:
+    """Start the Next.js web dashboard."""
+    import threading
+    import time
+    import webbrowser
+
+    ui_dir = stack_root / "hexis-ui"
+    if not ui_dir.is_dir():
+        _print_err(f"hexis-ui directory not found at {ui_dir}")
+        return 1
+
+    # Detect package manager
+    runner = shutil.which("bun")
+    pkg_cmd = "bun"
+    if not runner:
+        runner = shutil.which("npm")
+        pkg_cmd = "npm"
+    if not runner:
+        _print_err("Neither bun nor npm found on PATH. Install one of them first.")
+        return 1
+
+    # Install deps if needed
+    if not (ui_dir / "node_modules").is_dir():
+        from apps.cli_theme import console
+        console.print(f"[accent]Installing dependencies with {pkg_cmd}...[/accent]")
+        rc = subprocess.run([runner, "install"], cwd=ui_dir).returncode
+        if rc != 0:
+            _print_err(f"{pkg_cmd} install failed (exit {rc})")
+            return 1
+
+    # Ensure .env.local has DATABASE_URL
+    env_local = ui_dir / ".env.local"
+    dsn = db_dsn_from_env()
+    existing_env = env_local.read_text() if env_local.exists() else ""
+    if "DATABASE_URL" not in existing_env:
+        with open(env_local, "a") as f:
+            f.write(f"\nDATABASE_URL={dsn}\n")
+
+    from apps.cli_theme import console
+    console.print(f"\n[accent]Starting web dashboard on port {port}...[/accent]")
+
+    # Open browser after a short delay
+    if not no_open:
+        def _open_browser():
+            time.sleep(3)
+            webbrowser.open(f"http://localhost:{port}")
+        t = threading.Thread(target=_open_browser, daemon=True)
+        t.start()
+
+    # Run dev server in foreground
+    if pkg_cmd == "bun":
+        dev_cmd = [runner, "run", "dev", "--port", str(port)]
+    else:
+        npx = shutil.which("npx") or "npx"
+        dev_cmd = [npx, "next", "dev", "-p", str(port)]
+
+    try:
+        result = subprocess.run(dev_cmd, cwd=ui_dir)
+        return result.returncode
+    except KeyboardInterrupt:
+        return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     args = build_parser().parse_args(argv)
@@ -1697,7 +1769,15 @@ def main(argv: list[str] | None = None) -> int:
         up_args = ["up", "-d"]
         if args.build:
             up_args.append("--build")
-        return run_compose(compose_cmd or [], compose_file, stack_root, up_args, env_file)
+        rc = run_compose(compose_cmd or [], compose_file, stack_root, up_args, env_file)
+        if rc == 0:
+            from apps.cli_theme import console
+            console.print("\n[ok]Stack is starting.[/ok]\n")
+            console.print("  [accent]hexis ui[/accent]     Open the web dashboard")
+            console.print("  [accent]hexis chat[/accent]   Chat in the terminal")
+            console.print("  [accent]hexis init[/accent]   Configure the agent")
+            console.print()
+        return rc
     if args.func == "down":
         return run_compose(compose_cmd or [], compose_file, stack_root, ["down"], env_file)
     if args.func == "ps":
@@ -1718,6 +1798,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.func == "web":
         web_argv = ["--host", args.host, "--port", str(args.port)]
         return _run_module("apps.hexis_web", web_argv)
+    if args.func == "ui":
+        return _handle_ui(stack_root, args.port, args.no_open)
+    if args.func == "open":
+        import webbrowser
+        webbrowser.open(f"http://localhost:{args.port}")
+        return 0
     if args.func == "start":
         return run_compose(
             compose_cmd or [],

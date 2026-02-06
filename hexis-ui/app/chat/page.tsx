@@ -203,8 +203,7 @@ export default function ChatPage() {
     setCurrentPhase(null);
 
     try {
-      const apiBase = process.env.NEXT_PUBLIC_HEXIS_API_URL || "";
-      const res = await fetch(`${apiBase}/api/chat`, {
+      const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
