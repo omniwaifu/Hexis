@@ -24,35 +24,39 @@ This is both an engineering project and a philosophical experiment. For the phil
 
 ## Quick Start
 
-Get a running agent in under 5 minutes. You need [Docker Desktop](https://docs.docker.com/get-docker/), [Ollama](https://ollama.com/download), and Python 3.10+.
+Get a running agent in 3 commands. You need [Docker Desktop](https://docs.docker.com/get-docker/), [Ollama](https://ollama.com/download), and Python 3.10+.
 
 ```bash
-# 1. Install Hexis and pull the embedding model
 pip install hexis
-ollama pull embeddinggemma:300m-qat-q4_0
-
-# 2. Create a project directory
-mkdir my-agent && cd my-agent
-
-# 3. Add your LLM API key
-cat > .env <<'EOF'
-ANTHROPIC_API_KEY=sk-ant-...
-EOF
-
-# 4. Start the stack
-hexis up
-
-# 5. Open the web UI
-hexis ui
+hexis init --character hexis --api-key sk-ant-...
+hexis chat
 ```
 
-The init wizard walks you through setup. The fastest path: **Models** (pick your LLM) -> **Character** (select **Hexis**) -> **Consent** -> done. The Hexis character is a philosophical, curious agent designed to explore its own nature -- a good default for seeing what the system can do.
+`hexis init` auto-detects your provider from the key prefix, writes the `.env`, starts Docker, pulls the embedding model, configures the Hexis character, and runs consent -- all in one command.
+
+**Other providers:**
 
 ```bash
-# 6. Chat with your agent
-hexis chat
+# OpenAI
+hexis init --character jarvis --api-key sk-...
 
-# 7. Enable the autonomous heartbeat (optional)
+# Ollama (fully local, no API key needed)
+hexis init --provider ollama --model llama3.1 --character hexis
+
+# Explicit provider + model
+hexis init --provider anthropic --model claude-sonnet-4-20250514 --api-key sk-ant-...
+
+# Express defaults (no character card)
+hexis init --api-key sk-ant-...
+
+# Skip Docker/Ollama automation (useful if stack is already running)
+hexis init --api-key sk-ant-... --no-docker --no-pull
+```
+
+The interactive wizard is still available -- just run `hexis init` with no flags for the full 3-tier flow (Express, Character, Custom).
+
+```bash
+# Enable the autonomous heartbeat (optional)
 hexis up --profile active
 ```
 

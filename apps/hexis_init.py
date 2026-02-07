@@ -1,6 +1,9 @@
 """Hexis init wizard — 3-tier flow: Express, Character, Custom.
 
 Flow: [LLM Config] → [Choose Path] → [Express | Character | Custom] → [Consent] → [Done]
+
+Non-interactive mode: pass --api-key (and optionally --character, --provider, --model)
+to skip the wizard and configure everything from CLI flags.
 """
 from __future__ import annotations
 
@@ -8,8 +11,11 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
+import subprocess
 import sys
 from getpass import getpass
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -19,6 +25,249 @@ from core.init_api import get_card_summary, load_character_cards
 from core.llm import normalize_llm_config
 
 from apps.cli_theme import console, err_console, heading, make_panel, make_table
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive helpers
+# ---------------------------------------------------------------------------
+
+_DEFAULT_MODELS: dict[str, str] = {
+    "anthropic": "claude-sonnet-4-20250514",
+    "openai": "gpt-4o",
+    "grok": "grok-3",
+    "gemini": "gemini-2.5-flash",
+    "ollama": "llama3.1",
+}
+
+_PROVIDER_ENV_VARS: dict[str, str] = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "grok": "XAI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "ollama": "",
+}
+
+
+def detect_provider(api_key: str) -> str:
+    """Auto-detect LLM provider from API key prefix."""
+    if api_key.startswith("sk-ant-"):
+        return "anthropic"
+    if api_key.startswith("sk-"):
+        return "openai"
+    if api_key.startswith("gsk_"):
+        return "grok"
+    if api_key.startswith("AIza"):
+        return "gemini"
+    raise ValueError(
+        f"Cannot detect provider from key prefix '{api_key[:6]}...'. Use --provider."
+    )
+
+
+def _write_env_var(env_path: Path, key: str, value: str) -> None:
+    """Upsert a KEY=value line in a .env file."""
+    lines: list[str] = []
+    replaced = False
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith(f"{key}=") or stripped.startswith(f"{key} ="):
+                lines.append(f"{key}={value}")
+                replaced = True
+            else:
+                lines.append(line)
+    if not replaced:
+        lines.append(f"{key}={value}")
+    # Ensure trailing newline
+    env_path.write_text("\n".join(lines) + "\n")
+
+
+def _ensure_stack_running(args: argparse.Namespace) -> Path:
+    """Start Docker stack if needed. Returns stack_root."""
+    from apps.hexis_cli import (
+        _find_compose_file,
+        _stack_root_from_compose,
+        ensure_compose,
+        ensure_docker,
+        resolve_env_file,
+        run_compose,
+        _run_compose_capture,
+    )
+
+    compose_file, is_source = _find_compose_file()
+    if compose_file is None:
+        err_console.print("[fail]Cannot find docker-compose.yml. Is Hexis installed?[/fail]")
+        raise SystemExit(1)
+
+    stack_root = _stack_root_from_compose(compose_file)
+    docker_bin = ensure_docker()
+    compose_cmd = ensure_compose(docker_bin)
+    env_file = resolve_env_file(stack_root)
+
+    # Check if db service is already running
+    rc, out = _run_compose_capture(compose_cmd, compose_file, stack_root, ["ps", "--services", "--filter", "status=running"], env_file)
+    if rc == 0 and "db" in out.split():
+        console.print("[ok]\u2714[/ok] Docker stack already running")
+        return stack_root
+
+    console.print("[muted]Starting Docker stack...[/muted]")
+    if not is_source:
+        # pip install path: pull images first
+        run_compose(compose_cmd, compose_file, stack_root, ["pull"], env_file)
+    rc = run_compose(compose_cmd, compose_file, stack_root, ["up", "-d"], env_file)
+    if rc != 0:
+        err_console.print("[fail]Failed to start Docker stack.[/fail]")
+        raise SystemExit(1)
+
+    console.print("[ok]\u2714[/ok] Docker stack started")
+    return stack_root
+
+
+def _ensure_embedding_model() -> None:
+    """Pull the default Ollama embedding model if not present."""
+    model = "embeddinggemma:300m-qat-q4_0"
+    ollama_bin = shutil.which("ollama")
+    if not ollama_bin:
+        console.print(
+            "[warn]\u26a0[/warn] Ollama not found. Install from https://ollama.com/download "
+            f"and run: ollama pull {model}"
+        )
+        return
+
+    try:
+        result = subprocess.run(
+            [ollama_bin, "list"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if model.split(":")[0] in result.stdout:
+            console.print(f"[ok]\u2714[/ok] Embedding model [bold]{model}[/bold] present")
+            return
+    except Exception:
+        pass
+
+    console.print(f"[muted]Pulling embedding model {model}...[/muted]")
+    try:
+        subprocess.run(
+            [ollama_bin, "pull", model],
+            timeout=600,
+        )
+        console.print(f"[ok]\u2714[/ok] Embedding model pulled")
+    except subprocess.TimeoutExpired:
+        console.print(f"[warn]\u26a0[/warn] Ollama pull timed out. Run manually: ollama pull {model}")
+    except Exception as exc:
+        console.print(f"[warn]\u26a0[/warn] Ollama pull failed: {exc}. Run manually: ollama pull {model}")
+
+
+async def _run_init_noninteractive(args: argparse.Namespace) -> int:
+    """Non-interactive init: configure from CLI flags, start stack, apply config."""
+    # 1. Detect provider
+    provider = args.provider
+    if not provider:
+        if args.api_key:
+            provider = detect_provider(args.api_key)
+        else:
+            provider = "ollama"
+
+    if provider != "ollama" and not args.api_key:
+        err_console.print(f"[fail]--api-key required for provider '{provider}'[/fail]")
+        return 1
+
+    # 2. Resolve model
+    model = args.model or _DEFAULT_MODELS.get(provider, "gpt-4o")
+    api_key_env = _PROVIDER_ENV_VARS.get(provider, "")
+
+    console.print(make_panel(
+        f"[key]Provider:[/key] {provider}\n"
+        f"[key]Model:[/key]    {model}",
+        title="Non-Interactive Init",
+    ))
+
+    # 3. Write API key to .env + set os.environ
+    if args.api_key and api_key_env:
+        from apps.hexis_cli import _find_compose_file, _stack_root_from_compose, resolve_env_file
+        compose_file, _ = _find_compose_file()
+        if compose_file:
+            stack_root = _stack_root_from_compose(compose_file)
+        else:
+            stack_root = Path.cwd()
+        env_path = resolve_env_file(stack_root) or (stack_root / ".env")
+        _write_env_var(env_path, api_key_env, args.api_key)
+        os.environ[api_key_env] = args.api_key
+        console.print(f"[ok]\u2714[/ok] API key written to {env_path.name}")
+        # Re-load dotenv so downstream code picks it up
+        load_dotenv(env_path, override=True)
+
+    # 4. Start Docker if needed
+    if not args.no_docker:
+        _ensure_stack_running(args)
+
+    # 5. Pull embedding model if needed
+    if not args.no_pull:
+        _ensure_embedding_model()
+
+    # 6. Connect to DB
+    dsn = args.dsn or agent_api.db_dsn_from_env()
+    wait_seconds = args.wait_seconds
+    console.print("[muted]Connecting to database...[/muted]")
+    await agent_api.ensure_schema_has_config(dsn, wait_seconds=wait_seconds)
+    conn = await agent_api._connect_with_retry(dsn, wait_seconds=wait_seconds)
+
+    try:
+        # 7. Save LLM config
+        heartbeat_config = {
+            "provider": provider,
+            "model": model,
+            "endpoint": "",
+            "api_key_env": api_key_env,
+        }
+        subconscious_config = heartbeat_config.copy()
+
+        await conn.fetchval(
+            "SELECT init_llm_config($1::jsonb, $2::jsonb)",
+            json.dumps(heartbeat_config),
+            json.dumps(subconscious_config),
+        )
+        await conn.execute("SELECT set_config('llm.heartbeat', $1::jsonb)", json.dumps(heartbeat_config))
+        await conn.execute("SELECT set_config('llm.chat', $1::jsonb)", json.dumps(heartbeat_config))
+        await conn.execute("SELECT set_config('llm.subconscious', $1::jsonb)", json.dumps(subconscious_config))
+        console.print(f"[ok]\u2714[/ok] LLM config saved: [bold]{provider}/{model}[/bold]")
+
+        # 8. Apply character or express defaults
+        user_name = args.name or "User"
+        if args.character:
+            cards = load_character_cards()
+            match = [c for c in cards if c["filename"].replace(".json", "") == args.character]
+            if not match:
+                available = ", ".join(c["filename"].replace(".json", "") for c in cards)
+                err_console.print(f"[fail]Character '{args.character}' not found. Available: {available}[/fail]")
+                return 1
+            chosen = match[0]
+            hexis_ext = chosen["extensions_hexis"]
+            await conn.fetchval(
+                "SELECT init_from_character_card($1::jsonb, $2)",
+                json.dumps(hexis_ext),
+                user_name,
+            )
+            console.print(f"[ok]\u2714[/ok] Character [bold]{chosen['name']}[/bold] applied")
+        else:
+            await conn.fetchval("SELECT init_with_defaults($1)", user_name)
+            console.print("[ok]\u2714[/ok] Express defaults applied")
+
+        # 9. Consent
+        llm_config = normalize_llm_config(heartbeat_config)
+        consented = await _run_consent(conn, llm_config)
+        if not consented:
+            return 1
+
+        # 10. Done
+        raw = await conn.fetchval("SELECT get_init_profile()")
+        profile = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        agent_name = profile.get("agent", {}).get("name", "Hexis")
+
+        console.print(f"\n[ok]\u2714[/ok] [bold]{agent_name}[/bold] is ready. Run [accent]hexis chat[/accent] to say hello.")
+        return 0
+
+    finally:
+        await conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +807,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--dsn", default=None, help="Postgres DSN; defaults to POSTGRES_* env vars")
     p.add_argument("--wait-seconds", type=int, default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+
+    # Non-interactive mode flags (any of --api-key, --provider, --character triggers it)
+    p.add_argument("--api-key", default=None,
+                    help="API key (auto-detects provider; triggers non-interactive mode)")
+    p.add_argument("--provider", default=None,
+                    help="LLM provider (auto-detected from --api-key if omitted)")
+    p.add_argument("--model", default=None,
+                    help="LLM model (defaults per provider)")
+    p.add_argument("--character", default=None,
+                    help="Character card name (e.g. 'hexis', 'jarvis'). Omit for express defaults")
+    p.add_argument("--name", default=None,
+                    help="What the agent should call you (default: 'User')")
+    p.add_argument("--no-docker", action="store_true", default=False,
+                    help="Skip Docker auto-start")
+    p.add_argument("--no-pull", action="store_true", default=False,
+                    help="Skip Ollama embedding model pull")
     return p
 
 
@@ -565,6 +830,18 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     args = build_parser().parse_args(argv)
 
+    # Non-interactive mode if any of these flags are present
+    if args.api_key or args.provider or args.character:
+        try:
+            return asyncio.run(_run_init_noninteractive(args))
+        except KeyboardInterrupt:
+            err_console.print("\n[warn]Cancelled.[/warn]")
+            return 130
+        except Exception as e:
+            err_console.print(f"[fail]init failed: {e}[/fail]")
+            return 1
+
+    # Interactive mode (original flow)
     if args.dsn:
         dsn = args.dsn
     else:
