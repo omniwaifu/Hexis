@@ -1,5 +1,5 @@
 """
-Tests for the Hexis Web API server (apps/hexis_web.py).
+Tests for the Hexis API server (apps/hexis_api.py).
 
 Uses httpx.AsyncClient with the FastAPI app directly (no server needed).
 """
@@ -11,8 +11,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-import apps.hexis_web as web_module
-from apps.hexis_web import app
+import apps.hexis_api as web_module
+from apps.hexis_api import app
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session")]
 
@@ -79,7 +79,7 @@ async def test_chat_returns_sse_stream(client):
     async def mock_connect(*args, **kwargs):
         yield mock_mem
 
-    with patch("apps.hexis_web.CognitiveMemory.connect", side_effect=mock_connect):
+    with patch("apps.hexis_api.CognitiveMemory.connect", side_effect=mock_connect):
         with patch("core.agent_loop.stream_chat_completion", new_callable=AsyncMock) as mock_stream:
             mock_stream.return_value = mock_response
             with patch("core.agent_loop.chat_completion", new_callable=AsyncMock) as mock_chat:

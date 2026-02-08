@@ -54,6 +54,27 @@ class ChannelManager:
         self._adapters[ctype] = adapter
         logger.info("Registered channel adapter: %s", ctype)
 
+    async def ensure_started(self, adapter: ChannelAdapter) -> bool:
+        """
+        Register and start an adapter if it isn't already registered.
+
+        Returns:
+            True if the adapter was newly registered (and started if the manager
+            is running), False if it already existed.
+        """
+        ctype = adapter.channel_type
+        if ctype in self._adapters:
+            return False
+
+        self.register(adapter)
+
+        # If the manager has already been started, ensure the new adapter
+        # launches immediately.
+        if self._running:
+            await self._start_adapter(ctype, adapter)
+
+        return True
+
     async def start_all(self) -> None:
         """Start all registered adapters."""
         self._running = True

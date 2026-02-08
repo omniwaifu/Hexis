@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import signal
+from typing import Any
 
 import asyncpg
 from dotenv import load_dotenv
@@ -30,6 +31,17 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("channel_worker")
+
+CHANNEL_CONFIG_POLL_INTERVAL_S = float(os.getenv("HEXIS_CHANNEL_CONFIG_POLL_INTERVAL_S", "15"))
+SUPPORTED_CHANNEL_TYPES = [
+    "discord",
+    "telegram",
+    "slack",
+    "signal",
+    "whatsapp",
+    "imessage",
+    "matrix",
+]
 
 
 async def _load_channel_config(conn: asyncpg.Connection, channel_type: str) -> dict:
@@ -53,6 +65,196 @@ async def _load_channel_config(conn: asyncpg.Connection, channel_type: str) -> d
     return config
 
 
+def _wanted_channel_types(channels: list[str] | None) -> list[str]:
+    if channels is None:
+        return list(SUPPORTED_CHANNEL_TYPES)
+
+    # Preserve CLI ordering but dedupe.
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in channels:
+        if c in SUPPORTED_CHANNEL_TYPES and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _env_or_config_present(config: dict[str, Any], key: str, env_name: str) -> bool:
+    # Some adapters store the env var NAME in config (not the value).
+    return bool(config.get(key)) or bool(os.getenv(env_name))
+
+
+def _is_configured_discord(config: dict[str, Any]) -> bool:
+    try:
+        from channels.discord_adapter import _resolve_token
+
+        return bool(_resolve_token(config))
+    except Exception:
+        # If resolution logic changes, fall back to a conservative check.
+        return _env_or_config_present(config, "bot_token", "DISCORD_BOT_TOKEN")
+
+
+def _is_configured_telegram(config: dict[str, Any]) -> bool:
+    try:
+        from channels.telegram_adapter import _resolve_token
+
+        return bool(_resolve_token(config))
+    except Exception:
+        return _env_or_config_present(config, "bot_token", "TELEGRAM_BOT_TOKEN")
+
+
+def _is_configured_slack(config: dict[str, Any]) -> bool:
+    try:
+        from channels.slack_adapter import _resolve_token
+
+        return bool(_resolve_token(config, "bot_token", "SLACK_BOT_TOKEN"))
+    except Exception:
+        return _env_or_config_present(config, "bot_token", "SLACK_BOT_TOKEN")
+
+
+def _is_configured_signal(config: dict[str, Any]) -> bool:
+    try:
+        from channels.signal_adapter import _resolve_token
+
+        return bool(_resolve_token(config))
+    except Exception:
+        return _env_or_config_present(config, "phone_number", "SIGNAL_PHONE_NUMBER")
+
+
+def _is_configured_whatsapp(config: dict[str, Any]) -> bool:
+    try:
+        from channels.whatsapp_adapter import _resolve_token
+
+        access_token = _resolve_token(config, "access_token", "WHATSAPP_ACCESS_TOKEN")
+    except Exception:
+        access_token = os.getenv("WHATSAPP_ACCESS_TOKEN") or config.get("access_token")
+
+    phone_number_id = str(config.get("phone_number_id") or os.getenv("WHATSAPP_PHONE_NUMBER_ID") or "")
+    return bool(access_token) and bool(phone_number_id)
+
+
+def _is_configured_imessage(config: dict[str, Any]) -> bool:
+    try:
+        from channels.imessage_adapter import _resolve_config
+
+        return bool(_resolve_config(config, "password", "IMESSAGE_PASSWORD"))
+    except Exception:
+        return _env_or_config_present(config, "password", "IMESSAGE_PASSWORD")
+
+
+def _is_configured_matrix(config: dict[str, Any]) -> bool:
+    homeserver = str(config.get("homeserver") or os.getenv("MATRIX_HOMESERVER") or "")
+    user_id = str(config.get("user_id") or os.getenv("MATRIX_USER_ID") or "")
+    if not homeserver or not user_id:
+        return False
+
+    try:
+        from channels.matrix_adapter import _resolve_token
+
+        return bool(_resolve_token(config, "access_token", "MATRIX_ACCESS_TOKEN"))
+    except Exception:
+        return _env_or_config_present(config, "access_token", "MATRIX_ACCESS_TOKEN")
+
+
+def _is_channel_configured(channel_type: str, config: dict[str, Any]) -> bool:
+    if channel_type == "discord":
+        return _is_configured_discord(config)
+    if channel_type == "telegram":
+        return _is_configured_telegram(config)
+    if channel_type == "slack":
+        return _is_configured_slack(config)
+    if channel_type == "signal":
+        return _is_configured_signal(config)
+    if channel_type == "whatsapp":
+        return _is_configured_whatsapp(config)
+    if channel_type == "imessage":
+        return _is_configured_imessage(config)
+    if channel_type == "matrix":
+        return _is_configured_matrix(config)
+    return False
+
+
+async def _ensure_configured_adapters_running(manager, conn: asyncpg.Connection, channels: list[str] | None) -> int:
+    """
+    Detect newly-configured channels and start their adapters.
+
+    This only starts adapters when required credentials appear resolvable
+    (token/password/etc) to avoid crash/restart loops.
+    """
+    started = 0
+
+    for channel_type in _wanted_channel_types(channels):
+        if channel_type in manager.adapters:
+            continue
+
+        config = await _load_channel_config(conn, channel_type)
+        if not _is_channel_configured(channel_type, config):
+            continue
+
+        try:
+            if channel_type == "discord":
+                try:
+                    from channels.discord_adapter import DiscordAdapter
+
+                    adapter = DiscordAdapter(config)
+                except ImportError:
+                    logger.warning("discord.py not installed, skipping Discord channel")
+                    continue
+
+            elif channel_type == "telegram":
+                try:
+                    from channels.telegram_adapter import TelegramAdapter
+
+                    adapter = TelegramAdapter(config)
+                except ImportError:
+                    logger.warning("python-telegram-bot not installed, skipping Telegram channel")
+                    continue
+
+            elif channel_type == "slack":
+                try:
+                    from channels.slack_adapter import SlackAdapter
+
+                    adapter = SlackAdapter(config)
+                except ImportError:
+                    logger.warning("slack-bolt not installed, skipping Slack channel")
+                    continue
+
+            elif channel_type == "signal":
+                from channels.signal_adapter import SignalAdapter
+
+                adapter = SignalAdapter(config)
+
+            elif channel_type == "whatsapp":
+                from channels.whatsapp_adapter import WhatsAppAdapter
+
+                adapter = WhatsAppAdapter(config)
+
+            elif channel_type == "imessage":
+                from channels.imessage_adapter import IMessageAdapter
+
+                adapter = IMessageAdapter(config)
+
+            elif channel_type == "matrix":
+                try:
+                    from channels.matrix_adapter import MatrixAdapter
+
+                    adapter = MatrixAdapter(config)
+                except ImportError:
+                    logger.warning("matrix-nio not installed, skipping Matrix channel")
+                    continue
+
+            else:
+                continue
+
+            if await manager.ensure_started(adapter):
+                started += 1
+
+        except Exception:
+            logger.exception("Failed to start channel adapter: %s", channel_type)
+
+    return started
+
+
 async def run_channel_worker(
     channels: list[str] | None = None,
     instance: str | None = None,
@@ -72,103 +274,16 @@ async def run_channel_worker(
 
     manager = ChannelManager(pool)
 
-    # Load and register configured channels
+    # Initial config scan (may find zero channels).
     async with pool.acquire() as conn:
-        # Check if agent is configured
-        is_ready = await conn.fetchval("SELECT is_agent_configured() AND is_init_complete()")
-        if not is_ready:
-            logger.warning("Agent not configured. Run 'hexis init' first.")
+        try:
+            is_ready = await conn.fetchval("SELECT is_agent_configured() AND is_init_complete()")
+            if not is_ready:
+                logger.warning("Agent not configured. Run 'hexis init' first.")
+        except Exception:
+            logger.warning("Failed to check agent readiness", exc_info=True)
 
-        # Discord
-        if channels is None or "discord" in channels:
-            discord_config = await _load_channel_config(conn, "discord")
-            if discord_config.get("bot_token") or os.getenv("DISCORD_BOT_TOKEN"):
-                try:
-                    from channels.discord_adapter import DiscordAdapter
-                    adapter = DiscordAdapter(discord_config)
-                    manager.register(adapter)
-                except ImportError:
-                    logger.warning("discord.py not installed, skipping Discord channel")
-            else:
-                logger.info("Discord not configured (no bot_token), skipping")
-
-        # Telegram
-        if channels is None or "telegram" in channels:
-            telegram_config = await _load_channel_config(conn, "telegram")
-            if telegram_config.get("bot_token") or os.getenv("TELEGRAM_BOT_TOKEN"):
-                try:
-                    from channels.telegram_adapter import TelegramAdapter
-                    adapter = TelegramAdapter(telegram_config)
-                    manager.register(adapter)
-                except ImportError:
-                    logger.warning("python-telegram-bot not installed, skipping Telegram channel")
-            else:
-                logger.info("Telegram not configured (no bot_token), skipping")
-
-        # Slack
-        if channels is None or "slack" in channels:
-            slack_config = await _load_channel_config(conn, "slack")
-            if slack_config.get("bot_token") or os.getenv("SLACK_BOT_TOKEN"):
-                try:
-                    from channels.slack_adapter import SlackAdapter
-                    adapter = SlackAdapter(slack_config)
-                    manager.register(adapter)
-                except ImportError:
-                    logger.warning("slack-bolt not installed, skipping Slack channel")
-            else:
-                logger.info("Slack not configured (no bot_token), skipping")
-
-        # Signal
-        if channels is None or "signal" in channels:
-            signal_config = await _load_channel_config(conn, "signal")
-            if signal_config.get("phone_number") or os.getenv("SIGNAL_PHONE_NUMBER"):
-                from channels.signal_adapter import SignalAdapter
-                adapter = SignalAdapter(signal_config)
-                manager.register(adapter)
-            else:
-                logger.info("Signal not configured (no phone_number), skipping")
-
-        # WhatsApp
-        if channels is None or "whatsapp" in channels:
-            whatsapp_config = await _load_channel_config(conn, "whatsapp")
-            if whatsapp_config.get("access_token") or os.getenv("WHATSAPP_ACCESS_TOKEN"):
-                from channels.whatsapp_adapter import WhatsAppAdapter
-                adapter = WhatsAppAdapter(whatsapp_config)
-                manager.register(adapter)
-            else:
-                logger.info("WhatsApp not configured (no access_token), skipping")
-
-        # iMessage (via BlueBubbles)
-        if channels is None or "imessage" in channels:
-            imessage_config = await _load_channel_config(conn, "imessage")
-            if imessage_config.get("password") or os.getenv("IMESSAGE_PASSWORD"):
-                from channels.imessage_adapter import IMessageAdapter
-                adapter = IMessageAdapter(imessage_config)
-                manager.register(adapter)
-            else:
-                logger.info("iMessage not configured (no BlueBubbles password), skipping")
-
-        # Matrix
-        if channels is None or "matrix" in channels:
-            matrix_config = await _load_channel_config(conn, "matrix")
-            if matrix_config.get("access_token") or os.getenv("MATRIX_ACCESS_TOKEN"):
-                try:
-                    from channels.matrix_adapter import MatrixAdapter
-                    adapter = MatrixAdapter(matrix_config)
-                    manager.register(adapter)
-                except ImportError:
-                    logger.warning("matrix-nio not installed, skipping Matrix channel")
-            else:
-                logger.info("Matrix not configured (no access_token), skipping")
-
-    if not manager.adapters:
-        logger.error(
-            "No channels configured. Set environment variables for your channel "
-            "(e.g. DISCORD_BOT_TOKEN, SLACK_BOT_TOKEN, TELEGRAM_BOT_TOKEN) "
-            "or configure channel.* keys in the database."
-        )
-        await pool.close()
-        return
+        await _ensure_configured_adapters_running(manager, conn, channels)
 
     # Set up graceful shutdown
     stop_event = asyncio.Event()
@@ -180,7 +295,7 @@ async def run_channel_worker(
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
 
-    # Start all adapters
+    # Mark the manager as running and start any adapters we found.
     logger.info("Starting %d channel adapter(s)...", len(manager.adapters))
     await manager.start_all()
 
@@ -198,11 +313,42 @@ async def run_channel_worker(
     except Exception:
         logger.warning("Failed to start outbox consumer", exc_info=True)
 
+    if not manager.adapters:
+        logger.info(
+            "No channels configured. Staying idle and polling DB config every %.0fs "
+            "for channel.* settings.",
+            CHANNEL_CONFIG_POLL_INTERVAL_S,
+        )
+
+    async def _config_watch_loop() -> None:
+        while not stop_event.is_set():
+            try:
+                async with pool.acquire() as conn:
+                    started = await _ensure_configured_adapters_running(manager, conn, channels)
+                    if started:
+                        logger.info("Detected new channel config; started %d adapter(s)", started)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Channel config refresh failed")
+
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=CHANNEL_CONFIG_POLL_INTERVAL_S)
+            except asyncio.TimeoutError:
+                pass
+
+    config_task = asyncio.create_task(_config_watch_loop(), name="channel-config-watcher")
+
     # Wait for shutdown signal
     await stop_event.wait()
 
     # Graceful shutdown
     logger.info("Stopping channel adapters...")
+    config_task.cancel()
+    try:
+        await config_task
+    except asyncio.CancelledError:
+        pass
     if outbox_consumer:
         await outbox_consumer.stop()
     if outbox_task:

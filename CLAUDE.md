@@ -38,7 +38,7 @@ hexis/
 ├── apps/
 │   ├── hexis_cli.py          # CLI entrypoint (hexis ...)
 │   ├── hexis_init.py         # Interactive init wizard
-│   ├── hexis_web.py          # FastAPI web server (SSE chat)
+│   ├── hexis_api.py          # FastAPI API server (SSE chat)
 │   ├── hexis_mcp_server.py   # MCP tools server for LLMs
 │   └── worker.py             # Heartbeat + maintenance workers
 ├── channels/               # Multi-platform messaging adapters
@@ -66,7 +66,7 @@ hexis/
 | `services/worker_service.py` | Stateless workers: `HeartbeatWorker` (conscious loop) + `MaintenanceWorker` (subconscious upkeep) |
 | `apps/hexis_mcp_server.py` | Exposes memory operations as MCP tools for LLM integration |
 | `apps/hexis_cli.py` | CLI commands: `up`, `down`, `init`, `chat`, `ui`, `open`, `ingest`, `mcp` |
-| `apps/hexis_web.py` | FastAPI server with SSE chat streaming |
+| `apps/hexis_api.py` | FastAPI server with SSE chat streaming |
 
 ## Memory Architecture
 
@@ -233,7 +233,7 @@ Default port mappings (all on `127.0.0.1`):
 
 ```
 hexis_brain:       43815 -> 5432   (Postgres)
-hexis_web:         43817 -> 43817  (FastAPI SSE)
+hexis_api:         43817 -> 43817  (FastAPI SSE)
 hexis_ui:          3477  -> 3477   (Next.js dashboard)
 hexis_rabbitmq:    45672 -> 5672   (AMQP)
 hexis_rabbitmq:    45673 -> 15672  (RabbitMQ management)

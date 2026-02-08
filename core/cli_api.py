@@ -156,7 +156,16 @@ async def config_validate(dsn: str | None = None, *, wait_seconds: int = 30) -> 
             if not model and provider not in {"ollama"}:
                 warnings.append(f"{name}.model is empty (will rely on worker defaults)")
 
-            if provider in {"openai", "anthropic", "openai_compatible"}:
+            if provider == "openai-codex":
+                oauth = cfg.get("oauth.openai_codex")
+                if not isinstance(oauth, dict) or not oauth.get("refresh") or not oauth.get("access"):
+                    errors.append(
+                        "OpenAI Codex OAuth is not configured (missing oauth.openai_codex). "
+                        "Run: `hexis auth openai-codex login`"
+                    )
+                return
+
+            if provider in {"openai", "anthropic", "openai_compatible", "grok", "gemini"}:
                 if api_key_env:
                     if os.getenv(api_key_env) is None:
                         errors.append(f"{name}.api_key_env={api_key_env} is not set in environment")

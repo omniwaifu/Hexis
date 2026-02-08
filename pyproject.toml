@@ -33,6 +33,7 @@ dependencies = [
   "numpy>=1.24.0",
   "tiktoken>=0.5.1",
   "openai>=1.3.0",
+  "google-genai>=1.0.0",
   "pgvector>=0.2.0",
   "mcp",
   "rich>=13.0.0",
@@ -57,7 +58,7 @@ Issues = "https://github.com/QuixiAI/Hexis/issues"
 hexis = "apps.hexis_cli:main"
 hexis-worker = "apps.worker:main"
 hexis-mcp = "apps.hexis_mcp_server:main"
-hexis-web = "apps.hexis_web:main"
+hexis-api = "apps.hexis_api:main"
 hexis-channels = "services.channel_worker:main"
 
 [project.optional-dependencies]

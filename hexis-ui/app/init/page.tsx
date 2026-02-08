@@ -49,6 +49,7 @@ const stagePrompt: Record<InitStage, string> = {
 
 type LlmProvider =
   | "openai"
+  | "openai-codex"
   | "anthropic"
   | "grok"
   | "gemini"
@@ -81,6 +82,7 @@ type CharacterEntry = {
 
 const providerOptions: { value: LlmProvider; label: string }[] = [
   { value: "openai", label: "OpenAI" },
+  { value: "openai-codex", label: "ChatGPT Plus/Pro (Codex OAuth)" },
   { value: "anthropic", label: "Anthropic" },
   { value: "grok", label: "Grok (xAI)" },
   { value: "gemini", label: "Gemini" },
@@ -100,6 +102,12 @@ const providerDefaults: Record<
     endpoint: "https://api.openai.com/v1",
     apiKeyLabel: "OpenAI API Key",
     apiKeyRequired: true,
+  },
+  "openai-codex": {
+    model: "gpt-5.2-codex",
+    endpoint: "",
+    apiKeyLabel: "OAuth",
+    apiKeyRequired: false,
   },
   anthropic: {
     model: "claude-opus-4-5",
@@ -142,6 +150,11 @@ const providerModels: Record<LlmProvider, string[]> = {
     "gpt-5.1-codex-max",
     "gpt-5-mini",
     "gpt-5-nano",
+  ],
+  "openai-codex": [
+    "gpt-5.2-codex",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
   ],
   anthropic: [
     "claude-opus-4-5",
@@ -842,20 +855,30 @@ export default function Home() {
                               />
                             </div>
                           ) : null}
-                          <div>
-                            <label className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]">
-                              {defaults.apiKeyLabel}
-                            </label>
-                            <input
-                              className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm"
-                              type="password"
-                              value={entry.config.apiKey}
-                              onChange={(e) =>
-                                entry.setConfig((prev) => ({ ...prev, apiKey: e.target.value }))
-                              }
-                              placeholder={defaults.apiKeyRequired ? "Required" : "Optional"}
-                            />
-                          </div>
+                          {entry.config.provider === "openai-codex" ? (
+                            <div className="rounded-xl border border-[var(--outline)] bg-[var(--surface)] px-4 py-3 text-sm text-[var(--ink)]">
+                              <p className="font-semibold">OAuth required</p>
+                              <p className="mt-1 text-[var(--ink-soft)]">
+                                Run <span className="font-mono">hexis auth openai-codex login</span> to store your ChatGPT
+                                subscription token. No API key is needed here.
+                              </p>
+                            </div>
+                          ) : (
+                            <div>
+                              <label className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]">
+                                {defaults.apiKeyLabel}
+                              </label>
+                              <input
+                                className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm"
+                                type="password"
+                                value={entry.config.apiKey}
+                                onChange={(e) =>
+                                  entry.setConfig((prev) => ({ ...prev, apiKey: e.target.value }))
+                                }
+                                placeholder={defaults.apiKeyRequired ? "Required" : "Optional"}
+                              />
+                            </div>
+                          )}
                         </div>
                       </fieldset>
                     );

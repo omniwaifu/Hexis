@@ -34,7 +34,23 @@ async def load_llm_config(
 
     if "provider" not in cfg:
         cfg["provider"] = default_provider
+    provider = str(cfg.get("provider") or "").strip().lower()
+    if provider in {"openai_codex"}:
+        provider = "openai-codex"
+        cfg["provider"] = provider
+
     if "model" not in cfg:
-        cfg["model"] = default_model
+        # Codex models are distinct from Platform/OpenAI API models; pick a sane default.
+        cfg["model"] = "gpt-5.2-codex" if provider == "openai-codex" else default_model
+
+    # If the provider is OpenAI Codex (ChatGPT subscription), pull OAuth credentials
+    # from the shared token sink and refresh if needed.
+    if provider == "openai-codex":
+        from core.openai_codex_oauth import ensure_fresh_openai_codex_credentials
+
+        creds = await ensure_fresh_openai_codex_credentials(conn)
+        cfg["api_key"] = creds.access
+        # Base URL for Codex backend (not OpenAI Platform /v1).
+        cfg.setdefault("endpoint", "https://chatgpt.com/backend-api")
 
     return normalize_llm_config(cfg, default_model=default_model)

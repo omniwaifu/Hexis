@@ -114,6 +114,12 @@ services:
       RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
       RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-hexis}
       RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-hexis_password}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      HEXIS_LLM_CONSCIOUS_API_KEY: ${HEXIS_LLM_CONSCIOUS_API_KEY:-}
+      HEXIS_LLM_SUBCONSCIOUS_API_KEY: ${HEXIS_LLM_SUBCONSCIOUS_API_KEY:-}
     networks:
       - private
       - public
@@ -142,23 +148,29 @@ services:
       RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
       RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-hexis}
       RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-hexis_password}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      HEXIS_LLM_CONSCIOUS_API_KEY: ${HEXIS_LLM_CONSCIOUS_API_KEY:-}
+      HEXIS_LLM_SUBCONSCIOUS_API_KEY: ${HEXIS_LLM_SUBCONSCIOUS_API_KEY:-}
     networks:
       - private
       - public
 
-  web:
+  api:
     build:
       context: .
       dockerfile: ops/Dockerfile.worker
-    container_name: hexis_web
+    container_name: hexis_api
     profiles:
       - active
-    command: ["hexis-web", "--host", "0.0.0.0", "--port", "43817"]
+    command: ["hexis-api", "--host", "0.0.0.0", "--port", "43817"]
     depends_on:
       db:
         condition: service_healthy
     ports:
-      - "${HEXIS_BIND_ADDRESS:-127.0.0.1}:${HEXIS_WEB_PORT:-43817}:43817"
+      - "${HEXIS_BIND_ADDRESS:-127.0.0.1}:${HEXIS_API_PORT:-43817}:43817"
     environment:
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
@@ -168,6 +180,12 @@ services:
       EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
       HEXIS_CORS_ORIGINS: ${HEXIS_CORS_ORIGINS:-http://localhost:3477,http://localhost:3000}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      HEXIS_LLM_CONSCIOUS_API_KEY: ${HEXIS_LLM_CONSCIOUS_API_KEY:-}
+      HEXIS_LLM_SUBCONSCIOUS_API_KEY: ${HEXIS_LLM_SUBCONSCIOUS_API_KEY:-}
     networks:
       - private
       - public
@@ -210,6 +228,12 @@ services:
       MATRIX_HOMESERVER: ${MATRIX_HOMESERVER:-}
       MATRIX_ACCESS_TOKEN: ${MATRIX_ACCESS_TOKEN:-}
       MATRIX_USER_ID: ${MATRIX_USER_ID:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      HEXIS_LLM_CONSCIOUS_API_KEY: ${HEXIS_LLM_CONSCIOUS_API_KEY:-}
+      HEXIS_LLM_SUBCONSCIOUS_API_KEY: ${HEXIS_LLM_SUBCONSCIOUS_API_KEY:-}
     networks:
       - private
       - public

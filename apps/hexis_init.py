@@ -395,7 +395,7 @@ async def _configure_llm(conn: Any) -> dict[str, Any]:
     heading("LLM Configuration")
 
     provider = _prompt(
-        "Model provider (openai|anthropic|openai_compatible|ollama|grok|gemini)",
+        "Model provider (openai|openai-codex|anthropic|openai_compatible|ollama|grok|gemini)",
         default=os.getenv("LLM_PROVIDER", "openai"),
         required=True,
     )
@@ -410,7 +410,7 @@ async def _configure_llm(conn: Any) -> dict[str, Any]:
     )
     api_key_env = _prompt(
         "API key env var name (e.g. OPENAI_API_KEY)",
-        default="OPENAI_API_KEY" if provider.startswith("openai") else "",
+        default="OPENAI_API_KEY" if provider in {"openai", "openai_compatible"} else "",
     )
 
     use_separate_sub = _prompt_yes_no("Use separate subconscious model?", default=False)
