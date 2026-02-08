@@ -650,7 +650,7 @@ async def _run_character(conn: Any) -> str:
 
     cards = load_character_cards()
     if not cards:
-        err_console.print("[fail]No character cards found in services/characters/. Falling back to Express.[/fail]")
+        err_console.print("[fail]No character cards found in characters/. Falling back to Express.[/fail]")
         return await _run_express(conn)
 
     # Build table display

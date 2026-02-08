@@ -4,21 +4,21 @@ COPY hexis-ui/package.json hexis-ui/bun.lock* ./
 RUN npm install
 COPY hexis-ui/ .
 COPY services/prompts/ /services/prompts/
-COPY services/characters/ /services/characters/
+COPY characters/ /characters/
 ENV HEXIS_PROMPTS_DIR=/services/prompts
-ENV HEXIS_CHARACTERS_DIR=/services/characters
+ENV HEXIS_CHARACTERS_DIR=/characters
 RUN npx prisma generate && npm run build
 
 FROM node:20-slim
 WORKDIR /app
 ENV NODE_ENV=production
 ENV HEXIS_PROMPTS_DIR=/services/prompts
-ENV HEXIS_CHARACTERS_DIR=/services/characters
+ENV HEXIS_CHARACTERS_DIR=/characters
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/public ./public
 COPY --from=builder /services/prompts /services/prompts
-COPY --from=builder /services/characters /services/characters
+COPY --from=builder /characters /characters
 EXPOSE 3477
 ENV PORT=3477
 CMD ["node", "server.js"]

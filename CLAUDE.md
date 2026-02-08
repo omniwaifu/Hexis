@@ -33,8 +33,8 @@ hexis/
 │   ├── conversation.py     # Conversation loop orchestration
 │   ├── ingest.py           # Ingestion pipeline orchestration
 │   ├── worker_service.py   # Heartbeat + maintenance loops
-│   ├── prompts/            # Markdown prompt templates
-│   └── characters/         # Preset character cards (JSON + images)
+│   └── prompts/            # Markdown prompt templates
+├── characters/             # Preset character cards (JSON + images)
 ├── apps/
 │   ├── hexis_cli.py          # CLI entrypoint (hexis ...)
 │   ├── hexis_init.py         # Interactive init wizard
