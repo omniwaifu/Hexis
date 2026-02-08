@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hexis"
-version = "0.3.2"
+version = "0.3.3"
 description = "Persistent memory and identity for AI — a Postgres-native cognitive architecture."
 readme = "README.md"
 license = "MIT"
@@ -78,9 +78,10 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["apps*", "core*", "services*", "channels*", "plugins*", "skills*", "db*", "ops*"]
+include = ["apps*", "core*", "services*", "channels*", "plugins*", "skills*", "db*", "ops*", "characters*"]
 
 [tool.setuptools.package-data]
-services = ["prompts/*.md", "characters/*.json", "characters/*.jpg"]
+services = ["prompts/*.md"]
+characters = ["*.json", "*.jpg", "*.png"]
 db = ["*.sql"]
 ops = ["docker-compose.runtime.yml"]
