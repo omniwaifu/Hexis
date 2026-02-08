@@ -28,17 +28,24 @@ Get a running agent in 3 commands. You need [Docker Desktop](https://docs.docker
 
 ```bash
 pip install hexis
-hexis init --character hexis --api-key sk-ant-...
+hexis init --character hexis --provider openai-codex --model gpt-5.2
 hexis chat
 ```
 
-`hexis init` auto-detects your provider from the key prefix, writes the `.env`, starts Docker, pulls the embedding model, configures the Hexis character, and runs consent -- all in one command.
+This flow uses ChatGPT Plus/Pro OAuth (no API key). `hexis init` will open a browser window for login and store credentials in the Hexis database.
+
+`hexis init` can also auto-detect API-key providers from the key prefix. It writes the `.env`, starts Docker, pulls the embedding model, configures the character, and runs consent -- all in one command.
+
+For a full CLI reference (including ingestion flows and flags), see [CLI.md](docs/CLI.md). For deeper Codex OAuth details, see [OAUTH_OPENAI_CODEX.md](docs/OAUTH_OPENAI_CODEX.md).
 
 **Other providers:**
 
 ```bash
-# OpenAI
+# OpenAI Platform (API key; auto-detect provider)
 hexis init --character jarvis --api-key sk-...
+
+# OpenAI Platform (explicit provider + model)
+hexis init --character jarvis --provider openai --model gpt-5.2 --api-key sk-...
 
 # Ollama (fully local, no API key needed)
 hexis init --provider ollama --model llama3.1 --character hexis

@@ -2154,8 +2154,80 @@ def _handle_ui_container(
 
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
+
+    # Some commands intentionally forward argv to another module (init/chat/ingest/etc).
+    # `argparse` does not accept unknown `--flags` as positional passthrough unless the
+    # user adds `--`, which is not the UX we want. Do a small, predictable pre-parse
+    # here so commands like `hexis init --character hexis ...` work.
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+
+    forward_map = {
+        "chat": "apps.cli_chat",
+        "init": "apps.hexis_init",
+        "ingest": "services.ingest",
+        "mcp": "apps.hexis_mcp_server",
+        "worker": "apps.worker",
+    }
+
+    # Parse a minimal set of global flags that must apply to forwarded commands.
+    instance: str | None = None
+    global_help = False
+    i = 0
+    while i < len(raw_argv):
+        tok = raw_argv[i]
+        if tok in {"-h", "--help"}:
+            global_help = True
+            i += 1
+            continue
+        if tok in {"-V", "--version"}:
+            sys.stdout.write(f"hexis {_ver}\n")
+            return 0
+        if tok in {"-i", "--instance"}:
+            if i + 1 >= len(raw_argv):
+                break  # let argparse handle the error
+            instance = raw_argv[i + 1]
+            i += 2
+            continue
+        if tok.startswith("--instance="):
+            instance = tok.split("=", 1)[1]
+            i += 1
+            continue
+        if tok == "--":
+            i += 1
+            break
+        if tok.startswith("-"):
+            break  # unknown global flag; defer to argparse
+        break
+
+    cmd_argv = raw_argv[i:]
+    if not cmd_argv:
+        # No command; mirror legacy behavior: show grouped help.
+        _print_grouped_help()
+        return 0
+
+    if global_help:
+        _print_grouped_help()
+        return 0
+
+    cmd = cmd_argv[0]
+    if cmd in forward_map:
+        if instance:
+            os.environ["HEXIS_INSTANCE"] = instance
+
+        fwd_argv = cmd_argv[1:]
+
+        if cmd == "ingest":
+            # UX/backwards-compat: accept `hexis ingest --file foo.md` by auto-inserting
+            # the `ingest` subcommand when the user passed flags.
+            if fwd_argv and fwd_argv[0] == "--":
+                fwd_argv = fwd_argv[1:]
+            if fwd_argv and fwd_argv[0] not in {"ingest", "status", "process", "-h", "--help"}:
+                fwd_argv = ["ingest", *fwd_argv]
+
+        return _run_module(forward_map[cmd], fwd_argv)
+
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
 
     # Show grouped help for: no command, --help/-h, or 'help' with no subcommand
     if args.command is None or args.help:
@@ -2298,7 +2370,17 @@ def main(argv: list[str] | None = None) -> int:
     if func == "chat":
         return _run_module("apps.cli_chat", args.args)
     if func == "ingest":
-        return _run_module("services.ingest", args.args)
+        argv = list(args.args or [])
+        # `hexis ingest` forwards args to `python -m services.ingest`.
+        #
+        # The ingestion module uses subcommands: `ingest|status|process`.
+        # For UX/backwards-compat, accept `hexis ingest --file foo.md` by
+        # auto-inserting the `ingest` subcommand when the user passed flags.
+        if argv and argv[0] == "--":
+            argv = argv[1:]
+        if argv and argv[0] not in {"ingest", "status", "process", "-h", "--help"}:
+            argv = ["ingest", *argv]
+        return _run_module("services.ingest", argv)
     if func == "worker":
         return _run_module("apps.worker", args.args)
     if func == "init":

@@ -25,7 +25,8 @@ paste it back into the CLI prompt.
 Set your LLM provider config (via the init UI or by writing config) to:
 
 - `llm.chat.provider = "openai-codex"`
-- `llm.chat.model = "gpt-5.2-codex"` (or another Codex model id)
+- `llm.chat.model = "gpt-5.2"` (recommended; matches the README quick start)
+- (optional) `llm.chat.model = "gpt-5.2-codex"` (or another Codex model id)
 
 No API key is required in the UI for `openai-codex`; the Python server pulls the OAuth token
 from the DB and refreshes it automatically when needed.
@@ -36,4 +37,3 @@ from the DB and refreshes it automatically when needed.
 hexis auth openai-codex status
 hexis auth openai-codex logout
 ```
-

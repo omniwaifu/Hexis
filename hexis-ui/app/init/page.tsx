@@ -104,7 +104,7 @@ const providerDefaults: Record<
     apiKeyRequired: true,
   },
   "openai-codex": {
-    model: "gpt-5.2-codex",
+    model: "gpt-5.2",
     endpoint: "",
     apiKeyLabel: "OAuth",
     apiKeyRequired: false,
@@ -152,6 +152,7 @@ const providerModels: Record<LlmProvider, string[]> = {
     "gpt-5-nano",
   ],
   "openai-codex": [
+    "gpt-5.2",
     "gpt-5.2-codex",
     "gpt-5.1-codex-max",
     "gpt-5.1-codex-mini",

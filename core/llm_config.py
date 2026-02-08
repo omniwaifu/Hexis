@@ -40,8 +40,8 @@ async def load_llm_config(
         cfg["provider"] = provider
 
     if "model" not in cfg:
-        # Codex models are distinct from Platform/OpenAI API models; pick a sane default.
-        cfg["model"] = "gpt-5.2-codex" if provider == "openai-codex" else default_model
+        # Default to GPT‑5.2 for Codex OAuth, matching the README quick start.
+        cfg["model"] = "gpt-5.2" if provider == "openai-codex" else default_model
 
     # If the provider is OpenAI Codex (ChatGPT subscription), pull OAuth credentials
     # from the shared token sink and refresh if needed.

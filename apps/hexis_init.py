@@ -34,6 +34,7 @@ from apps.cli_theme import console, err_console, heading, make_panel, make_table
 _DEFAULT_MODELS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-20250514",
     "openai": "gpt-4o",
+    "openai-codex": "gpt-5.2",
     "grok": "grok-3",
     "gemini": "gemini-2.5-flash",
     "ollama": "llama3.1",
@@ -42,6 +43,7 @@ _DEFAULT_MODELS: dict[str, str] = {
 _PROVIDER_ENV_VARS: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
+    "openai-codex": "",
     "grok": "XAI_API_KEY",
     "gemini": "GEMINI_API_KEY",
     "ollama": "",
@@ -60,6 +62,66 @@ def detect_provider(api_key: str) -> str:
         return "gemini"
     raise ValueError(
         f"Cannot detect provider from key prefix '{api_key[:6]}...'. Use --provider."
+    )
+
+
+def _normalize_provider_name(provider: str | None) -> str:
+    raw = (provider or "").strip().lower()
+    if raw in {"openai_codex"}:
+        return "openai-codex"
+    return raw
+
+
+async def _ensure_openai_codex_oauth(dsn: str, conn: Any, *, wait_seconds: int) -> None:
+    """
+    Ensure ChatGPT subscription (Codex) OAuth credentials exist in the DB.
+
+    This is used by `hexis init` so the README quick start can use OAuth with:
+      hexis init --provider openai-codex --model gpt-5.2
+    """
+    from core.openai_codex_oauth import load_openai_codex_credentials
+
+    existing = await load_openai_codex_credentials(conn)
+    if existing:
+        return
+
+    console.print("[muted]Starting ChatGPT Codex OAuth login...[/muted]")
+
+    # Reuse the CLI's battle-tested OAuth login flow (local callback server + manual paste fallback).
+    from apps.hexis_cli import _auth_openai_codex_login
+
+    timeout_seconds = int(os.getenv("OPENAI_CODEX_OAUTH_TIMEOUT_SECONDS", "180"))
+    no_open = os.getenv("OPENAI_CODEX_OAUTH_NO_OPEN", "").strip().lower() in {"1", "true", "yes", "y"}
+
+    rc = await _auth_openai_codex_login(
+        dsn,
+        wait_seconds,
+        no_open=no_open,
+        timeout_seconds=timeout_seconds,
+    )
+    if rc != 0:
+        raise RuntimeError("OpenAI Codex OAuth login failed")
+
+
+async def _load_llm_config_for_consent(
+    conn: Any,
+    *,
+    dsn: str,
+    wait_seconds: int,
+    provider: str,
+    model: str,
+) -> dict[str, Any]:
+    if provider == "openai-codex":
+        await _ensure_openai_codex_oauth(dsn, conn, wait_seconds=wait_seconds)
+
+    from core.llm_config import load_llm_config
+
+    # Consent is a chat-style flow; use llm.chat config.
+    return await load_llm_config(
+        conn,
+        "llm.chat",
+        default_provider=provider,
+        default_model=model,
     )
 
 
@@ -160,14 +222,15 @@ def _ensure_embedding_model() -> None:
 async def _run_init_noninteractive(args: argparse.Namespace) -> int:
     """Non-interactive init: configure from CLI flags, start stack, apply config."""
     # 1. Detect provider
-    provider = args.provider
+    provider = _normalize_provider_name(args.provider)
     if not provider:
         if args.api_key:
             provider = detect_provider(args.api_key)
         else:
             provider = "ollama"
+    provider = _normalize_provider_name(provider)
 
-    if provider != "ollama" and not args.api_key:
+    if provider not in {"ollama", "openai-codex"} and not args.api_key:
         err_console.print(f"[fail]--api-key required for provider '{provider}'[/fail]")
         return 1
 
@@ -253,7 +316,13 @@ async def _run_init_noninteractive(args: argparse.Namespace) -> int:
             console.print("[ok]\u2714[/ok] Express defaults applied")
 
         # 9. Consent
-        llm_config = normalize_llm_config(heartbeat_config)
+        llm_config = await _load_llm_config_for_consent(
+            conn,
+            dsn=dsn,
+            wait_seconds=wait_seconds,
+            provider=provider,
+            model=model,
+        )
         consented = await _run_consent(conn, llm_config)
         if not consented:
             return 1
@@ -389,7 +458,7 @@ def _prompt_list(label: str, *, default: list[str] | None = None) -> list[str]:
 # Step 0: LLM Config
 # ---------------------------------------------------------------------------
 
-async def _configure_llm(conn: Any) -> dict[str, Any]:
+async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str, Any]:
     """Configure LLM provider/model. Returns normalized config dict."""
     console.print(f"\n{_step_bar(0)}\n")
     heading("LLM Configuration")
@@ -399,14 +468,17 @@ async def _configure_llm(conn: Any) -> dict[str, Any]:
         default=os.getenv("LLM_PROVIDER", "openai"),
         required=True,
     )
+    provider = _normalize_provider_name(provider)
+
+    default_model = os.getenv("LLM_MODEL") or ("gpt-5.2" if provider == "openai-codex" else "gpt-4o")
     model = _prompt(
         "Model",
-        default=os.getenv("LLM_MODEL", "gpt-4o"),
+        default=default_model,
         required=True,
     )
     endpoint = _prompt(
         "Endpoint (blank for provider default)",
-        default=os.getenv("OPENAI_BASE_URL", ""),
+        default="" if provider == "openai-codex" else os.getenv("OPENAI_BASE_URL", ""),
     )
     api_key_env = _prompt(
         "API key env var name (e.g. OPENAI_API_KEY)",
@@ -453,7 +525,13 @@ async def _configure_llm(conn: Any) -> dict[str, Any]:
     console.print(f"\n[ok]\u2714[/ok] Models saved: [bold]{provider}/{model}[/bold]")
 
     # Return resolved config for consent flow
-    return normalize_llm_config(heartbeat_config)
+    return await _load_llm_config_for_consent(
+        conn,
+        dsn=dsn,
+        wait_seconds=wait_seconds,
+        provider=provider,
+        model=model,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -770,7 +848,7 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
         ))
 
         # Step 0: LLM Config
-        llm_config = await _configure_llm(conn)
+        llm_config = await _configure_llm(conn, dsn=dsn, wait_seconds=wait_seconds)
 
         # Choose tier
         tier = _choose_tier()
