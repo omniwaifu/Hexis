@@ -1,7 +1,7 @@
 FROM node:20-slim AS builder
 WORKDIR /app
 COPY hexis-ui/package.json hexis-ui/bun.lock* ./
-RUN npm install
+RUN npm install --legacy-peer-deps
 COPY hexis-ui/ .
 COPY services/prompts/ /services/prompts/
 COPY characters/ /characters/
