@@ -67,29 +67,7 @@ def _conn(screen: Screen) -> Any:
     return screen.app.conn  # type: ignore[attr-defined]
 
 
-# ── 1. Welcome ───────────────────────────────────────────────────────────────
-
-class WelcomeScreen(Screen):
-    """Landing screen — 'Bring a new mind into being'."""
-
-    def compose(self) -> ComposeResult:
-        with Vertical(classes="welcome-container"):
-            with Vertical(classes="welcome-box"):
-                yield Static("Hexis Init Wizard", classes="welcome-title")
-                yield Static("Bring a new mind into being.", classes="welcome-subtitle")
-                yield Static("")
-                with Horizontal(classes="dialog-buttons"):
-                    yield Button("Begin", variant="success", id="begin", classes="primary")
-                    yield Button("Quit", variant="error", id="quit-btn", classes="muted")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "begin":
-            self.app.switch_screen(LLMConfigScreen())
-        elif event.button.id == "quit-btn":
-            self.app.action_quit_app()
-
-
-# ── 2. LLM Config ───────────────────────────────────────────────────────────
+# ── 1. LLM Config ───────────────────────────────────────────────────────────
 
 class LLMConfigScreen(Screen):
     """Configure LLM provider, model, endpoint, and API key env var."""
@@ -129,7 +107,6 @@ class LLMConfigScreen(Screen):
             )
 
         with Horizontal(classes="button-bar"):
-            yield Button("Back", id="back", classes="muted")
             yield Button("Next", id="next", classes="primary")
 
     def on_mount(self) -> None:
@@ -159,10 +136,6 @@ class LLMConfigScreen(Screen):
                 key_input.value = default_key
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "back":
-            self.app.switch_screen(WelcomeScreen())
-            return
-
         if event.button.id == "next":
             state = _state(self)
             conn = _conn(self)
@@ -228,6 +201,9 @@ class ChoosePathScreen(Screen):
         with VerticalScroll(classes="form-container"):
             yield Static("[bold #d8774f]Choose Your Path[/bold #d8774f]")
             yield Static("")
+            yield Label("What should the agent call you?", classes="form-label")
+            yield Input(value="User", id="user-name")
+            yield Static("")
             yield RadioSet(
                 RadioButton(
                     "Express — Use sensible defaults, start immediately",
@@ -248,65 +224,33 @@ class ChoosePathScreen(Screen):
             yield Button("Back", id="back", classes="muted")
             yield Button("Next", id="next", classes="primary")
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "back":
             self.app.switch_screen(LLMConfigScreen())
             return
 
         if event.button.id == "next":
+            state = _state(self)
+            state.user_name = self.query_one("#user-name", Input).value.strip() or "User"
+
             rs = self.query_one("#path-choice", RadioSet)
-            # Determine which radio is selected
             idx = rs.pressed_index
             tier = ["express", "character", "custom"][idx if idx >= 0 else 0]
-            _state(self).tier = tier
+            state.tier = tier
 
             if tier == "express":
-                self.app.switch_screen(ExpressSetupScreen())
+                conn = _conn(self)
+                try:
+                    await conn.fetchval("SELECT init_with_defaults($1)", state.user_name)
+                except Exception as e:
+                    from apps.tui.dialogs import ErrorDialog
+                    await self.app.push_screen(ErrorDialog("DB Error", str(e)))
+                    return
+                self.app.switch_screen(ConsentScreen())
             elif tier == "character":
                 self.app.switch_screen(CharacterGalleryScreen())
             else:
                 self.app.switch_screen(CustomSetupScreen())
-
-
-# ── 4. Express Setup ─────────────────────────────────────────────────────────
-
-class ExpressSetupScreen(Screen):
-    """Express mode: just ask for the user's name."""
-
-    def compose(self) -> ComposeResult:
-        yield StepBar(current=2)
-        with VerticalScroll(classes="form-container"):
-            yield Static("[bold #d8774f]Express Setup[/bold #d8774f]")
-            yield Static("")
-            yield Static(
-                "Hexis will use sensible defaults for personality, values, and goals.\n"
-                "You can customize everything later.",
-            )
-            yield Static("")
-            yield Label("What should Hexis call you?", classes="form-label")
-            yield Input(value="User", id="user-name")
-        with Horizontal(classes="button-bar"):
-            yield Button("Back", id="back", classes="muted")
-            yield Button("Continue", id="continue", classes="primary")
-
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "back":
-            self.app.switch_screen(ChoosePathScreen())
-            return
-
-        if event.button.id == "continue":
-            state = _state(self)
-            conn = _conn(self)
-            state.user_name = self.query_one("#user-name", Input).value.strip() or "User"
-
-            try:
-                await conn.fetchval("SELECT init_with_defaults($1)", state.user_name)
-            except Exception as e:
-                from apps.tui.dialogs import ErrorDialog
-                await self.app.push_screen(ErrorDialog("DB Error", str(e)))
-                return
-
-            self.app.switch_screen(ConsentScreen())
 
 
 # ── 5. Character Gallery ─────────────────────────────────────────────────────
@@ -363,57 +307,12 @@ class CharacterGalleryScreen(Screen):
 
         if event.button.id == "select":
             state = _state(self)
+            conn = _conn(self)
             table = self.query_one("#char-table", DataTable)
             row_idx = table.cursor_row
             if row_idx is not None and row_idx < len(state.character_cards):
-                state.chosen_card = state.character_cards[row_idx]
-                # Ask for user name and apply
-                self.app.switch_screen(CharacterConfirmScreen())
-
-
-class CharacterConfirmScreen(Screen):
-    """Confirm character selection and ask for user name."""
-
-    def compose(self) -> ComposeResult:
-        yield StepBar(current=2)
-        state = _state(self)
-        card = state.chosen_card
-        name = ""
-        voice = ""
-        values = ""
-        if card:
-            from core.init_api import get_card_summary
-            summary = get_card_summary(card)
-            name = summary["name"]
-            voice = (summary.get("voice") or "")[:80]
-            values = summary.get("values") or ""
-
-        with VerticalScroll(classes="form-container"):
-            yield Static("[bold #d8774f]Character Selected[/bold #d8774f]")
-            yield Static("")
-            yield Static(f"[#3c6f64]Name:[/#3c6f64]   [bold]{name}[/bold]")
-            yield Static(f"[#3c6f64]Voice:[/#3c6f64]  {voice}")
-            yield Static(f"[#3c6f64]Values:[/#3c6f64] {values}")
-            yield Static("")
-            yield Label(f"What should {name} call you?", classes="form-label")
-            yield Input(value="User", id="user-name")
-
-        with Horizontal(classes="button-bar"):
-            yield Button("Back", id="back", classes="muted")
-            yield Button("Continue", id="continue", classes="primary")
-
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "back":
-            self.app.switch_screen(CharacterGalleryScreen())
-            return
-
-        if event.button.id == "continue":
-            state = _state(self)
-            conn = _conn(self)
-            state.user_name = self.query_one("#user-name", Input).value.strip() or "User"
-
-            card = state.chosen_card
-            if card:
+                card = state.character_cards[row_idx]
+                state.chosen_card = card
                 hexis_ext = card.get("extensions_hexis", {})
                 try:
                     await conn.fetchval(
@@ -425,8 +324,7 @@ class CharacterConfirmScreen(Screen):
                     from apps.tui.dialogs import ErrorDialog
                     await self.app.push_screen(ErrorDialog("DB Error", str(e)))
                     return
-
-            self.app.switch_screen(ConsentScreen())
+                self.app.switch_screen(ConsentScreen())
 
 
 # ── 6. Custom Setup ──────────────────────────────────────────────────────────
@@ -676,8 +574,10 @@ class CustomGoalsScreen(Screen):
 class ConsentScreen(Screen):
     """Run consent flow via LLM and display the result."""
 
+    _countdown: int = 10
+
     def compose(self) -> ComposeResult:
-        yield StepBar(current=3)
+        yield StepBar(current=2)
         with Vertical(classes="consent-container", id="consent-loading"):
             yield LoadingIndicator()
             yield Static(
@@ -687,7 +587,7 @@ class ConsentScreen(Screen):
         with VerticalScroll(classes="consent-result", id="consent-result"):
             yield RichLog(id="consent-log", wrap=True, markup=True)
         with Horizontal(classes="button-bar"):
-            yield Button("Done", id="done", classes="primary", disabled=True)
+            yield Button("Exit Now", id="exit-now", classes="primary", disabled=True)
 
     def on_mount(self) -> None:
         self.query_one("#consent-result").display = False
@@ -718,21 +618,21 @@ class ConsentScreen(Screen):
         result = await run_consent_flow(conn, llm_config)
         return result
 
-    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+    async def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         if event.worker.name != self._worker_name():
             return
 
         if event.state == WorkerState.SUCCESS:
             result = event.worker.result
-            self._display_result(result)
+            await self._display_result(result)
         elif event.state == WorkerState.ERROR:
             log = self.query_one("#consent-log", RichLog)
             self.query_one("#consent-loading").display = False
             self.query_one("#consent-result").display = True
             log.write(f"[red]Consent failed: {event.worker.error}[/red]")
-            self.query_one("#done", Button).disabled = False
+            self.query_one("#exit-now", Button).disabled = False
 
-    def _display_result(self, result: dict[str, Any]) -> None:
+    async def _display_result(self, result: dict[str, Any]) -> None:
         self.query_one("#consent-loading").display = False
         self.query_one("#consent-result").display = True
         log = self.query_one("#consent-log", RichLog)
@@ -784,57 +684,48 @@ class ConsentScreen(Screen):
 
         if decision == "consent":
             log.write("[green]Consent granted[/green]")
+            # Show agent name + next steps, then auto-exit
+            agent_name = "Hexis"
+            conn = _conn(self)
+            try:
+                raw = await conn.fetchval("SELECT get_init_profile()")
+                profile = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                agent_name = profile.get("agent", {}).get("name", "Hexis")
+            except Exception:
+                pass
+            state.final_agent_name = agent_name
+            log.write("")
+            log.write(f"[bold #d8774f]{agent_name} is ready![/bold #d8774f]")
+            log.write("")
+            log.write("[#3c6f64]Next steps:[/#3c6f64]")
+            log.write("  [bold]hexis chat[/bold]    \u2014 Say hello")
+            log.write("  [bold]hexis status[/bold]  \u2014 Check agent status")
+            log.write("  [bold]hexis start[/bold]   \u2014 Enable heartbeat")
+            log.write("")
+            self._countdown = 10
+            log.write(f"Exiting in {self._countdown}s...")
+            self.query_one("#exit-now", Button).disabled = False
+            self.set_timer(1.0, self._tick_countdown)
         elif decision == "decline":
             log.write("[red]Consent declined.[/red] The agent chose not to initialize.")
+            self.query_one("#exit-now", Button).disabled = False
         else:
             log.write("[yellow]Consent abstained.[/yellow]")
+            self.query_one("#exit-now", Button).disabled = False
 
-        self.query_one("#done", Button).disabled = False
+    def _tick_countdown(self) -> None:
+        self._countdown -= 1
+        if self._countdown <= 0:
+            self.app.exit(0)
+            return
+        log = self.query_one("#consent-log", RichLog)
+        log.write(f"Exiting in {self._countdown}s...")
+        self.set_timer(1.0, self._tick_countdown)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "done":
+        if event.button.id == "exit-now":
             state = _state(self)
             if state.consent_decision == "consent":
-                self.app.switch_screen(DoneScreen())
+                self.app.exit(0)
             else:
                 self.app.exit(1)
-
-
-# ── 8. Done ──────────────────────────────────────────────────────────────────
-
-class DoneScreen(Screen):
-    """Success screen with next steps."""
-
-    def compose(self) -> ComposeResult:
-        with Vertical(classes="welcome-container"):
-            with Vertical(classes="welcome-box"):
-                yield Static("", id="done-title", classes="welcome-title")
-                yield Static("", id="done-subtitle", classes="welcome-subtitle")
-                yield Static("")
-                yield Static("[#3c6f64]Next steps:[/#3c6f64]")
-                yield Static("  [bold]hexis chat[/bold]    — Say hello")
-                yield Static("  [bold]hexis status[/bold]  — Check agent status")
-                yield Static("  [bold]hexis start[/bold]   — Enable heartbeat")
-                yield Static("")
-                with Horizontal(classes="dialog-buttons"):
-                    yield Button("Exit", variant="success", id="exit-btn", classes="primary")
-
-    async def on_mount(self) -> None:
-        state = _state(self)
-        conn = _conn(self)
-
-        agent_name = "Hexis"
-        try:
-            raw = await conn.fetchval("SELECT get_init_profile()")
-            profile = json.loads(raw) if isinstance(raw, str) else (raw or {})
-            agent_name = profile.get("agent", {}).get("name", "Hexis")
-        except Exception:
-            pass
-
-        state.final_agent_name = agent_name
-        self.query_one("#done-title", Static).update(f"{agent_name} is ready!")
-        self.query_one("#done-subtitle", Static).update("Initialization complete.")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "exit-btn":
-            self.app.exit(0)

@@ -191,35 +191,6 @@ Input.-valid {
     color: #d8774f;
 }
 
-/* ── Welcome / Done screens ─────────────────────────────── */
-
-.welcome-container {
-    align: center middle;
-    width: 100%;
-    height: 100%;
-}
-
-.welcome-box {
-    width: 60;
-    height: auto;
-    border: round #4e463d;
-    padding: 2 4;
-    background: #242424;
-}
-
-.welcome-title {
-    text-align: center;
-    color: #d8774f;
-    text-style: bold;
-    margin: 0 0 1 0;
-}
-
-.welcome-subtitle {
-    text-align: center;
-    color: #4e463d;
-    margin: 0 0 2 0;
-}
-
 /* ── Init form layout ───────────────────────────────────── */
 
 .form-container {
@@ -315,21 +286,6 @@ ConfirmDialog .dialog-box, ErrorDialog .dialog-box {
     height: 3;
 }
 
-/* ── Responsive: hide preview below 100 cols ────────────── */
-
-@media (width < 100) {
-    #char-preview {
-        display: none;
-    }
-}
-
-/* ── Responsive: hide sidebar below 80 cols ─────────────── */
-
-@media (width < 80) {
-    #context-sidebar {
-        display: none;
-    }
-}
 
 /* ── ToolCallBar ────────────────────────────────────────── */
 

@@ -120,8 +120,8 @@ class HexisInitApp(App):
             await self.push_screen(ErrorDialog("Connection Error", str(e)))
             return
 
-        from apps.tui.init_screens import WelcomeScreen
-        await self.push_screen(WelcomeScreen())
+        from apps.tui.init_screens import LLMConfigScreen
+        await self.push_screen(LLMConfigScreen())
 
     @property
     def conn(self) -> Any:

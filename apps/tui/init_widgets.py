@@ -12,7 +12,7 @@ from textual.widgets import Input, Label, Static, RichLog
 
 # ── Step bar ─────────────────────────────────────────────────────────────────
 
-STEPS = ["Models", "Path", "Setup", "Consent"]
+STEPS = ["Models", "Path", "Setup"]
 
 
 class StepBar(Widget):

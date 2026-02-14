@@ -59,9 +59,6 @@ class ChatScreen(Screen):
             f" [#4e463d]— streaming chat[/#4e463d]"
         )
 
-        log = self.query_one("#chat-log", ChatLog)
-        log.write_info(f"Connected to {self._agent_name}. Type /quit to exit, /help for commands.")
-
         self.query_one("#chat-input", ChatInput).focus()
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
