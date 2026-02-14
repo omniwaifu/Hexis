@@ -1,0 +1,377 @@
+/* Hexis TUI — shared stylesheet */
+
+Screen {
+    background: #1a1a1a;
+}
+
+/* ── Step bar ───────────────────────────────────────────── */
+
+StepBar {
+    height: 3;
+    dock: top;
+    background: #242424;
+    padding: 0 2;
+    content-align: center middle;
+}
+
+StepBar .step {
+    margin: 0 1;
+}
+
+StepBar .step--completed {
+    color: #4a9;
+}
+
+StepBar .step--active {
+    color: #d8774f;
+    text-style: bold;
+}
+
+StepBar .step--pending {
+    color: #4e463d;
+}
+
+StepBar .separator {
+    color: #4e463d;
+    margin: 0 1;
+}
+
+/* ── Buttons ────────────────────────────────────────────── */
+
+Button {
+    margin: 1 1;
+    min-width: 12;
+}
+
+Button.primary {
+    background: #d8774f;
+    color: #1a1a1a;
+}
+
+Button.primary:hover {
+    background: #b45835;
+}
+
+Button.secondary {
+    background: #3c6f64;
+    color: #e0d8d0;
+}
+
+Button.secondary:hover {
+    background: #2d544c;
+}
+
+Button.muted {
+    background: #4e463d;
+    color: #e0d8d0;
+}
+
+/* ── Input fields ───────────────────────────────────────── */
+
+Input {
+    margin: 1 0;
+    border: tall #4e463d;
+}
+
+Input:focus {
+    border: tall #d8774f;
+}
+
+Input.-valid {
+    border: tall #4a9;
+}
+
+/* ── Panels / containers ────────────────────────────────── */
+
+.panel {
+    background: #242424;
+    border: round #4e463d;
+    padding: 1 2;
+    margin: 1 0;
+}
+
+.panel-title {
+    color: #d8774f;
+    text-style: bold;
+}
+
+/* ── Chat messages ──────────────────────────────────────── */
+
+.msg-user {
+    color: #d8774f;
+    margin: 0 0 1 0;
+}
+
+.msg-assistant {
+    color: #e0d8d0;
+    margin: 0 0 1 0;
+}
+
+.msg-tool {
+    color: #4e463d;
+    text-style: italic;
+}
+
+.msg-error {
+    color: #c44;
+    text-style: bold;
+}
+
+/* ── Chat layout ────────────────────────────────────────── */
+
+#chat-column {
+    width: 1fr;
+}
+
+#chat-log {
+    height: 1fr;
+    border: round #4e463d;
+    padding: 0 1;
+    scrollbar-size: 1 1;
+}
+
+#chat-input {
+    dock: bottom;
+    height: 3;
+    margin: 0 0;
+}
+
+#context-sidebar {
+    width: 40;
+    display: none;
+    border-left: tall #4e463d;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+#context-sidebar.visible {
+    display: block;
+}
+
+/* ── Character gallery ──────────────────────────────────── */
+
+#character-gallery {
+    height: 1fr;
+}
+
+#char-table {
+    width: 2fr;
+    height: 1fr;
+}
+
+#char-preview {
+    width: 1fr;
+    min-width: 30;
+    border-left: tall #4e463d;
+    padding: 1 2;
+    height: 1fr;
+}
+
+/* ── Big Five sliders ───────────────────────────────────── */
+
+.big-five-row {
+    height: 3;
+    margin: 0 0;
+}
+
+.big-five-label {
+    width: 20;
+    content-align: right middle;
+    padding: 0 1;
+    color: #3c6f64;
+}
+
+.big-five-slider {
+    width: 1fr;
+}
+
+.big-five-value {
+    width: 8;
+    content-align: center middle;
+    color: #d8774f;
+}
+
+/* ── Welcome / Done screens ─────────────────────────────── */
+
+.welcome-container {
+    align: center middle;
+    width: 100%;
+    height: 100%;
+}
+
+.welcome-box {
+    width: 60;
+    height: auto;
+    border: round #4e463d;
+    padding: 2 4;
+    background: #242424;
+}
+
+.welcome-title {
+    text-align: center;
+    color: #d8774f;
+    text-style: bold;
+    margin: 0 0 1 0;
+}
+
+.welcome-subtitle {
+    text-align: center;
+    color: #4e463d;
+    margin: 0 0 2 0;
+}
+
+/* ── Init form layout ───────────────────────────────────── */
+
+.form-container {
+    padding: 1 4;
+    height: 1fr;
+    overflow-y: auto;
+}
+
+.form-group {
+    margin: 1 0;
+}
+
+.form-label {
+    color: #3c6f64;
+    margin: 0 0 0 0;
+}
+
+.button-bar {
+    dock: bottom;
+    height: 3;
+    align: center middle;
+    background: #242424;
+}
+
+/* ── RadioSet styling ───────────────────────────────────── */
+
+RadioSet {
+    margin: 1 0;
+    border: round #4e463d;
+    padding: 1 2;
+}
+
+RadioSet:focus {
+    border: round #d8774f;
+}
+
+/* ── DataTable ──────────────────────────────────────────── */
+
+DataTable {
+    height: 1fr;
+    scrollbar-size: 1 1;
+}
+
+DataTable > .datatable--cursor {
+    background: #3c6f64 30%;
+}
+
+/* ── Consent / loading ──────────────────────────────────── */
+
+.consent-container {
+    align: center middle;
+    width: 100%;
+    height: 1fr;
+    padding: 1 4;
+}
+
+.consent-result {
+    width: 100%;
+    height: 1fr;
+    padding: 1 4;
+    overflow-y: auto;
+}
+
+/* ── Dialogs ────────────────────────────────────────────── */
+
+ConfirmDialog, ErrorDialog {
+    align: center middle;
+}
+
+ConfirmDialog .dialog-box, ErrorDialog .dialog-box {
+    width: 50;
+    height: auto;
+    max-height: 20;
+    border: round #4e463d;
+    background: #242424;
+    padding: 2 4;
+}
+
+.dialog-title {
+    text-align: center;
+    text-style: bold;
+    color: #d8774f;
+    margin: 0 0 1 0;
+}
+
+.dialog-body {
+    text-align: center;
+    margin: 0 0 2 0;
+}
+
+.dialog-buttons {
+    align: center middle;
+    height: 3;
+}
+
+/* ── Responsive: hide preview below 100 cols ────────────── */
+
+@media (width < 100) {
+    #char-preview {
+        display: none;
+    }
+}
+
+/* ── Responsive: hide sidebar below 80 cols ─────────────── */
+
+@media (width < 80) {
+    #context-sidebar {
+        display: none;
+    }
+}
+
+/* ── ToolCallBar ────────────────────────────────────────── */
+
+.tool-indicator {
+    color: #4e463d;
+    text-style: italic;
+    margin: 0 0 0 2;
+}
+
+.tool-success {
+    color: #4a9;
+}
+
+.tool-failure {
+    color: #c44;
+}
+
+/* ── Header bar ─────────────────────────────────────────── */
+
+.chat-header {
+    dock: top;
+    height: 1;
+    background: #242424;
+    padding: 0 2;
+    color: #e0d8d0;
+}
+
+.chat-header .agent-name {
+    text-style: bold;
+    color: #d8774f;
+}
+
+.chat-header .agent-meta {
+    color: #4e463d;
+}
+
+/* ── Footer ─────────────────────────────────────────────── */
+
+.chat-footer {
+    dock: bottom;
+    height: 1;
+    background: #242424;
+    padding: 0 2;
+    color: #4e463d;
+}

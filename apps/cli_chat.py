@@ -113,7 +113,8 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False) -> 
 
         while True:
             try:
-                user_input = console.input("[accent]you:[/accent] ").strip()
+                console.print("[accent]you:[/accent] ", end="")
+                user_input = input().strip()
             except (EOFError, KeyboardInterrupt):
                 console.print("\n[muted]Goodbye.[/muted]")
                 break

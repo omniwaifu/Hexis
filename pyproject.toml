@@ -37,6 +37,7 @@ dependencies = [
   "pgvector>=0.2.0",
   "mcp",
   "rich>=13.0.0",
+  "textual>=1.0.0",
   "pytest>=7.4.3",
   "pytest-asyncio>=0.21.1",
   "pytest-mock>=3.11.1",
@@ -94,3 +95,4 @@ services = ["prompts/*.md"]
 characters = ["*.json", "*.jpg", "*.png"]
 db = ["*.sql"]
 ops = ["docker-compose.runtime.yml"]
+"apps.tui" = ["*.tcss"]

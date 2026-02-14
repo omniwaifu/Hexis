@@ -439,7 +439,11 @@ def _prompt(
             console.print(prompt, end="")
             raw = getpass("")
         else:
-            raw = console.input(prompt)
+            # Use console.print + builtin input() so readline handles
+            # arrow keys, backspace, and line editing properly.
+            # Rich's console.input() bypasses readline.
+            console.print(prompt, end="")
+            raw = input()
         value = raw.strip()
         if not value and default is not None:
             value = str(default)
