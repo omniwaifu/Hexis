@@ -53,6 +53,32 @@ hexis/
 
 See [Testing](testing.md) for test conventions, running tests, and writing new tests.
 
+## PyPI Package
+
+Hexis is published as the `hexis` package on PyPI.
+
+### Publishing via CI
+
+The package is published automatically by GitHub Actions (`.github/workflows/pypi-publish.yml`) when a version tag is pushed:
+
+```bash
+git tag v1.0.3
+git push origin v1.0.3
+```
+
+The workflow builds an sdist and wheel, then publishes to PyPI using OIDC (trusted publisher) authentication.
+
+### Publishing manually
+
+```bash
+# Bump version in pyproject.toml, then:
+pip install build twine
+python -m build
+twine upload dist/*
+```
+
+`twine` authenticates via `~/.pypirc` or the `TWINE_USERNAME`/`TWINE_PASSWORD` environment variables.
+
 ## Docker Images
 
 Hexis ships 4 Docker images, all published to `ghcr.io/quixiai/`:
