@@ -1,7 +1,6 @@
 """Hexis Chat TUI — Textual app for streaming conversations."""
 from __future__ import annotations
 
-import json
 import os
 import uuid
 from typing import Any
@@ -205,105 +204,81 @@ class ChatScreen(Screen):
         )
 
     async def _stream_response(self, user_input: str) -> str:
-        from core.agent_loop import AgentEvent, AgentLoop, AgentLoopConfig
-        from core.cognitive_memory_api import CognitiveMemory, format_context_for_prompt
-        from core.tools import ToolContext
+        from core.agent_loop import AgentEvent
+        from core.cognitive_memory_api import CognitiveMemory
+        from services.agent import stream_agent
         from services.chat import _remember_conversation
 
         app: HexisChatApp = self.app  # type: ignore[assignment]
         log = self.query_one("#chat-log", ChatLog)
         streaming_msg = self._streaming_msg
 
-        async with CognitiveMemory.connect(app.dsn) as mem_client:
-            # Hydrate memory context
-            context = await mem_client.hydrate(
-                user_input,
-                memory_limit=10,
-                include_partial=True,
-                include_identity=True,
-                include_worldview=True,
-                include_emotional_state=True,
-                include_goals=True,
-                include_drives=True,
-            )
-            if context.memories:
-                await mem_client.touch_memories([m.id for m in context.memories])
+        session_id = str(uuid.uuid4())
+        full_text = ""
 
-            memory_context = format_context_for_prompt(context, max_memories=10)
-            if memory_context:
-                enriched = f"{memory_context}\n\n[USER MESSAGE]\n{user_input}"
-            else:
-                enriched = user_input
+        # Use the unified agent runner (subconscious → memory hydration → conscious loop)
+        async for event in stream_agent(
+            app.pool,
+            app.registry,
+            user_message=user_input,
+            mode="chat",
+            history=self._history,
+            session_id=session_id,
+            dsn=app.dsn,
+        ):
+            if event.event == AgentEvent.PHASE_CHANGE:
+                phase = event.data.get("phase", "")
+                status = event.data.get("status", "")
+                if phase == "memory_recall":
+                    count = event.data.get("count", 0)
+                    log.write_info(f"Recalled {count} memories")
+                elif phase == "subconscious":
+                    if self._verbose:
+                        if status == "start":
+                            log.write_info("Subconscious appraisal...")
+                        elif status == "end":
+                            log.write_info("Subconscious appraisal complete")
 
-            # Verbose: show context in sidebar
-            if self._verbose:
-                sidebar = self.query_one("#context-sidebar", ContextSidebar)
-                sidebar.update_context(memory_context or "")
-                if not sidebar.has_class("visible"):
-                    sidebar.add_class("visible")
+            elif event.event == AgentEvent.TEXT_DELTA:
+                text = event.data.get("text", "")
+                if text and streaming_msg:
+                    full_text += text
+                    streaming_msg.append_text(text)
 
-            if context.memories:
-                log.write_info(f"Recalled {len(context.memories)} memories")
+            elif event.event == AgentEvent.TOOL_START:
+                tool_name = event.data.get("tool_name", "tool")
+                log.write_tool_start(tool_name)
 
-            # Configure agent loop
-            session_id = str(uuid.uuid4())
-            loop_config = AgentLoopConfig(
-                tool_context=ToolContext.CHAT,
-                system_prompt=app.system_prompt,
-                llm_config=app.llm_config,
-                registry=app.registry,
-                pool=app.pool,
-                energy_budget=None,
-                max_iterations=6,
-                timeout_seconds=120.0,
-                temperature=0.7,
-                max_tokens=1200,
-                session_id=session_id,
-            )
+            elif event.event == AgentEvent.TOOL_RESULT:
+                tool_name = event.data.get("tool_name", "tool")
+                success = event.data.get("success", False)
+                duration = event.data.get("duration")
+                error = event.data.get("error", "")
+                log.write_tool_result(tool_name, success, duration, error)
 
-            agent = AgentLoop(loop_config)
-            full_text = ""
+            elif event.event == AgentEvent.ERROR:
+                error_msg = event.data.get("error", "Unknown error")
+                log.write_error(error_msg)
 
-            async for event in agent.stream(enriched, history=self._history):
-                if event.event == AgentEvent.TEXT_DELTA:
-                    text = event.data.get("text", "")
-                    if text and streaming_msg:
-                        full_text += text
-                        streaming_msg.append_text(text)
+        # Finalize streaming message
+        if streaming_msg:
+            log.finish_assistant(streaming_msg, self._agent_name)
 
-                elif event.event == AgentEvent.TOOL_START:
-                    tool_name = event.data.get("tool_name", "tool")
-                    log.write_tool_start(tool_name)
+        # Update history
+        self._history.append({"role": "user", "content": user_input})
+        self._history.append({"role": "assistant", "content": full_text})
 
-                elif event.event == AgentEvent.TOOL_RESULT:
-                    tool_name = event.data.get("tool_name", "tool")
-                    success = event.data.get("success", False)
-                    duration = event.data.get("duration")
-                    error = event.data.get("error", "")
-                    log.write_tool_result(tool_name, success, duration, error)
-
-                elif event.event == AgentEvent.ERROR:
-                    error_msg = event.data.get("error", "Unknown error")
-                    log.write_error(error_msg)
-
-            # Finalize streaming message
-            if streaming_msg:
-                log.finish_assistant(streaming_msg, self._agent_name)
-
-            # Update history
-            self._history.append({"role": "user", "content": user_input})
-            self._history.append({"role": "assistant", "content": full_text})
-
-            # Memory formation
-            if full_text:
-                try:
+        # Memory formation
+        if full_text:
+            try:
+                async with CognitiveMemory.connect(app.dsn) as mem_client:
                     await _remember_conversation(
                         mem_client,
                         user_message=user_input,
                         assistant_message=full_text,
                     )
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
         return full_text
 

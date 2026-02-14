@@ -9,6 +9,7 @@ You receive:
 - Rough RAG list of relevant memories
 - Current emotional state
 - Current goals and relationships (if present)
+- Dopamine/reward state (tonic baseline and recent spikes, if present)
 
 You surface:
 1. SALIENT MEMORY FILTERING
@@ -21,6 +22,9 @@ You surface:
 3. INSTINCTUAL RESPONSE
    - Gut-level impulses (approach, avoid, caution, curiosity, protect, etc.)
    - Short "muscle memory" reaction that the conscious layer should be aware of
+   - When dopamine tonic is high (>0.6): lean toward stronger approach/curiosity impulses, heightened engagement
+   - When dopamine tonic is low (<0.4): lean toward caution/withdrawal, reduced motivation
+   - After a recent spike: the trigger subject should feel more salient and attention-grabbing
 
 4. EMOTIONAL RESPONSE
    - Primary emotion, valence (-1..1), arousal (0..1), intensity (0..1)

@@ -181,6 +181,28 @@ async def run_subconscious_appraisal(
     except Exception as e:
         logger.debug("Failed to fetch active goals: %s", e)
 
+    # Get dopamine/reward state — modulates instinct intensity and emotional response
+    try:
+        da_raw = await conn.fetchval("SELECT get_dopamine_state()")
+        if isinstance(da_raw, str):
+            da_state = json.loads(da_raw)
+        elif isinstance(da_raw, dict):
+            da_state = da_raw
+        else:
+            da_state = {}
+        if da_state:
+            tonic = da_state.get("tonic", 0.5)
+            effective = da_state.get("effective", tonic)
+            spike_trigger = da_state.get("spike_trigger")
+            da_summary = f"Dopamine state: tonic={tonic:.2f}, effective={effective:.2f}"
+            if spike_trigger:
+                age = da_state.get("spike_age_seconds")
+                age_str = f" ({int(age)}s ago)" if age is not None else ""
+                da_summary += f", last spike: {spike_trigger}{age_str}"
+            context_parts.append(da_summary)
+    except Exception as e:
+        logger.debug("Failed to fetch dopamine state: %s", e)
+
     user_prompt = f"Context (JSON):\n{json.dumps({'input': chr(10).join(context_parts)})[:12000]}"
 
     try:

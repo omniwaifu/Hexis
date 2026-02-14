@@ -15,7 +15,6 @@ import asyncio
 import json
 import os
 import sys
-import textwrap
 import uuid
 from typing import Any
 
@@ -64,10 +63,11 @@ def _print_debug_panel(title: str, content: str, *, style: str = "blue") -> None
 async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False) -> int:
     import asyncpg
     from core.agent_api import get_agent_profile_context
-    from core.agent_loop import AgentEvent, AgentLoop, AgentLoopConfig
-    from core.cognitive_memory_api import CognitiveMemory, format_context_for_prompt
+    from core.agent_loop import AgentEvent
+    from core.cognitive_memory_api import CognitiveMemory
     from core.llm_config import load_llm_config
     from core.tools import ToolContext, create_default_registry
+    from services.agent import stream_agent
     from services.chat import _build_system_prompt, _remember_conversation
     from rich.panel import Panel
     from rich.table import Table
@@ -212,164 +212,131 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False) -> 
                     err_console.print("[muted]Commands: /quit /clear /recall /status /verbose /debug /prompt /tools /history[/muted]")
                     continue
 
-            # Normal message — stream response
+            # Normal message — stream response via unified agent runner
+            # (subconscious pre-phase → memory hydration → conscious loop)
             session_id = str(uuid.uuid4())
 
             try:
-                async with CognitiveMemory.connect(dsn) as mem_client:
-                    # Hydrate memory context
-                    context = await mem_client.hydrate(
-                        user_input,
-                        memory_limit=10,
-                        include_partial=True,
-                        include_identity=True,
-                        include_worldview=True,
-                        include_emotional_state=True,
-                        include_goals=True,
-                        include_drives=True,
+                full_text = ""
+                tool_calls_log: list[dict[str, Any]] = []
+
+                # Debug: show conversation history being sent
+                if debug and history:
+                    hist_summary = "\n".join(
+                        f"[{m['role']}] {_truncate(m['content'], 150)}"
+                        for m in history
                     )
-                    if context.memories:
-                        await mem_client.touch_memories([m.id for m in context.memories])
-
-                    memory_context = format_context_for_prompt(context, max_memories=10)
-                    if memory_context:
-                        enriched = f"{memory_context}\n\n[USER MESSAGE]\n{user_input}"
-                    else:
-                        enriched = user_input
-
-                    # Verbose: show hydrated context
-                    if verbose:
-                        console.print(Panel(
-                            memory_context or "[dim]No memory context[/dim]",
-                            title="Hydrated Context",
-                            border_style="dim",
-                            expand=False,
-                        ))
-
-                    # Debug: show the full enriched user message that gets sent to the LLM
-                    if debug:
-                        _print_debug_panel(
-                            f"Enriched User Message ({len(enriched)} chars)",
-                            enriched,
-                            style="yellow",
-                        )
-
-                        # Show conversation history being sent
-                        if history:
-                            hist_summary = "\n".join(
-                                f"[{m['role']}] {_truncate(m['content'], 150)}"
-                                for m in history
-                            )
-                            _print_debug_panel(
-                                f"Conversation History ({len(history)} messages)",
-                                hist_summary,
-                                style="dim",
-                            )
-
-                    # Configure agent loop
-                    loop_config = AgentLoopConfig(
-                        tool_context=ToolContext.CHAT,
-                        system_prompt=system_prompt,
-                        llm_config=llm_config,
-                        registry=registry,
-                        pool=pool,
-                        energy_budget=None,
-                        max_iterations=6,
-                        timeout_seconds=120.0,
-                        temperature=0.7,
-                        max_tokens=1200,
-                        session_id=session_id,
+                    _print_debug_panel(
+                        f"Conversation History ({len(history)} messages)",
+                        hist_summary,
+                        style="dim",
                     )
 
-                    agent = AgentLoop(loop_config)
-                    full_text = ""
-                    tool_calls_log: list[dict[str, Any]] = []
-
-                    if context.memories:
-                        console.print(f"  [muted]Recalled {len(context.memories)} memories[/muted]")
-
-                    # Stream tokens
-                    console.print(f"[teal]{agent_name}:[/teal] ", end="")
-                    async for event in agent.stream(enriched, history=history):
-                        if event.event == AgentEvent.TEXT_DELTA:
-                            text = event.data.get("text", "")
-                            if text:
-                                full_text += text
-                                sys.stdout.write(text)
-                                sys.stdout.flush()
-
-                        elif event.event == AgentEvent.TOOL_START:
-                            tool_name = event.data.get("tool_name", "tool")
-                            arguments = event.data.get("arguments", {})
-                            tool_calls_log.append({"tool": tool_name, "args": arguments})
+                console.print(f"[teal]{agent_name}:[/teal] ", end="")
+                async for event in stream_agent(
+                    pool,
+                    registry,
+                    user_message=user_input,
+                    mode="chat",
+                    history=history,
+                    session_id=session_id,
+                    agent_profile=agent_profile,
+                    dsn=dsn,
+                ):
+                    if event.event == AgentEvent.PHASE_CHANGE:
+                        phase = event.data.get("phase", "")
+                        status = event.data.get("status", "")
+                        if phase == "memory_recall":
+                            count = event.data.get("count", 0)
                             if verbose:
-                                console.print(f"\n  [dim]{tool_name}({_fmt_json(arguments, 300)})[/dim]", end="")
-                            else:
-                                console.print(f"\n  [dim]{tool_name}...[/dim]", end="")
+                                console.print(f"\n  [muted]Recalled {count} memories[/muted]", end="")
+                        elif phase == "subconscious":
+                            if verbose:
+                                if status == "start":
+                                    console.print(f"\n  [muted]Subconscious appraisal...[/muted]", end="")
+                                elif status == "end":
+                                    console.print(f" [ok]done[/ok]", end="")
 
-                        elif event.event == AgentEvent.TOOL_RESULT:
-                            tool_name = event.data.get("tool_name", "tool")
-                            success = event.data.get("success", False)
-                            duration = event.data.get("duration")
-                            dur_str = f" [{duration:.1f}s]" if isinstance(duration, (int, float)) else ""
-                            if success:
-                                console.print(f" [ok]done[/ok][dim]{dur_str}[/dim]")
-                                if verbose:
-                                    display = event.data.get("display_output") or event.data.get("output")
-                                    if display:
-                                        console.print(f"    [dim]{_fmt_json(display, 500)}[/dim]")
-                            else:
-                                error_msg = event.data.get("error", "")
-                                console.print(f" [fail]failed[/fail][dim]{dur_str}[/dim] [muted]{error_msg[:120]}[/muted]")
+                    elif event.event == AgentEvent.TEXT_DELTA:
+                        text = event.data.get("text", "")
+                        if text:
+                            full_text += text
+                            sys.stdout.write(text)
+                            sys.stdout.flush()
 
-                        elif event.event == AgentEvent.LOOP_START:
-                            if debug:
-                                tool_count = event.data.get("tool_count", 0)
-                                energy = event.data.get("energy_budget", "unlimited")
-                                console.print(f"  [dim]Loop started: {tool_count} tools, energy={energy}[/dim]")
+                    elif event.event == AgentEvent.TOOL_START:
+                        tool_name = event.data.get("tool_name", "tool")
+                        arguments = event.data.get("arguments", {})
+                        tool_calls_log.append({"tool": tool_name, "args": arguments})
+                        if verbose:
+                            console.print(f"\n  [dim]{tool_name}({_fmt_json(arguments, 300)})[/dim]", end="")
+                        else:
+                            console.print(f"\n  [dim]{tool_name}...[/dim]", end="")
 
-                        elif event.event == AgentEvent.LOOP_END:
-                            if debug:
-                                reason = event.data.get("stopped_reason", "?")
-                                iters = event.data.get("iterations", 0)
-                                energy_spent = event.data.get("energy_spent", 0)
-                                timed_out = event.data.get("timed_out", False)
-                                console.print(
-                                    f"  [dim]Loop ended: reason={reason}, iterations={iters}, "
-                                    f"energy_spent={energy_spent}{', TIMED OUT' if timed_out else ''}[/dim]"
-                                )
+                    elif event.event == AgentEvent.TOOL_RESULT:
+                        tool_name = event.data.get("tool_name", "tool")
+                        success = event.data.get("success", False)
+                        duration = event.data.get("duration")
+                        dur_str = f" [{duration:.1f}s]" if isinstance(duration, (int, float)) else ""
+                        if success:
+                            console.print(f" [ok]done[/ok][dim]{dur_str}[/dim]")
+                            if verbose:
+                                display = event.data.get("display_output") or event.data.get("output")
+                                if display:
+                                    console.print(f"    [dim]{_fmt_json(display, 500)}[/dim]")
+                        else:
+                            error_msg = event.data.get("error", "")
+                            console.print(f" [fail]failed[/fail][dim]{dur_str}[/dim] [muted]{error_msg[:120]}[/muted]")
 
-                        elif event.event == AgentEvent.ERROR:
-                            error_msg = event.data.get("error", "Unknown error")
-                            console.print(f"\n[fail]Error: {error_msg}[/fail]")
+                    elif event.event == AgentEvent.LOOP_START:
+                        if debug:
+                            tool_count = event.data.get("tool_count", 0)
+                            energy = event.data.get("energy_budget", "unlimited")
+                            console.print(f"\n  [dim]Loop started: {tool_count} tools, energy={energy}[/dim]")
 
-                    # End the streaming line
-                    sys.stdout.write("\n")
+                    elif event.event == AgentEvent.LOOP_END:
+                        if debug:
+                            reason = event.data.get("stopped_reason", "?")
+                            iters = event.data.get("iterations", 0)
+                            energy_spent = event.data.get("energy_spent", 0)
+                            timed_out = event.data.get("timed_out", False)
+                            console.print(
+                                f"  [dim]Loop ended: reason={reason}, iterations={iters}, "
+                                f"energy_spent={energy_spent}{', TIMED OUT' if timed_out else ''}[/dim]"
+                            )
 
-                    # Debug: post-turn summary
-                    if debug and tool_calls_log:
-                        summary = "\n".join(
-                            f"  {tc['tool']}({json.dumps(tc['args'], default=str)[:100]})"
-                            for tc in tool_calls_log
-                        )
-                        console.print(f"[dim]Tool calls this turn:\n{summary}[/dim]")
+                    elif event.event == AgentEvent.ERROR:
+                        error_msg = event.data.get("error", "Unknown error")
+                        console.print(f"\n[fail]Error: {error_msg}[/fail]")
 
-                    console.print()
+                # End the streaming line
+                sys.stdout.write("\n")
 
-                    # Update history
-                    history.append({"role": "user", "content": user_input})
-                    history.append({"role": "assistant", "content": full_text})
+                # Debug: post-turn summary
+                if debug and tool_calls_log:
+                    summary = "\n".join(
+                        f"  {tc['tool']}({json.dumps(tc['args'], default=str)[:100]})"
+                        for tc in tool_calls_log
+                    )
+                    console.print(f"[dim]Tool calls this turn:\n{summary}[/dim]")
 
-                    # Memory formation
-                    if full_text:
-                        try:
+                console.print()
+
+                # Update history
+                history.append({"role": "user", "content": user_input})
+                history.append({"role": "assistant", "content": full_text})
+
+                # Memory formation
+                if full_text:
+                    try:
+                        async with CognitiveMemory.connect(dsn) as mem_client:
                             await _remember_conversation(
                                 mem_client,
                                 user_message=user_input,
                                 assistant_message=full_text,
                             )
-                        except Exception:
-                            pass
+                    except Exception:
+                        pass
 
             except Exception as e:
                 err_console.print(f"\n[fail]Error: {e}[/fail]\n")

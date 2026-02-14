@@ -2335,6 +2335,30 @@ def main(argv: list[str] | None = None) -> int:
 
         fwd_argv = cmd_argv[1:]
 
+        # Launch Textual TUI for chat and init (unless non-interactive)
+        if cmd == "chat":
+            try:
+                from apps.tui.chat_app import HexisChatApp
+                tui_argv = [a for a in fwd_argv if a != "--"]
+                app = HexisChatApp(tui_argv)
+                app.run()
+                return 0
+            except ImportError:
+                pass
+
+        if cmd == "init":
+            _noninteractive_flags = {"--api-key", "--provider", "--character"}
+            has_noninteractive = any(f in fwd_argv for f in _noninteractive_flags)
+            if not has_noninteractive:
+                try:
+                    from apps.tui.init_app import HexisInitApp
+                    tui_argv = [a for a in fwd_argv if a != "--"]
+                    app = HexisInitApp(tui_argv)
+                    app.run()
+                    return 0
+                except ImportError:
+                    pass
+
         if cmd == "ingest":
             # UX/backwards-compat: accept `hexis ingest --file foo.md` by auto-inserting
             # the `ingest` subcommand when the user passed flags.
@@ -2503,17 +2527,14 @@ def main(argv: list[str] | None = None) -> int:
         return run_compose(compose_cmd or [], compose_file, stack_root, log_args, env_file)
     if func == "chat":
         fwd_argv = list(args.args or [])
-        if "--no-tui" not in fwd_argv:
-            try:
-                from apps.tui.chat_app import HexisChatApp
-                tui_argv = [a for a in fwd_argv if a != "--"]
-                app = HexisChatApp(tui_argv)
-                app.run()
-                return 0
-            except ImportError:
-                pass  # textual not installed, fall through
-        else:
-            fwd_argv = [a for a in fwd_argv if a != "--no-tui"]
+        try:
+            from apps.tui.chat_app import HexisChatApp
+            tui_argv = [a for a in fwd_argv if a != "--"]
+            app = HexisChatApp(tui_argv)
+            app.run()
+            return 0
+        except ImportError:
+            pass  # textual not installed, fall through
         return _run_module("apps.cli_chat", fwd_argv)
     if func == "ingest":
         argv = list(args.args or [])
@@ -2534,7 +2555,7 @@ def main(argv: list[str] | None = None) -> int:
         # Non-interactive flags bypass TUI automatically
         _noninteractive_flags = {"--api-key", "--provider", "--character"}
         has_noninteractive = any(f in fwd_argv for f in _noninteractive_flags)
-        if "--no-tui" not in fwd_argv and not has_noninteractive:
+        if not has_noninteractive:
             try:
                 from apps.tui.init_app import HexisInitApp
                 tui_argv = [a for a in fwd_argv if a != "--"]
@@ -2543,8 +2564,6 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             except ImportError:
                 pass  # textual not installed, fall through
-        else:
-            fwd_argv = [a for a in fwd_argv if a != "--no-tui"]
         return _run_module("apps.hexis_init", fwd_argv)
     if func == "mcp":
         return _run_module("apps.hexis_mcp_server", args.args)

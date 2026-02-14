@@ -74,6 +74,12 @@ async def test_decay_activation_boosts_and_get_spontaneous_memories(db_pool):
         tr = conn.transaction()
         await tr.start()
         try:
+            # Set dopamine tonic to 0 so decay multiplier is 1.0 (no modulation)
+            await conn.execute(
+                "SELECT set_current_affective_state($1::jsonb)",
+                json.dumps({"dopamine_tonic": 0.0}),
+            )
+
             mem_id = await conn.fetchval(
                 """
                 INSERT INTO memories (type, content, embedding, metadata)
