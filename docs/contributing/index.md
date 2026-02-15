@@ -57,27 +57,18 @@ See [Testing](testing.md) for test conventions, running tests, and writing new t
 
 Hexis is published as the `hexis` package on PyPI.
 
-### Publishing via CI
-
-The package is published automatically by GitHub Actions (`.github/workflows/pypi-publish.yml`) when a version tag is pushed:
-
-```bash
-git tag v1.0.3
-git push origin v1.0.3
-```
-
-The workflow builds an sdist and wheel, then publishes to PyPI using OIDC (trusted publisher) authentication.
-
 ### Publishing manually
 
 ```bash
-# Bump version in pyproject.toml, then:
-pip install build twine
+# Bump version in pyproject.toml first, then:
+python -m pip install --upgrade build twine
+rm -rf dist
 python -m build
-twine upload dist/*
+python -m twine check dist/*
+python -m twine upload dist/*
 ```
 
-`twine` authenticates via `~/.pypirc` or the `TWINE_USERNAME`/`TWINE_PASSWORD` environment variables.
+`twine` authenticates via `~/.pypirc` or the `TWINE_USERNAME`/`TWINE_PASSWORD` environment variables. Version tags are optional and do not trigger publish automation.
 
 ## Docker Images
 
@@ -110,33 +101,38 @@ docker build -f ops/Dockerfile.ui -t ghcr.io/quixiai/hexis-ui:dev .
 
 The `hexis-brain` image takes the longest to build because it compiles pgvector, pgsql-http, and Apache AGE from source.
 
-### Publishing via CI
-
-Images are published automatically by GitHub Actions (`.github/workflows/docker-publish.yml`) when a version tag is pushed:
-
-```bash
-# Tag a release (triggers the build-and-push workflow)
-git tag v0.4.0
-git push origin v0.4.0
-```
-
-The workflow builds all 4 images in parallel, tags them with both the semver version and `latest`, and pushes to GHCR. Authentication uses the built-in `GITHUB_TOKEN`.
-
 ### Publishing manually
 
-If you need to push images outside of CI (e.g., hotfix):
+Docker image publishing is manual.
 
 ```bash
 # Authenticate with GHCR
-echo $GITHUB_TOKEN | docker login ghcr.io -u USERNAME --password-stdin
+export VERSION=<version>
+export GHCR_USERNAME=<github-username>
+export GHCR_TOKEN=<github-token-with-write-packages>
+echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
 
-# Build and push a specific image
-docker build -f ops/Dockerfile.worker -t ghcr.io/quixiai/hexis-worker:0.4.0 .
-docker push ghcr.io/quixiai/hexis-worker:0.4.0
+# Build versioned images
+docker build -f ops/Dockerfile.db -t ghcr.io/quixiai/hexis-brain:$VERSION .
+docker build -f ops/Dockerfile.worker -t ghcr.io/quixiai/hexis-worker:$VERSION .
+docker build -f ops/Dockerfile.channels -t ghcr.io/quixiai/hexis-channels:$VERSION .
+docker build -f ops/Dockerfile.ui -t ghcr.io/quixiai/hexis-ui:$VERSION .
 
-# Also update :latest
-docker tag ghcr.io/quixiai/hexis-worker:0.4.0 ghcr.io/quixiai/hexis-worker:latest
+# Push versioned tags
+docker push ghcr.io/quixiai/hexis-brain:$VERSION
+docker push ghcr.io/quixiai/hexis-worker:$VERSION
+docker push ghcr.io/quixiai/hexis-channels:$VERSION
+docker push ghcr.io/quixiai/hexis-ui:$VERSION
+
+# Update latest tags
+docker tag ghcr.io/quixiai/hexis-brain:$VERSION ghcr.io/quixiai/hexis-brain:latest
+docker tag ghcr.io/quixiai/hexis-worker:$VERSION ghcr.io/quixiai/hexis-worker:latest
+docker tag ghcr.io/quixiai/hexis-channels:$VERSION ghcr.io/quixiai/hexis-channels:latest
+docker tag ghcr.io/quixiai/hexis-ui:$VERSION ghcr.io/quixiai/hexis-ui:latest
+docker push ghcr.io/quixiai/hexis-brain:latest
 docker push ghcr.io/quixiai/hexis-worker:latest
+docker push ghcr.io/quixiai/hexis-channels:latest
+docker push ghcr.io/quixiai/hexis-ui:latest
 ```
 
 ### Runtime vs dev compose files
