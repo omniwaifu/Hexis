@@ -337,7 +337,13 @@ async def _generic_logout(dsn: str, wait_seconds: int, provider: str, yes: bool)
 # OpenAI Codex handlers (migrated from hexis_cli.py)
 # ---------------------------------------------------------------------------
 
-async def _openai_codex_login(dsn: str, wait_seconds: int, no_open: bool, timeout_seconds: int) -> int:
+async def _openai_codex_login(
+    dsn: str,
+    wait_seconds: int,
+    no_open: bool,
+    timeout_seconds: int,
+    allow_manual_fallback: bool = True,
+) -> int:
     import socket
     import webbrowser
 
@@ -414,6 +420,13 @@ async def _openai_codex_login(dsn: str, wait_seconds: int, no_open: bool, timeou
         )
 
         code: str | None = result.get("code") if result else None
+
+        if not code and not allow_manual_fallback:
+            _print_err(
+                "Authorization callback not received. Retry login in TUI or run "
+                "`hexis auth openai-codex login` in a terminal."
+            )
+            return 1
 
         if not code:
             try:
@@ -595,6 +608,7 @@ async def _chutes_login(dsn: str, wait_seconds: int, args: Any) -> int:
     no_open = getattr(args, "no_open", False)
     manual = getattr(args, "manual", False)
     timeout_seconds = getattr(args, "timeout_seconds", 120)
+    non_interactive = bool(getattr(args, "non_interactive", False))
 
     code: str | None = None
     if not manual:
@@ -613,6 +627,13 @@ async def _chutes_login(dsn: str, wait_seconds: int, args: Any) -> int:
             port=port, callback_path=path, timeout_seconds=timeout_seconds, expected_state=state,
         )
         code = result.get("code") if result else None
+
+    if not code and non_interactive:
+        _print_err(
+            "Authorization callback not received. Retry and complete browser OAuth, or run "
+            "`hexis auth chutes login --manual` in a terminal."
+        )
+        return 1
 
     if not code:
         try:
@@ -776,6 +797,7 @@ async def _google_gemini_cli_login(dsn: str, wait_seconds: int, args: Any) -> in
     no_open = getattr(args, "no_open", False)
     manual = getattr(args, "manual", False)
     timeout_seconds = getattr(args, "timeout_seconds", 120)
+    non_interactive = bool(getattr(args, "non_interactive", False))
 
     code: str | None = None
     if not manual:
@@ -789,6 +811,13 @@ async def _google_gemini_cli_login(dsn: str, wait_seconds: int, args: Any) -> in
             timeout_seconds=timeout_seconds, expected_state=state,
         )
         code = result.get("code") if result else None
+
+    if not code and non_interactive:
+        _print_err(
+            "Authorization callback not received. Retry and complete browser OAuth, or run "
+            "`hexis auth google-gemini-cli login --manual` in a terminal."
+        )
+        return 1
 
     if not code:
         try:
@@ -842,6 +871,7 @@ async def _google_antigravity_login(dsn: str, wait_seconds: int, args: Any) -> i
     no_open = getattr(args, "no_open", False)
     manual = getattr(args, "manual", False)
     timeout_seconds = getattr(args, "timeout_seconds", 120)
+    non_interactive = bool(getattr(args, "non_interactive", False))
 
     code: str | None = None
     if not manual:
@@ -855,6 +885,13 @@ async def _google_antigravity_login(dsn: str, wait_seconds: int, args: Any) -> i
             timeout_seconds=timeout_seconds, expected_state=state,
         )
         code = result.get("code") if result else None
+
+    if not code and non_interactive:
+        _print_err(
+            "Authorization callback not received. Retry and complete browser OAuth, or run "
+            "`hexis auth google-antigravity login --manual` in a terminal."
+        )
+        return 1
 
     if not code:
         try:

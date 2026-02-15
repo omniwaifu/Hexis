@@ -1,7 +1,7 @@
 """Hexis Chat TUI — Textual app for streaming conversations."""
 from __future__ import annotations
 
-import os
+import time
 import uuid
 from typing import Any
 
@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
-from textual.widgets import Footer, Input, Static
+from textual.widgets import Input, Static
 from textual.worker import Worker, WorkerState
 
 from apps.tui.chat_widgets import (
@@ -25,7 +25,7 @@ class ChatScreen(Screen):
     """Main chat screen with log, input, and optional sidebar."""
 
     BINDINGS = [
-        ("ctrl+q", "quit_app", "Quit"),
+        ("ctrl+c", "quit_app", "Quit"),
         ("ctrl+l", "clear_chat", "Clear"),
     ]
 
@@ -37,6 +37,46 @@ class ChatScreen(Screen):
         self._agent_name = "Hexis"
         self._streaming = False
         self._streaming_msg: StreamingMessage | None = None
+        self._status_text = "streaming chat"
+        self._status_started_at: float | None = None
+        self._status_timer: Any = None
+
+    def _format_elapsed(self) -> str:
+        if self._status_started_at is None:
+            return "0s"
+        total = max(0, int(time.monotonic() - self._status_started_at))
+        if total < 60:
+            return f"{total}s"
+        minutes, seconds = divmod(total, 60)
+        return f"{minutes}m {seconds}s"
+
+    def _render_header(self) -> None:
+        status = self._status_text
+        if self._status_started_at is not None:
+            status = f"{status} · {self._format_elapsed()}"
+        header = self.query_one("#chat-header", Static)
+        header.update(
+            f"[bold #d8774f]{self._agent_name}[/bold #d8774f]"
+            f" [#4e463d]\u2014 {status}[/#4e463d]"
+        )
+
+    def _tick_status(self) -> None:
+        if self._status_started_at is not None:
+            self._render_header()
+
+    def _set_header_status(self, status_text: str, *, busy: bool = False) -> None:
+        if busy:
+            if self._status_text != status_text or self._status_started_at is None:
+                self._status_started_at = time.monotonic()
+            if self._status_timer is None:
+                self._status_timer = self.set_interval(1.0, self._tick_status)
+        else:
+            self._status_started_at = None
+            if self._status_timer is not None:
+                self._status_timer.stop()
+                self._status_timer = None
+        self._status_text = status_text
+        self._render_header()
 
     def compose(self) -> ComposeResult:
         yield Static("", id="chat-header", classes="chat-header")
@@ -53,13 +93,14 @@ class ChatScreen(Screen):
     async def on_mount(self) -> None:
         app: HexisChatApp = self.app  # type: ignore[assignment]
         self._agent_name = app.agent_name
-        header = self.query_one("#chat-header", Static)
-        header.update(
-            f"[bold #d8774f]{self._agent_name}[/bold #d8774f]"
-            f" [#4e463d]— streaming chat[/#4e463d]"
-        )
+        self._set_header_status("streaming chat")
 
         self.query_one("#chat-input", ChatInput).focus()
+
+    def on_unmount(self) -> None:
+        if self._status_timer is not None:
+            self._status_timer.stop()
+            self._status_timer = None
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "chat-input":
@@ -70,16 +111,19 @@ class ChatScreen(Screen):
             return
 
         chat_input = self.query_one("#chat-input", ChatInput)
-        chat_input.push_history(text)
-        chat_input.value = ""
 
         if text.startswith("/"):
+            chat_input.push_history(text)
+            chat_input.value = ""
             await self._handle_slash(text)
             return
 
         if self._streaming:
+            # Keep input intact so the user can resubmit after streaming completes.
             return
 
+        chat_input.push_history(text)
+        chat_input.value = ""
         await self._send_message(text)
 
     async def _handle_slash(self, text: str) -> None:
@@ -193,6 +237,7 @@ class ChatScreen(Screen):
         log.write_user(text)
 
         self._streaming = True
+        self._set_header_status("waiting", busy=True)
         self._streaming_msg = log.start_assistant(self._agent_name)
         self.run_worker(
             self._stream_response(text),
@@ -212,6 +257,7 @@ class ChatScreen(Screen):
 
         session_id = str(uuid.uuid4())
         full_text = ""
+        saw_first_token = False
 
         # Use the unified agent runner (subconscious → memory hydration → conscious loop)
         async for event in stream_agent(
@@ -227,18 +273,30 @@ class ChatScreen(Screen):
                 phase = event.data.get("phase", "")
                 status = event.data.get("status", "")
                 if phase == "memory_recall":
-                    count = event.data.get("count", 0)
-                    log.write_info(f"Recalled {count} memories")
+                    if status == "start":
+                        self._set_header_status("recalling memories", busy=True)
+                        log.write_info("Recalling memories...")
+                    else:
+                        self._set_header_status("thinking...", busy=True)
+                        count = event.data.get("count", 0)
+                        log.write_info(f"Recalled {count} memories")
                 elif phase == "subconscious":
                     if self._verbose:
                         if status == "start":
                             log.write_info("Subconscious appraisal...")
                         elif status == "end":
                             log.write_info("Subconscious appraisal complete")
+                    if status == "start":
+                        self._set_header_status("reasoning", busy=True)
+                    elif status == "end":
+                        self._set_header_status("thinking...", busy=True)
 
             elif event.event == AgentEvent.TEXT_DELTA:
                 text = event.data.get("text", "")
                 if text and streaming_msg:
+                    if not saw_first_token:
+                        saw_first_token = True
+                        self._set_header_status("streaming", busy=True)
                     full_text += text
                     streaming_msg.append_text(text)
 
@@ -256,10 +314,11 @@ class ChatScreen(Screen):
             elif event.event == AgentEvent.ERROR:
                 error_msg = event.data.get("error", "Unknown error")
                 log.write_error(error_msg)
+                self._set_header_status("error")
 
         # Finalize streaming message
         if streaming_msg:
-            log.finish_assistant(streaming_msg, self._agent_name)
+            log.finish_assistant(streaming_msg, full_text)
 
         # Update history
         self._history.append({"role": "user", "content": user_input})
@@ -277,6 +336,7 @@ class ChatScreen(Screen):
             except Exception:
                 pass
 
+        self._set_header_status("streaming chat")
         return full_text
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
@@ -286,6 +346,10 @@ class ChatScreen(Screen):
         if event.state in (WorkerState.SUCCESS, WorkerState.ERROR, WorkerState.CANCELLED):
             self._streaming = False
             self._streaming_msg = None
+            if event.state == WorkerState.ERROR:
+                self._set_header_status("error")
+            else:
+                self._set_header_status("streaming chat")
             self.query_one("#chat-input", ChatInput).focus()
 
             if event.state == WorkerState.ERROR:
@@ -295,10 +359,10 @@ class ChatScreen(Screen):
     def action_quit_app(self) -> None:
         self.app.exit(0)
 
-    def action_clear_chat(self) -> None:
+    async def action_clear_chat(self) -> None:
         self._history.clear()
         log = self.query_one("#chat-log", ChatLog)
-        log.remove_children()
+        await log.remove_children()
         log.write_info("Conversation cleared.")
 
 

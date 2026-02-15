@@ -96,7 +96,14 @@ def _normalize_provider_name(provider: str | None) -> str:
     return _ALIASES.get(raw, raw)
 
 
-async def _ensure_oauth_login(provider: str, dsn: str, conn: Any, *, wait_seconds: int) -> None:
+async def _ensure_oauth_login(
+    provider: str,
+    dsn: str,
+    conn: Any,
+    *,
+    wait_seconds: int,
+    allow_manual_fallback: bool = True,
+) -> None:
     """
     Ensure OAuth/device-code/token credentials exist for the given provider.
 
@@ -139,10 +146,17 @@ async def _ensure_oauth_login(provider: str, dsn: str, conn: Any, *, wait_second
         no_open=False,
         timeout_seconds=180,
         manual=False,
+        non_interactive=not allow_manual_fallback,
     )
 
     if provider == "openai-codex":
-        rc = await _openai_codex_login(dsn, wait_seconds, no_open=False, timeout_seconds=180)
+        rc = await _openai_codex_login(
+            dsn,
+            wait_seconds,
+            no_open=False,
+            timeout_seconds=180,
+            allow_manual_fallback=allow_manual_fallback,
+        )
     elif provider == "chutes":
         ns.client_id = None
         rc = await _chutes_login(dsn, wait_seconds, ns)

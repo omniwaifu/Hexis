@@ -9,7 +9,7 @@ export const runtime = "nodejs";
  * instead of 30-second polling.
  */
 
-const DEFAULT_UPSTREAM = "http://localhost:43817";
+const DEFAULT_UPSTREAM = "http://127.0.0.1:43817";
 
 function resolveUpstreamUrl(pathname: string): string {
   const base =

@@ -533,6 +533,10 @@ async def stream_agent(
         memory_context = ""
         if mode == "chat":
             try:
+                yield AgentEventData(
+                    event=AgentEvent.PHASE_CHANGE,
+                    data={"phase": "memory_recall", "status": "start"},
+                )
                 mem_client = CognitiveMemory(pool)
                 context = await mem_client.hydrate(
                     user_message,
@@ -548,11 +552,14 @@ async def stream_agent(
                     await mem_client.touch_memories([m.id for m in context.memories])
                 memory_context = format_context_for_prompt(context, max_memories=10)
 
-                if context.memories:
-                    yield AgentEventData(
-                        event=AgentEvent.PHASE_CHANGE,
-                        data={"phase": "memory_recall", "count": len(context.memories)},
-                    )
+                yield AgentEventData(
+                    event=AgentEvent.PHASE_CHANGE,
+                    data={
+                        "phase": "memory_recall",
+                        "status": "end",
+                        "count": len(context.memories),
+                    },
+                )
             except Exception as exc:
                 logger.warning("Memory hydration failed: %s", exc)
 

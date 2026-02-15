@@ -6,7 +6,7 @@ function upstreamBaseUrl(): string {
   return (
     process.env.HEXIS_API_URL ||
     process.env.HEXIS_API_BASE_URL ||
-    "http://localhost:43817"
+    "http://127.0.0.1:43817"
   );
 }
 
@@ -28,10 +28,13 @@ export async function POST(request: Request) {
         "content-type": res.headers.get("content-type") || "application/json",
       },
     });
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error("Consent proxy failed:", err);
     return NextResponse.json(
-      { error: err?.message || "Consent request failed" },
+      {
+        error:
+          err instanceof Error ? err.message : "Consent request failed",
+      },
       { status: 500 }
     );
   }

@@ -1,6 +1,7 @@
 """Init wizard screens for the Hexis TUI."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Any
@@ -17,6 +18,7 @@ from textual.widgets import (
     RadioButton,
     RadioSet,
     RichLog,
+    Select,
     Static,
 )
 from textual.worker import Worker, WorkerState
@@ -56,6 +58,44 @@ _PROVIDER_ENV_VARS: dict[str, str] = {
     "google-antigravity": "",
 }
 
+_PROVIDER_OPTIONS: list[tuple[str, str]] = [
+    ("OpenAI Codex (ChatGPT OAuth)", "openai-codex"),
+    ("OpenAI Platform (API key)", "openai"),
+    ("Anthropic", "anthropic"),
+    ("Grok (xAI)", "grok"),
+    ("Gemini", "gemini"),
+    ("Ollama (local)", "ollama"),
+    ("Chutes (OAuth)", "chutes"),
+    ("GitHub Copilot (OAuth)", "github-copilot"),
+    ("Qwen Portal (OAuth)", "qwen-portal"),
+    ("MiniMax Portal (OAuth)", "minimax-portal"),
+    ("Google Gemini CLI (OAuth)", "google-gemini-cli"),
+    ("Google Antigravity (OAuth)", "google-antigravity"),
+]
+
+_OAUTH_PROVIDERS: set[str] = {
+    "openai-codex",
+    "chutes",
+    "github-copilot",
+    "qwen-portal",
+    "minimax-portal",
+    "google-gemini-cli",
+    "google-antigravity",
+}
+
+
+def _normalize_provider(raw: str) -> str:
+    val = (raw or "").strip().lower()
+    aliases = {
+        "openai_codex": "openai-codex",
+        "github_copilot": "github-copilot",
+        "qwen_portal": "qwen-portal",
+        "minimax_portal": "minimax-portal",
+        "google_gemini_cli": "google-gemini-cli",
+        "google_antigravity": "google-antigravity",
+    }
+    return aliases.get(val, val)
+
 
 def _state(screen: Screen) -> Any:
     """Get the shared InitState from the app."""
@@ -72,36 +112,51 @@ def _conn(screen: Screen) -> Any:
 class LLMConfigScreen(Screen):
     """Configure LLM provider, model, endpoint, and API key env var."""
 
+    @staticmethod
+    def _default_endpoint(provider: str) -> str:
+        if provider == "openai":
+            return os.getenv("OPENAI_BASE_URL", "")
+        return ""
+
     def compose(self) -> ComposeResult:
+        provider_default = _normalize_provider(os.getenv("LLM_PROVIDER", "openai"))
+        if provider_default not in _DEFAULT_MODELS:
+            provider_default = "openai"
+        model_default = os.getenv("LLM_MODEL", _DEFAULT_MODELS.get(provider_default, "gpt-4o"))
+        endpoint_default = self._default_endpoint(provider_default)
+        key_default = _PROVIDER_ENV_VARS.get(provider_default, "OPENAI_API_KEY")
+
         yield StepBar(current=0)
         with VerticalScroll(classes="form-container"):
             yield Static("[bold #d8774f]LLM Configuration[/bold #d8774f]")
             yield Static("")
 
             yield Label("Provider", classes="form-label")
-            yield Input(
-                value=os.getenv("LLM_PROVIDER", "openai"),
-                placeholder="openai, anthropic, ollama, ...",
+            yield Select(
+                _PROVIDER_OPTIONS,
+                value=provider_default,
+                allow_blank=False,
                 id="provider",
             )
+            yield Static("", id="provider-help", classes="form-label")
 
             yield Label("Model", classes="form-label")
             yield Input(
-                value=os.getenv("LLM_MODEL", "gpt-4o"),
+                value=model_default,
                 placeholder="Model name",
                 id="model",
             )
 
             yield Label("Endpoint (blank for provider default)", classes="form-label")
             yield Input(
-                value=os.getenv("OPENAI_BASE_URL", ""),
+                value=endpoint_default,
                 placeholder="https://...",
                 id="endpoint",
             )
 
             yield Label("API key env var name", classes="form-label")
             yield Input(
-                value="OPENAI_API_KEY",
+                value=key_default,
                 placeholder="e.g. OPENAI_API_KEY",
                 id="api-key-env",
             )
@@ -109,41 +164,144 @@ class LLMConfigScreen(Screen):
         with Horizontal(classes="button-bar"):
             yield Button("Next", id="next", classes="primary")
 
-    def on_mount(self) -> None:
-        # Update model default when provider changes
-        provider_input = self.query_one("#provider", Input)
-        provider = provider_input.value.strip().lower()
-        default_model = _DEFAULT_MODELS.get(provider, "gpt-4o")
-        model_input = self.query_one("#model", Input)
-        if model_input.value == "gpt-4o" or not model_input.value:
-            model_input.value = default_model
-        # Update API key env var
-        key_input = self.query_one("#api-key-env", Input)
-        default_key = _PROVIDER_ENV_VARS.get(provider, "")
-        if default_key:
-            key_input.value = default_key
+    def _selected_provider(self) -> str:
+        provider_widget = self.query_one("#provider", Select)
+        value = provider_widget.value
+        if isinstance(value, str):
+            provider = _normalize_provider(value)
+            if provider in _DEFAULT_MODELS:
+                return provider
+        return "openai"
 
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id == "provider":
-            provider = event.value.strip().lower()
-            model_input = self.query_one("#model", Input)
-            default_model = _DEFAULT_MODELS.get(provider, model_input.value)
-            model_input.value = default_model
-            # Update API key env var
-            key_input = self.query_one("#api-key-env", Input)
+    def _apply_provider_defaults(
+        self,
+        provider: str,
+        *,
+        preserve_model: bool = False,
+        preserve_endpoint: bool = False,
+    ) -> None:
+        model_input = self.query_one("#model", Input)
+        if not preserve_model or not model_input.value:
+            model_input.value = _DEFAULT_MODELS.get(provider, model_input.value or "gpt-4o")
+
+        endpoint_input = self.query_one("#endpoint", Input)
+        key_input = self.query_one("#api-key-env", Input)
+        help_text = self.query_one("#provider-help", Static)
+        if provider in _OAUTH_PROVIDERS:
+            endpoint_input.value = ""
+            endpoint_input.placeholder = "Not required for OAuth providers"
+            endpoint_input.disabled = True
+            key_input.value = ""
+            key_input.placeholder = "Not required for OAuth providers"
+            key_input.disabled = True
+            if provider == "openai-codex":
+                help_text.update("Next opens browser OAuth for ChatGPT Plus/Pro.")
+            else:
+                help_text.update("Next runs provider OAuth/device-code login.")
+        else:
+            endpoint_input.disabled = False
+            endpoint_input.placeholder = "https://..."
+            if not preserve_endpoint:
+                endpoint_input.value = self._default_endpoint(provider)
+            key_input.disabled = False
+            key_input.placeholder = "e.g. OPENAI_API_KEY"
             default_key = _PROVIDER_ENV_VARS.get(provider, "")
             if default_key:
                 key_input.value = default_key
+            help_text.update("")
+
+    def on_mount(self) -> None:
+        self._apply_provider_defaults(
+            self._selected_provider(),
+            preserve_model=bool(os.getenv("LLM_MODEL")),
+            preserve_endpoint=True,
+        )
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id != "provider":
+            return
+        provider = _normalize_provider(str(event.value)) if isinstance(event.value, str) else "openai"
+        self._apply_provider_defaults(provider)
+
+    async def _ensure_openai_codex_login(self) -> None:
+        import socket
+        import webbrowser
+
+        from core.auth.callback_server import run_callback_server
+        from core.auth.openai_codex import (
+            build_authorize_url,
+            create_state,
+            ensure_fresh_openai_codex_credentials,
+            exchange_authorization_code,
+            generate_pkce,
+            save_openai_codex_credentials,
+        )
+
+        # Match CLI behavior: callback server binds localhost:1455.
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", 1455))
+        except OSError as e:
+            raise RuntimeError(
+                "OpenAI Codex OAuth needs localhost:1455, but the port is in use."
+            ) from e
+
+        verifier, challenge = generate_pkce()
+        state = create_state()
+        auth_url = build_authorize_url(challenge=challenge, state=state)
+        try:
+            webbrowser.open(auth_url)
+        except Exception:
+            pass
+
+        result = await asyncio.to_thread(
+            run_callback_server,
+            1455,
+            "/auth/callback",
+            180,
+            state,
+        )
+        code = result.get("code") if result else None
+        if not code:
+            raise RuntimeError(
+                "OpenAI Codex OAuth callback not received. "
+                "Retry, or run `hexis auth openai-codex login` in a terminal."
+            )
+
+        creds = await exchange_authorization_code(code=code, verifier=verifier)
+        save_openai_codex_credentials(creds)
+        await ensure_fresh_openai_codex_credentials(skew_seconds=0)
+
+    async def _ensure_provider_auth(self, provider: str) -> None:
+        if provider not in _OAUTH_PROVIDERS:
+            return
+        if provider == "openai-codex":
+            await self._ensure_openai_codex_login()
+            return
+
+        from apps.hexis_init import _ensure_oauth_login
+
+        state = _state(self)
+        await _ensure_oauth_login(
+            provider,
+            state.dsn,
+            _conn(self),
+            wait_seconds=state.wait_seconds,
+            allow_manual_fallback=False,
+        )
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "next":
             state = _state(self)
             conn = _conn(self)
 
-            state.provider = self.query_one("#provider", Input).value.strip().lower()
+            state.provider = self._selected_provider()
             state.model = self.query_one("#model", Input).value.strip()
             state.endpoint = self.query_one("#endpoint", Input).value.strip()
             state.api_key_env = self.query_one("#api-key-env", Input).value.strip()
+            if state.provider in _OAUTH_PROVIDERS:
+                # OAuth providers don't use API key env vars in llm config.
+                state.api_key_env = ""
 
             # Subconscious defaults to same config
             state.sub_provider = state.provider
@@ -166,6 +324,7 @@ class LLMConfigScreen(Screen):
             }
 
             try:
+                await self._ensure_provider_auth(state.provider)
                 await conn.fetchval(
                     "SELECT init_llm_config($1::jsonb, $2::jsonb)",
                     json.dumps(heartbeat_config),
@@ -183,6 +342,10 @@ class LLMConfigScreen(Screen):
                     "SELECT set_config('llm.subconscious', $1::jsonb)",
                     json.dumps(subconscious_config),
                 )
+            except RuntimeError as e:
+                from apps.tui.dialogs import ErrorDialog
+                await self.app.push_screen(ErrorDialog("Auth Error", str(e)))
+                return
             except Exception as e:
                 from apps.tui.dialogs import ErrorDialog
                 await self.app.push_screen(ErrorDialog("DB Error", str(e)))

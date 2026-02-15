@@ -71,24 +71,30 @@ class StreamingMessage(Static):
     """A Static widget that updates in-place as streaming text arrives."""
 
     text: reactive[str] = reactive("")
+    done: reactive[bool] = reactive(False)
 
     def __init__(self, agent_name: str, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._agent_name = agent_name
 
     def render(self) -> str:
+        cursor = "" if self.done else "\u2588"
         if self.text:
-            return f"[bold #3c6f64]{self._agent_name}:[/bold #3c6f64] {self.text}\u2588"
-        return f"[bold #3c6f64]{self._agent_name}:[/bold #3c6f64] \u2588"
+            return f"[bold #3c6f64]{self._agent_name}:[/bold #3c6f64] {self.text}{cursor}"
+        return f"[bold #3c6f64]{self._agent_name}:[/bold #3c6f64] {cursor}"
 
     def append_text(self, chunk: str) -> None:
         self.text += chunk
 
-    def finalize(self) -> str:
-        """Remove cursor and return final text."""
-        final = self.text
-        self.text = ""  # Clear reactive
-        return final
+    def set_text(self, text: str) -> None:
+        self.text = text
+
+    def finalize(self, final_text: str | None = None) -> str:
+        """Mark streaming complete and optionally replace content."""
+        if final_text is not None:
+            self.text = final_text
+        self.done = True
+        return self.text
 
 
 # ── ChatLog ──────────────────────────────────────────────────────────────────
@@ -106,10 +112,12 @@ class ChatLog(VerticalScroll):
         self.scroll_end(animate=False)
         return msg
 
-    def finish_assistant(self, streaming_msg: StreamingMessage, agent_name: str) -> None:
-        final_text = streaming_msg.finalize()
-        # Update the streaming widget in place with the final text (no cursor)
-        streaming_msg.update(f"[bold #3c6f64]{agent_name}:[/bold #3c6f64] {final_text}")
+    def finish_assistant(
+        self,
+        streaming_msg: StreamingMessage,
+        final_text: str | None = None,
+    ) -> None:
+        streaming_msg.finalize(final_text)
         self.scroll_end(animate=False)
 
     def write_tool_start(self, tool_name: str) -> None:

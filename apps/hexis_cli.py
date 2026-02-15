@@ -2123,7 +2123,10 @@ def _handle_ui(stack_root: Path, port: int, no_open: bool) -> int:
     """Start the Next.js web dashboard."""
     import threading
     import time
+    import urllib.error
+    import urllib.request
     import webbrowser
+    from urllib.parse import urlparse
 
     ui_dir = stack_root / "hexis-ui"
     if not ui_dir.is_dir():
@@ -2157,6 +2160,68 @@ def _handle_ui(stack_root: Path, port: int, no_open: bool) -> int:
         with open(env_local, "a") as f:
             f.write(f"\nDATABASE_URL={dsn}\n")
 
+    api_url = (
+        os.getenv("HEXIS_API_URL")
+        or os.getenv("HEXIS_API_BASE_URL")
+        or "http://127.0.0.1:43817"
+    )
+
+    def _api_healthcheck(url: str) -> bool:
+        health_url = f"{url.rstrip('/')}/health"
+        try:
+            with urllib.request.urlopen(health_url, timeout=1.0) as resp:
+                return 200 <= int(getattr(resp, "status", 0)) < 300
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            return False
+
+    api_proc: subprocess.Popen[Any] | None = None
+    parsed_api = urlparse(api_url)
+    local_hosts = {"127.0.0.1", "localhost", "::1"}
+    is_local_api = parsed_api.hostname in local_hosts or not parsed_api.hostname
+
+    if is_local_api and not _api_healthcheck(api_url):
+        from apps.cli_theme import console
+        console.print("[accent]Starting local Hexis API for web chat...[/accent]")
+        api_port = parsed_api.port or 43817
+        api_cmd = [
+            sys.executable,
+            "-m",
+            "apps.hexis_api",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(api_port),
+        ]
+        try:
+            api_proc = subprocess.Popen(
+                api_cmd,
+                cwd=stack_root,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=os.environ.copy(),
+            )
+        except Exception as exc:
+            _print_err(f"Failed to start Hexis API: {exc}")
+            return 1
+
+        # Wait briefly for API readiness.
+        for _ in range(50):
+            if _api_healthcheck(api_url):
+                break
+            if api_proc.poll() is not None:
+                _print_err("Hexis API exited immediately. Run `hexis api` to inspect errors.")
+                return 1
+            time.sleep(0.2)
+        else:
+            if api_proc.poll() is None:
+                api_proc.terminate()
+                try:
+                    api_proc.wait(timeout=2)
+                except Exception:
+                    api_proc.kill()
+            _print_err("Timed out waiting for Hexis API. Run `hexis api` and retry.")
+            return 1
+
     from apps.cli_theme import console
     console.print(f"\n[accent]Starting web dashboard on port {port}...[/accent]")
 
@@ -2175,11 +2240,21 @@ def _handle_ui(stack_root: Path, port: int, no_open: bool) -> int:
         npx = shutil.which("npx") or "npx"
         dev_cmd = [npx, "next", "dev", "-p", str(port)]
 
+    dev_env = os.environ.copy()
+    dev_env["HEXIS_API_URL"] = api_url
+
     try:
-        result = subprocess.run(dev_cmd, cwd=ui_dir)
+        result = subprocess.run(dev_cmd, cwd=ui_dir, env=dev_env)
         return result.returncode
     except KeyboardInterrupt:
         return 0
+    finally:
+        if api_proc and api_proc.poll() is None:
+            api_proc.terminate()
+            try:
+                api_proc.wait(timeout=2)
+            except Exception:
+                api_proc.kill()
 
 
 async def _check_embedding_health(dsn: str, timeout: int = 20) -> None:

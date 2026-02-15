@@ -73,7 +73,16 @@ Input {
     border: tall #4e463d;
 }
 
+Select {
+    margin: 1 0;
+    border: tall #4e463d;
+}
+
 Input:focus {
+    border: tall #d8774f;
+}
+
+Select:focus {
     border: tall #d8774f;
 }
 

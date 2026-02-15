@@ -21,6 +21,8 @@ type LogEvent = {
   ts: number;
 };
 
+type SsePayload = Record<string, unknown>;
+
 const promptAddendaOptions = [
   { id: "philosophy", label: "Philosophy Grounding" },
   { id: "letter", label: "Letter From Claude" },
@@ -60,7 +62,6 @@ function renderMarkdown(text: string) {
     // Code block detection (simple)
     if (line.startsWith("```")) {
       // Find closing fence
-      const lang = line.slice(3).trim();
       const codeLines: string[] = [];
       let j = i + 1;
       while (j < lines.length && !lines[j].startsWith("```")) {
@@ -104,6 +105,13 @@ export default function ChatPage() {
   const [ready, setReady] = useState<boolean | null>(null);
   const [promptAddenda, setPromptAddenda] = useState<string[]>([]);
   const [currentPhase, setCurrentPhase] = useState<string | null>(null);
+  const [showSearchConfig, setShowSearchConfig] = useState(false);
+  const [searchConfigValue, setSearchConfigValue] = useState("");
+  const [searchConfigSaving, setSearchConfigSaving] = useState(false);
+  const [searchConfigError, setSearchConfigError] = useState<string | null>(null);
+  const [searchConfigNotice, setSearchConfigNotice] = useState<string | null>(null);
+  const [historyIndex, setHistoryIndex] = useState<number | null>(null);
+  const [historyDraft, setHistoryDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -150,6 +158,15 @@ export default function ChatPage() {
     logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [events]);
 
+  useEffect(() => {
+    const latestAssistant = [...messages]
+      .reverse()
+      .find((msg) => msg.role === "assistant" && msg.content);
+    if (latestAssistant && isSearchToolMisconfigured(latestAssistant.content)) {
+      setShowSearchConfig(true);
+    }
+  }, [messages]);
+
   const appendLog = (event: LogEvent) => {
     setEvents((prev) => [...prev, event]);
   };
@@ -184,6 +201,48 @@ export default function ChatPage() {
     );
   };
 
+  const handleConfigureSearchTool = async () => {
+    const value = searchConfigValue.trim();
+    if (!value) {
+      setSearchConfigError("Enter a Tavily key or env reference (for example: env:TAVILY_API_KEY).");
+      return;
+    }
+
+    setSearchConfigSaving(true);
+    setSearchConfigError(null);
+    setSearchConfigNotice(null);
+    try {
+      const payload = value.startsWith("env:")
+        ? { key_ref: value, enable: true }
+        : { api_key: value, enable: true };
+      const res = await fetch("/api/settings/tools/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data?.error || `Failed with status ${res.status}`);
+      }
+      appendLog({
+        id: crypto.randomUUID(),
+        kind: "log",
+        title: "Search Tool",
+        detail: "Configured web_search. Retry your question to run live search.",
+        ts: Date.now(),
+      });
+      setShowSearchConfig(false);
+      setSearchConfigValue("");
+      setSearchConfigNotice("Search tool configured. Retry your question.");
+    } catch (err: unknown) {
+      setSearchConfigError(
+        err instanceof Error ? err.message : "Failed to configure search tool."
+      );
+    } finally {
+      setSearchConfigSaving(false);
+    }
+  };
+
   const handleSend = async () => {
     if (!input.trim() || sending) return;
 
@@ -199,8 +258,11 @@ export default function ChatPage() {
     };
     setMessages((prev) => [...prev, userMessage, assistantMessage]);
     setInput("");
+    setHistoryIndex(null);
+    setHistoryDraft("");
     setSending(true);
     setCurrentPhase(null);
+    setSearchConfigNotice(null);
 
     try {
       const res = await fetch("/api/chat", {
@@ -247,25 +309,32 @@ export default function ChatPage() {
             }
           }
           if (!data) continue;
-          let payload: any = {};
+          let payload: SsePayload = {};
           try {
-            payload = JSON.parse(data);
+            const parsed = JSON.parse(data);
+            payload =
+              parsed && typeof parsed === "object" && !Array.isArray(parsed)
+                ? (parsed as SsePayload)
+                : { raw: data };
           } catch {
             payload = { raw: data };
           }
 
           if (eventType === "token") {
-            const phase = payload.phase || "";
-            const text = payload.text || "";
+            const phase = asString(payload.phase);
+            const text = asString(payload.text);
             setCurrentPhase(phase);
             appendStreamToken(phase, text);
             if (phase === "conscious_final" && text) {
               updateAssistantMessage(assistantMessage.id, text);
+              if (isSearchToolMisconfigured(text)) {
+                setShowSearchConfig(true);
+              }
             }
           }
 
           if (eventType === "phase_start") {
-            const phase = payload.phase || "phase";
+            const phase = asString(payload.phase, "phase");
             setCurrentPhase(phase);
             appendLog({
               id: crypto.randomUUID(),
@@ -277,32 +346,40 @@ export default function ChatPage() {
           }
 
           if (eventType === "log") {
+            const detail = asString(payload.detail);
             appendLog({
-              id: payload.id || crypto.randomUUID(),
+              id: asString(payload.id) || crypto.randomUUID(),
               kind: "log",
-              title: payload.title || payload.kind || "log",
-              detail: payload.detail || "",
+              title: asString(payload.title) || asString(payload.kind) || "log",
+              detail,
               ts: Date.now(),
             });
+            if (isSearchToolMisconfigured(detail)) {
+              setShowSearchConfig(true);
+            }
           }
 
           if (eventType === "error") {
+            const detail = asString(payload.message, "Unknown error");
             appendLog({
               id: crypto.randomUUID(),
               kind: "error",
               title: "Error",
-              detail: payload.message || "Unknown error",
+              detail,
               ts: Date.now(),
             });
+            if (isSearchToolMisconfigured(String(detail))) {
+              setShowSearchConfig(true);
+            }
           }
         }
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       appendLog({
         id: crypto.randomUUID(),
         kind: "error",
         title: "Chat error",
-        detail: err?.message || "Unknown error",
+        detail: err instanceof Error ? err.message : "Unknown error",
         ts: Date.now(),
       });
     } finally {
@@ -312,6 +389,51 @@ export default function ChatPage() {
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    const userHistory = messages
+      .filter((msg) => msg.role === "user" && msg.content.trim())
+      .map((msg) => msg.content);
+
+    if (e.key === "ArrowUp" && userHistory.length > 0) {
+      e.preventDefault();
+      let nextIndex = historyIndex;
+      if (nextIndex === null) {
+        setHistoryDraft(input);
+        nextIndex = userHistory.length - 1;
+      } else {
+        nextIndex = Math.max(0, nextIndex - 1);
+      }
+      setHistoryIndex(nextIndex);
+      setInput(userHistory[nextIndex] ?? "");
+      requestAnimationFrame(() => {
+        const el = textareaRef.current;
+        if (el) {
+          const pos = el.value.length;
+          el.setSelectionRange(pos, pos);
+        }
+      });
+      return;
+    }
+
+    if (e.key === "ArrowDown" && historyIndex !== null) {
+      e.preventDefault();
+      if (historyIndex < userHistory.length - 1) {
+        const nextIndex = historyIndex + 1;
+        setHistoryIndex(nextIndex);
+        setInput(userHistory[nextIndex] ?? "");
+      } else {
+        setHistoryIndex(null);
+        setInput(historyDraft);
+      }
+      requestAnimationFrame(() => {
+        const el = textareaRef.current;
+        if (el) {
+          const pos = el.value.length;
+          el.setSelectionRange(pos, pos);
+        }
+      });
+      return;
+    }
+
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -364,6 +486,46 @@ export default function ChatPage() {
             </div>
           )}
 
+          {showSearchConfig && (
+            <Card className="border-[var(--accent)]/40 bg-white">
+              <h3 className="font-display text-lg">Enable Web Search</h3>
+              <p className="mt-1 text-sm text-[var(--ink-soft)]">
+                This response indicates web search is not configured. Add a Tavily API key now, or use an env reference like <code>env:TAVILY_API_KEY</code>.
+              </p>
+              <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+                <input
+                  type="text"
+                  value={searchConfigValue}
+                  onChange={(e) => setSearchConfigValue(e.target.value)}
+                  placeholder="tvly-... or env:TAVILY_API_KEY"
+                  className="flex-1 rounded-xl border border-[var(--outline)] px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                />
+                <button
+                  onClick={handleConfigureSearchTool}
+                  disabled={searchConfigSaving}
+                  className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-semibold text-white disabled:opacity-60"
+                >
+                  {searchConfigSaving ? "Saving..." : "Save & Enable"}
+                </button>
+                <a
+                  href="/settings"
+                  className="rounded-xl border border-[var(--outline)] px-4 py-2 text-center text-sm"
+                >
+                  Open Settings
+                </a>
+              </div>
+              {searchConfigError ? (
+                <p className="mt-2 text-xs text-red-600">{searchConfigError}</p>
+              ) : null}
+            </Card>
+          )}
+
+          {searchConfigNotice && (
+            <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
+              {searchConfigNotice}
+            </div>
+          )}
+
           <Card className="flex flex-1 flex-col overflow-hidden !p-0">
             <div className="flex-1 space-y-4 overflow-y-auto p-6" ref={scrollRef}>
               {messages.length === 0 ? (
@@ -399,7 +561,12 @@ export default function ChatPage() {
                   className="min-h-[48px] max-h-[120px] flex-1 resize-none rounded-2xl border border-[var(--outline)] bg-white px-4 py-3 text-sm focus:border-[var(--accent)] focus:outline-none"
                   placeholder="Talk with Hexis... (Enter to send, Shift+Enter for newline)"
                   value={input}
-                  onChange={(e) => setInput(e.target.value)}
+                  onChange={(e) => {
+                    if (historyIndex !== null) {
+                      setHistoryIndex(null);
+                    }
+                    setInput(e.target.value);
+                  }}
                   onKeyDown={handleKeyDown}
                   rows={1}
                 />
@@ -504,6 +671,10 @@ function streamLabel(phase: string) {
   }
 }
 
+function asString(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
 function phaseDescription(phase: string) {
   switch (phase) {
     case "subconscious":
@@ -515,4 +686,14 @@ function phaseDescription(phase: string) {
     default:
       return "Thinking...";
   }
+}
+
+function isSearchToolMisconfigured(text: string): boolean {
+  const normalized = (text || "").toLowerCase();
+  if (!normalized) return false;
+  return (
+    normalized.includes("web search api key not configured") ||
+    (normalized.includes("web search") && normalized.includes("not configured")) ||
+    normalized.includes("tavily_api_key")
+  );
 }

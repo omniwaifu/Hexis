@@ -82,6 +82,9 @@ class HexisInitApp(App):
 
     TITLE = "Hexis Init"
     CSS_PATH = "hexis.tcss"
+    BINDINGS = [
+        ("ctrl+c", "quit_app", "Quit"),
+    ]
 
     def __init__(self, argv: list[str] | None = None) -> None:
         super().__init__()

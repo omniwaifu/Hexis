@@ -7,7 +7,7 @@ export const runtime = "nodejs";
  * `/api/chat` while all LLM/tool logic remains in Python.
  */
 
-const DEFAULT_UPSTREAM = "http://localhost:43817";
+const DEFAULT_UPSTREAM = "http://127.0.0.1:43817";
 
 function resolveUpstreamUrl(pathname: string): string {
   const base =
