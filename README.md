@@ -16,39 +16,39 @@ This is both an engineering project and a philosophical experiment. For the phil
 - **Autonomous heartbeat** -- The agent wakes on its own, reviews goals, reflects on experience, and reaches out when it has something to say
 - **Energy-budgeted actions** -- Every action has a cost; autonomy is intentional, not unbounded
 - **Identity and worldview** -- Persistent values, beliefs with confidence scores, boundaries, and emotional state
-- **Multi-provider LLM support** -- OpenAI, Anthropic, Grok, Gemini, Ollama, GitHub Copilot, Chutes, Qwen, MiniMax, or any OpenAI-compatible endpoint. Free-tier OAuth providers supported via `hexis auth`
+- **Multi-provider LLM support** -- OpenAI, Anthropic, Grok, Gemini, Ollama, Z.ai, Chutes, Qwen, MiniMax, or any OpenAI-compatible endpoint. OAuth providers supported via `hexis auth`
 - **80+ configurable tools** -- Memory, web, filesystem, shell, calendar, email, messaging, browser, code execution, ingestion, and 30+ external integrations
 - **Messaging channels** -- Discord, Telegram, Slack, Signal, WhatsApp, iMessage, Matrix
-- **11 preset character cards** -- chara_card_v2 format with portraits, or bring your own
+- **Character cards** -- chara_card_v2 format with portraits, or bring your own
 - **Skills marketplace** -- 12 built-in skills with a declarative SKILL.md format for community extensions
 - **Consent, boundaries, and termination** -- The agent can refuse requests, and can choose to end its own existence
 
 ## Quick Start
 
-Get a running agent in 3 commands. You need [Docker Desktop](https://docs.docker.com/get-docker/), [Ollama](https://ollama.com/download), and Python 3.10+.
+Get a running agent in 3 commands. You need [Docker Desktop](https://docs.docker.com/get-docker/) and Python 3.10+.
 
 ```bash
 pip install hexis
-hexis init --character hexis --provider openai-codex --model gpt-5.2
+hexis init --character hexis --api-key sk-...
 hexis chat
 ```
 
-This uses ChatGPT Plus/Pro OAuth (no API key). `hexis init` opens a browser for login, starts Docker, pulls the embedding model, configures the character, and runs consent -- all in one command.
+`hexis init` auto-detects your provider from the key prefix, starts Docker, configures the character, and runs consent -- all in one command.
 
 **Other providers:**
 
 ```bash
-# GitHub Copilot (device code login)
-hexis init --character jarvis --provider github-copilot --model gpt-4o
-
-# Chutes (free inference)
+# Chutes (free inference, no API key)
 hexis init --character hexis --provider chutes --model deepseek-ai/DeepSeek-V3-0324
 
-# Ollama (fully local, no API key)
-hexis init --provider ollama --model llama3.1 --character hexis
+# Ollama (fully local)
+hexis init --character hexis --provider ollama --model llama3.1
 
-# API-key providers (auto-detect from prefix)
-hexis init --character jarvis --api-key sk-...
+# Z.ai / Zhipu (auto-detected from key format)
+hexis init --character hexis --api-key <32hex>.<token>
+
+# Any OpenAI-compatible endpoint
+hexis init --character hexis --api-key sk-... --endpoint https://your.endpoint/v1
 ```
 
 See [Auth Providers](docs/integrations/auth/index.md) for all options. The interactive wizard is also available: `hexis init` with no flags.
