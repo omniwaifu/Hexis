@@ -13,6 +13,8 @@ import subprocess
 import time
 from typing import Any
 
+from core.config import HEXIS_DATA_DIR
+
 from .base import (
     ToolCategory,
     ToolContext,
@@ -50,7 +52,7 @@ class DatabaseBackupHandler(ToolHandler):
                         "type": "string",
                         "description": (
                             "Backup destination directory path. "
-                            "Defaults to config key 'backup.directory' or ~/.hexis/backups/"
+                            "Defaults to config key 'backup.directory' or $XDG_DATA_HOME/hexis/backups/"
                         ),
                     },
                     "label": {
@@ -81,10 +83,10 @@ class DatabaseBackupHandler(ToolHandler):
                 async with pool.acquire() as conn:
                     dest = await conn.fetchval(
                         "SELECT get_config_text('backup.directory', $1)",
-                        os.path.expanduser("~/.hexis/backups"),
+                        str(HEXIS_DATA_DIR / "backups"),
                     )
             except Exception:
-                dest = os.path.expanduser("~/.hexis/backups")
+                dest = str(HEXIS_DATA_DIR / "backups")
 
         os.makedirs(dest, exist_ok=True)
 
@@ -216,13 +218,13 @@ class BackupRetentionHandler(ToolHandler):
                 async with pool.acquire() as conn:
                     directory = await conn.fetchval(
                         "SELECT get_config_text('backup.directory', $1)",
-                        os.path.expanduser("~/.hexis/backups"),
+                        str(HEXIS_DATA_DIR / "backups"),
                     )
             except Exception:
-                directory = os.path.expanduser("~/.hexis/backups")
+                directory = str(HEXIS_DATA_DIR / "backups")
 
         if not directory:
-            directory = os.path.expanduser("~/.hexis/backups")
+            directory = str(HEXIS_DATA_DIR / "backups")
 
         if not retention_days and pool:
             try:
@@ -294,7 +296,7 @@ class ConfigExportHandler(ToolHandler):
                 "properties": {
                     "output_path": {
                         "type": "string",
-                        "description": "Path to write the JSON file. Defaults to ~/.hexis/config_export.json",
+                        "description": "Path to write the JSON file. Defaults to $XDG_DATA_HOME/hexis/config_export.json",
                     },
                 },
             },
@@ -314,7 +316,7 @@ class ConfigExportHandler(ToolHandler):
 
         output_path = arguments.get("output_path", "")
         if not output_path:
-            output_path = os.path.expanduser("~/.hexis/config_export.json")
+            output_path = str(HEXIS_DATA_DIR / "config_export.json")
 
         try:
             async with pool.acquire() as conn:

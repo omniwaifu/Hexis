@@ -530,7 +530,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     char_export = char_sub.add_parser("export", parents=[_db], help="Export current agent identity as a character card")
     char_export.add_argument("name", help="Name for the exported card")
-    char_export.add_argument("--output", "-o", default=None, help="Output path (default: ~/.hexis/characters/<name>.json)")
+    char_export.add_argument("--output", "-o", default=None, help="Output path (default: $XDG_DATA_HOME/hexis/characters/<name>.json)")
     char_export.set_defaults(func="characters_export")
 
     characters.set_defaults(func="characters")

@@ -54,7 +54,7 @@ def _parse_card_file(path: Path) -> dict[str, Any] | None:
 def load_character_cards() -> list[dict[str, Any]]:
     """Load character card JSON files from all search directories.
 
-    Scans env override, user dir (~/.hexis/characters/), and package dir.
+    Scans env override, user dir ($XDG_DATA_HOME/hexis/characters/), and package dir.
     First-seen filename wins (env > user > package).
 
     Returns list of dicts with keys: filename, name, description, voice,
@@ -82,7 +82,7 @@ def save_character_card(
 ) -> Path:
     """Save a character card JSON (and optional portrait) to the user dir.
 
-    Creates ~/.hexis/characters/ if needed. Returns path to saved JSON.
+    Creates $XDG_DATA_HOME/hexis/characters/ if needed. Returns path to saved JSON.
     """
     USER_CHARACTERS_DIR.mkdir(parents=True, exist_ok=True)
     dest = USER_CHARACTERS_DIR / filename

@@ -1,6 +1,6 @@
 """Filesystem-based credential store for auth providers.
 
-Stores credentials as JSON files in ``~/.hexis/auth/`` so they survive
+Stores credentials as JSON files in ``$XDG_DATA_HOME/hexis/auth/`` so they survive
 database resets (``docker-compose down -v``).
 """
 

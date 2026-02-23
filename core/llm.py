@@ -257,7 +257,7 @@ def normalize_provider(provider: str | None) -> str:
     if not provider:
         return "openai"
     raw = provider.strip().lower()
-    return _PROVIDER_ALIASES.get(raw, raw)
+    return _PROVIDER_ALIASES.get(raw, raw).replace("_", "-")
 
 
 def normalize_endpoint(provider: str, endpoint: str | None) -> str | None:

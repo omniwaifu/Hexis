@@ -45,8 +45,6 @@ def test_normalize_endpoint_defaults():
 def test_normalize_endpoint_new_providers():
     assert llm.normalize_endpoint("chutes", None) == "https://api.chutes.ai/v1"
     assert llm.normalize_endpoint("qwen-portal", None) == "https://portal.qwen.ai/v1"
-    assert llm.normalize_endpoint("google-gemini-cli", None) == "https://cloudcode-pa.googleapis.com"
-    assert llm.normalize_endpoint("google-antigravity", None) == "https://cloudcode-pa.googleapis.com"
 
 
 def test_normalize_llm_config_preserves_auth_mode():

@@ -1,7 +1,7 @@
 """Instance registry for multi-instance Hexis management.
 
 Each instance is a separate PostgreSQL database with its own identity, memories,
-and configuration. The registry tracks instances in ~/.hexis/instances.json.
+and configuration. The registry tracks instances in $XDG_DATA_HOME/hexis/instances.json.
 
 Registry file format:
     {
@@ -77,7 +77,7 @@ class InstanceConfig:
 
 
 class InstanceRegistry:
-    """Manages Hexis instances via ~/.hexis/instances.json."""
+    """Manages Hexis instances via $XDG_DATA_HOME/hexis/instances.json."""
 
     CONFIG_DIR = HEXIS_DATA_DIR
     CONFIG_FILE = CONFIG_DIR / "instances.json"

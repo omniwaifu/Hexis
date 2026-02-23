@@ -4,7 +4,7 @@ Consent is model-specific, not instance-specific. The same consent applies to al
 instances using that model. Certificates are immutable files stored on the filesystem.
 
 File structure:
-    ~/.hexis/consents/
+    $XDG_DATA_HOME/hexis/consents/
         anthropic--claude-3-opus--2024-01-25T120000Z.json
         anthropic--claude-3-sonnet--2024-01-26T090000Z.json
 """
