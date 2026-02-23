@@ -2,8 +2,8 @@
 Hexis Configuration File Support
 
 Supplements environment variables with a config file at:
-  ~/.hexis/config.json                          (global)
-  ~/.hexis/instances/<name>/config.json         (per-instance)
+  $XDG_CONFIG_HOME/hexis/config.json                          (global)
+  $XDG_CONFIG_HOME/hexis/instances/<name>/config.json         (per-instance)
 
 Precedence: env vars > config file > defaults
 """
@@ -18,8 +18,16 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Default base directory
-_HEXIS_HOME = Path(os.environ.get("HEXIS_HOME", Path.home() / ".hexis"))
+# XDG base directories (spec defaults when env vars are unset)
+_XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+_XDG_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+
+# Hexis directories — override via HEXIS_CONFIG_HOME / HEXIS_DATA_HOME
+HEXIS_CONFIG_DIR = Path(os.environ.get("HEXIS_CONFIG_HOME", _XDG_CONFIG_HOME / "hexis"))
+HEXIS_DATA_DIR = Path(os.environ.get("HEXIS_HOME", _XDG_DATA_HOME / "hexis"))
+
+# Legacy alias
+_HEXIS_HOME = HEXIS_DATA_DIR
 
 # Defaults used when neither env var nor config file provides a value
 _DEFAULTS: dict[str, Any] = {
@@ -56,15 +64,15 @@ _ENV_MAP: dict[str, str] = {
 
 
 def hexis_home() -> Path:
-    """Return the Hexis home directory (~/.hexis)."""
-    return _HEXIS_HOME
+    """Return the Hexis data directory ($XDG_DATA_HOME/hexis)."""
+    return HEXIS_DATA_DIR
 
 
 def _config_file_path(instance: str | None = None) -> Path:
     """Return the path to the config file for the given instance."""
     if instance and instance != "default":
-        return _HEXIS_HOME / "instances" / instance / "config.json"
-    return _HEXIS_HOME / "config.json"
+        return HEXIS_CONFIG_DIR / "instances" / instance / "config.json"
+    return HEXIS_CONFIG_DIR / "config.json"
 
 
 def _load_file(path: Path) -> dict[str, Any]:

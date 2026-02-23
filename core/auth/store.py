@@ -14,7 +14,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Generator
 
-AUTH_DIR = Path.home() / ".hexis" / "auth"
+from core.config import HEXIS_DATA_DIR
+AUTH_DIR = HEXIS_DATA_DIR / "auth"
 
 
 def _auth_file(key: str) -> Path:

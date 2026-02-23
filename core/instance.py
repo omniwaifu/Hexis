@@ -30,6 +30,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from core.config import HEXIS_DATA_DIR
+
 
 @dataclass
 class InstanceConfig:
@@ -77,7 +79,7 @@ class InstanceConfig:
 class InstanceRegistry:
     """Manages Hexis instances via ~/.hexis/instances.json."""
 
-    CONFIG_DIR = Path.home() / ".hexis"
+    CONFIG_DIR = HEXIS_DATA_DIR
     CONFIG_FILE = CONFIG_DIR / "instances.json"
     NAME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*$")
 

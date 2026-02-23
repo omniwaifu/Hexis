@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any
 
 PACKAGE_CHARACTERS_DIR = Path(__file__).resolve().parent.parent / "characters"
-USER_CHARACTERS_DIR = Path.home() / ".hexis" / "characters"
+from core.config import HEXIS_DATA_DIR
+USER_CHARACTERS_DIR = HEXIS_DATA_DIR / "characters"
 
 # Backwards compat alias
 CHARACTERS_DIR = PACKAGE_CHARACTERS_DIR

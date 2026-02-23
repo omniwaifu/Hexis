@@ -14,6 +14,7 @@ import json
 
 import asyncpg
 
+from core.config import HEXIS_DATA_DIR
 from core.instance import InstanceConfig, InstanceRegistry, validate_instance_name
 from core.schema import (
     apply_schema,
@@ -36,7 +37,7 @@ class AgentDeletionRefused(RuntimeError):
 
 
 def _termination_record_path(instance_name: str) -> Path:
-    base = Path.home() / ".hexis" / "termination_records" / instance_name
+    base = HEXIS_DATA_DIR / "termination_records" / instance_name
     base.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return base / f"{instance_name}-{timestamp}.json"

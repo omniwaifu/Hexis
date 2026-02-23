@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from core.config import HEXIS_DATA_DIR
+
 logger = logging.getLogger(__name__)
 
 
@@ -106,7 +108,7 @@ class ConsentCertificate:
 class ConsentManager:
     """Manages consent certificates on the filesystem."""
 
-    CONSENTS_DIR = Path.home() / ".hexis" / "consents"
+    CONSENTS_DIR = HEXIS_DATA_DIR / "consents"
 
     def __init__(self, consents_dir: Path | None = None):
         if consents_dir is not None:
