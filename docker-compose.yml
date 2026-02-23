@@ -62,7 +62,6 @@ services:
   embeddings:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
     container_name: hexis_embeddings
-    platform: linux/amd64
     command:
       - --model-id
       - ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}

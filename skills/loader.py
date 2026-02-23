@@ -6,7 +6,7 @@ Skills use YAML frontmatter for metadata and markdown for content.
 
 Supports:
 - Bundled skills (skills/installed/)
-- User skills (~/.hexis/skills/)
+- User skills ($XDG_DATA_HOME/hexis/skills/)
 - Workspace skills (./skills/ in CWD)
 - Extra directories via parameter
 """
@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from .base import SkillContext, SkillSpec
+from core.config import HEXIS_DATA_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 _SKILLS_DIR = Path(__file__).resolve().parent / "installed"
 
 # User skills directory
-_USER_SKILLS_DIR = Path.home() / ".hexis" / "skills"
+_USER_SKILLS_DIR = HEXIS_DATA_DIR / "skills"
 
 # YAML frontmatter regex: --- at start, content, --- delimiter
 _FRONTMATTER_RE = re.compile(
@@ -172,7 +173,7 @@ def discover_skill_dirs() -> list[Path]:
     Discover all skill directories to scan.
 
     Precedence (highest to lowest):
-    1. User skills (~/.hexis/skills/)
+    1. User skills ($XDG_DATA_HOME/hexis/skills/)
     2. Bundled skills (skills/installed/)
     """
     dirs: list[Path] = []

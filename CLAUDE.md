@@ -188,13 +188,13 @@ The heartbeat is the agent's conscious cognitive loop:
 Always activate the venv before running any Python, pytest, or hexis CLI commands:
 
 ```bash
-source /Volumes/SB-XTM5/git/Hexis/.venv/bin/activate
+source .venv/bin/activate
 ```
 
 Prefix all shell commands with this activation. Example:
 
 ```bash
-source /Volumes/SB-XTM5/git/Hexis/.venv/bin/activate && pytest tests -q
+source .venv/bin/activate && pytest tests -q
 ```
 
 ### Bouncing the Database (Applying Schema Changes)
@@ -204,7 +204,7 @@ SQL schema files (`db/*.sql`) are **baked into the Docker image at build time** 
 To apply schema changes, you must rebuild the image and recreate the volume:
 
 ```bash
-source /Volumes/SB-XTM5/git/Hexis/.venv/bin/activate && docker-compose down -v && docker-compose build db && docker-compose up -d
+docker-compose down -v && docker-compose build db && docker-compose up -d
 ```
 
 Breaking this down:
