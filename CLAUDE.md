@@ -199,20 +199,19 @@ source .venv/bin/activate && pytest tests -q
 
 ### Bouncing the Database (Applying Schema Changes)
 
-SQL schema files (`db/*.sql`) are **baked into the Docker image at build time** (not bind-mounted). Editing SQL files on disk does NOT automatically take effect in the running container.
+SQL schema files (`db/*.sql`) are bind-mounted into `/docker-entrypoint-initdb.d/` and executed by Postgres on first init. Editing them on disk takes effect after a volume reset — no image rebuild required.
 
-To apply schema changes, you must rebuild the image and recreate the volume:
+To apply schema changes:
 
 ```bash
-docker-compose down -v && docker-compose build db && docker-compose up -d
+docker-compose down -v && docker-compose up -d
 ```
 
 Breaking this down:
 1. `docker-compose down -v` -- stops containers and **removes the data volume** (required for fresh schema init)
-2. `docker-compose build db` -- rebuilds the `db` service image with the updated SQL files
-3. `docker-compose up -d` -- starts containers with the new image
+2. `docker-compose up -d` -- starts fresh; Postgres re-runs all SQL files from `db/`
 
-**Important**: The docker-compose service is named `db`, but the container is named `hexis_brain`. Always use the service name (`db`) with docker-compose commands (e.g., `docker-compose build db`), but use the container name with `docker exec` (e.g., `docker exec hexis_brain psql ...`).
+**Note**: The docker-compose service is named `db`, but the container is named `hexis_brain`. Use the service name with docker-compose commands and the container name with `docker exec` (e.g., `docker exec hexis_brain psql ...`).
 
 ### Verifying Schema Changes
 
