@@ -1,7 +1,5 @@
 # Hexis
 
-<img width="500" alt="image" src="https://github.com/user-attachments/assets/28ec017f-f646-46c4-9750-5173188b755d" />
-
 **Memory, Identity, and the Shape of Becoming**
 
 A Postgres-native cognitive architecture that wraps any LLM and gives it persistent memory, autonomous behavior, and identity. You run it locally. Your data stays yours.
