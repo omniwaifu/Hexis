@@ -40,6 +40,7 @@ _DEFAULT_MODELS: dict[str, str] = {
     "chutes": "deepseek-ai/DeepSeek-V3-0324",
     "qwen-portal": "qwen-max-latest",
     "minimax-portal": "MiniMax-M1",
+    "zhipu": "glm-4-flash",
 }
 
 _PROVIDER_ENV_VARS: dict[str, str] = {
@@ -51,6 +52,7 @@ _PROVIDER_ENV_VARS: dict[str, str] = {
     "chutes": "",
     "qwen-portal": "",
     "minimax-portal": "",
+    "zhipu": "HEXIS_LLM_CONSCIOUS_API_KEY",
 }
 
 # Providers that use OAuth / device-code / token auth (no API key needed).
@@ -61,6 +63,7 @@ _OAUTH_PROVIDERS: set[str] = {
 
 def detect_provider(api_key: str) -> str:
     """Auto-detect LLM provider from API key prefix."""
+    import re
     if api_key.startswith("sk-ant-"):
         return "anthropic"
     if api_key.startswith("sk-"):
@@ -69,6 +72,8 @@ def detect_provider(api_key: str) -> str:
         return "grok"
     if api_key.startswith("AIza"):
         return "gemini"
+    if re.fullmatch(r"[0-9a-f]{32}\.[A-Za-z0-9]+", api_key):
+        return "zhipu"
     raise ValueError(
         f"Cannot detect provider from key prefix '{api_key[:6]}...'. Use --provider."
     )

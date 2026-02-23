@@ -37,6 +37,7 @@ _DEFAULT_MODELS: dict[str, str] = {
     "chutes": "deepseek-ai/DeepSeek-V3-0324",
     "qwen-portal": "qwen-max-latest",
     "minimax-portal": "MiniMax-M1",
+    "zhipu": "glm-4-flash",
 }
 
 _PROVIDER_ENV_VARS: dict[str, str] = {
@@ -48,6 +49,7 @@ _PROVIDER_ENV_VARS: dict[str, str] = {
     "chutes": "",
     "qwen-portal": "",
     "minimax-portal": "",
+    "zhipu": "HEXIS_LLM_CONSCIOUS_API_KEY",
 }
 
 _PROVIDER_OPTIONS: list[tuple[str, str]] = [
@@ -55,6 +57,7 @@ _PROVIDER_OPTIONS: list[tuple[str, str]] = [
     ("Anthropic", "anthropic"),
     ("Grok (xAI)", "grok"),
     ("Gemini", "gemini"),
+    ("Z.ai / Zhipu (API key)", "zhipu"),
     ("Ollama (local)", "ollama"),
     ("Chutes (OAuth)", "chutes"),
     ("Qwen Portal (OAuth)", "qwen-portal"),
@@ -96,6 +99,8 @@ class LLMConfigScreen(Screen):
     def _default_endpoint(provider: str) -> str:
         if provider == "openai":
             return os.getenv("OPENAI_BASE_URL", "")
+        if provider == "zhipu":
+            return "https://open.bigmodel.cn/api/paas/v4/"
         return ""
 
     def compose(self) -> ComposeResult:
