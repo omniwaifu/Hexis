@@ -27,9 +27,9 @@ services:
       - -c
       - app.embedding_dimension=${EMBEDDING_DIMENSION:-768}
       - -c
-      - app.embedding_service_url=${EMBEDDING_SERVICE_URL:-http://host.docker.internal:11434/api/embed}
+      - app.embedding_service_url=${EMBEDDING_SERVICE_URL:-http://embeddings:80/embed}
       - -c
-      - app.embedding_model_id=${EMBEDDING_MODEL_ID:-embeddinggemma:300m-qat-q4_0}
+      - app.embedding_model_id=${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
     networks:
       - public
       - private
@@ -57,38 +57,35 @@ services:
       - public
       - private
 
-  # Embeddings are provided by Ollama running on the host (default).
-  # The DB connects to Ollama via host.docker.internal:11434.
-  # To use HuggingFace TEI instead, uncomment the service below and set:
-  #   EMBEDDING_SERVICE_URL=http://embeddings:80/embed
-  #
-  # embeddings:
-  #   image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
-  #   container_name: hexis_embeddings
-  #   platform: linux/amd64
-  #   command:
-  #     - --model-id
-  #     - ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
-  #     - --dtype
-  #     - float32
-  #   environment:
-  #     EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
-  #     EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
-  #     HF_HOME: /data
-  #     HUGGINGFACE_HUB_CACHE: /data
-  #   expose:
-  #     - "80"
-  #   volumes:
-  #     - ${EMBEDDINGS_CACHE_DIR:-/tmp/hexis_embeddings_cache}:/data
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:80/health"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 3
-  #     start_period: 60s
-  #   networks:
-  #     - private
-  #     - public
+  # Embeddings via HuggingFace TEI (fully containerized, no Ollama dependency).
+  # Set EMBEDDINGS_CACHE_DIR to a persistent path so the model isn't re-downloaded on every `down -v`.
+  embeddings:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    container_name: hexis_embeddings
+    platform: linux/amd64
+    command:
+      - --model-id
+      - ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
+      - --dtype
+      - float32
+    environment:
+      EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
+      HF_HOME: /data
+      HUGGINGFACE_HUB_CACHE: /data
+    expose:
+      - "80"
+    volumes:
+      - ${EMBEDDINGS_CACHE_DIR:-/tmp/hexis_embeddings_cache}:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - private
+      - public
 
   heartbeat_worker:
     build:

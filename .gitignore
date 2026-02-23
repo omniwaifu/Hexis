@@ -29,6 +29,7 @@ wheels/
 venv/
 env/
 ENV/
+.env*
 
 # IDE
 .idea/
@@ -65,3 +66,5 @@ logs/
 .cache/
 .tmp/
 .reference
+
+

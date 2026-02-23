@@ -239,6 +239,7 @@ async def build_system_prompt(
     subconscious_output: SubconsciousOutput | None = None,
     has_backlog_tasks: bool = False,
     is_group: bool = False,
+    persona: dict[str, Any] | None = None,
 ) -> str:
     """Build the system prompt for either chat or heartbeat mode."""
 
@@ -250,6 +251,16 @@ async def build_system_prompt(
             prompt += "\n\n" + load_channel_context_prompt().strip()
     else:
         prompt = load_heartbeat_agentic_prompt().strip()
+
+    # Persona preamble — voice, description, personality from init_profile
+    if persona:
+        lines = ["## Persona"]
+        for key in ("description", "voice", "personality", "purpose", "pronouns"):
+            val = persona.get(key)
+            if val:
+                lines.append(f"- **{key}**: {val}")
+        if len(lines) > 1:
+            prompt += "\n\n" + "\n".join(lines)
 
     # Add dynamic tool descriptions
     tool_context = ToolContext.CHAT if mode == "chat" else ToolContext.HEARTBEAT
@@ -350,6 +361,21 @@ async def run_agent(
         llm_fallback = "llm" if mode == "chat" else None
         llm_config = await load_llm_config(conn, llm_key, fallback_key=llm_fallback)
 
+        # Inject agent name into prompts + capture persona for system prompt
+        _persona: dict[str, Any] | None = None
+        try:
+            _raw = await conn.fetchval("SELECT value FROM config WHERE key = 'agent.init_profile'")
+            if _raw:
+                _ip = json.loads(_raw) if isinstance(_raw, str) else _raw
+                _agent = _ip.get("agent") or {}
+                _aname = _agent.get("name") or _ip.get("name")
+                if _aname:
+                    from services.prompt_resources import set_agent_name
+                    set_agent_name(_aname)
+                _persona = {k: _agent[k] for k in ("description", "voice", "personality", "purpose", "pronouns") if _agent.get(k)}
+        except Exception:
+            pass
+
         # 2. Hydrate memory context (chat mode - heartbeat builds its own context)
         memory_context = ""
         if mode == "chat":
@@ -413,6 +439,7 @@ async def run_agent(
         subconscious_output=subconscious_output,
         has_backlog_tasks=has_backlog_tasks,
         is_group=is_group,
+        persona=_persona,
     )
 
     # 5. Build enriched user message
@@ -529,6 +556,21 @@ async def stream_agent(
         llm_fallback = "llm" if mode == "chat" else None
         llm_config = await load_llm_config(conn, llm_key, fallback_key=llm_fallback)
 
+        # Inject agent name into prompts + capture persona for system prompt
+        _persona: dict[str, Any] | None = None
+        try:
+            _raw = await conn.fetchval("SELECT value FROM config WHERE key = 'agent.init_profile'")
+            if _raw:
+                _ip = json.loads(_raw) if isinstance(_raw, str) else _raw
+                _agent = _ip.get("agent") or {}
+                _aname = _agent.get("name") or _ip.get("name")
+                if _aname:
+                    from services.prompt_resources import set_agent_name
+                    set_agent_name(_aname)
+                _persona = {k: _agent[k] for k in ("description", "voice", "personality", "purpose", "pronouns") if _agent.get(k)}
+        except Exception:
+            pass
+
         # Hydrate memory
         memory_context = ""
         if mode == "chat":
@@ -588,6 +630,7 @@ async def stream_agent(
         subconscious_output=subconscious_output,
         has_backlog_tasks=has_backlog_tasks,
         is_group=is_group,
+        persona=_persona,
     )
 
     # Build enriched user message

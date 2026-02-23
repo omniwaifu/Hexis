@@ -261,7 +261,29 @@ def _ensure_stack_running(args: argparse.Namespace) -> Path:
 
 
 def _ensure_embedding_model() -> None:
-    """Pull the default Ollama embedding model if not present."""
+    """Verify embeddings are available. Supports TEI (default) or Ollama."""
+    import urllib.request
+    embedding_url = os.getenv("EMBEDDING_SERVICE_URL", "http://embeddings:80/embed")
+
+    # If pointing at TEI (or any non-Ollama service), just health-check and bail.
+    if "11434" not in embedding_url and "ollama" not in embedding_url.lower():
+        # TEI downloads the model on first startup — nothing to pull.
+        # Try a quick health check to confirm the service is reachable.
+        health_url = embedding_url.rsplit("/", 1)[0] + "/health"
+        try:
+            with urllib.request.urlopen(health_url, timeout=5) as resp:
+                if resp.status == 200:
+                    console.print("[ok]\u2714[/ok] Embedding service healthy")
+                    return
+        except Exception:
+            pass
+        console.print(
+            "[warn]\u26a0[/warn] Embedding service not reachable yet "
+            f"({health_url}). It will start automatically with the Docker stack."
+        )
+        return
+
+    # Ollama path (only reached if EMBEDDING_SERVICE_URL points at Ollama).
     model = "embeddinggemma:300m-qat-q4_0"
     ollama_bin = shutil.which("ollama")
     if not ollama_bin:
@@ -284,11 +306,8 @@ def _ensure_embedding_model() -> None:
 
     console.print(f"[muted]Pulling embedding model {model}...[/muted]")
     try:
-        subprocess.run(
-            [ollama_bin, "pull", model],
-            timeout=600,
-        )
-        console.print(f"[ok]\u2714[/ok] Embedding model pulled")
+        subprocess.run([ollama_bin, "pull", model], timeout=600)
+        console.print("[ok]\u2714[/ok] Embedding model pulled")
     except subprocess.TimeoutExpired:
         console.print(f"[warn]\u26a0[/warn] Ollama pull timed out. Run manually: ollama pull {model}")
     except Exception as exc:
@@ -310,18 +329,24 @@ async def _run_init_noninteractive(args: argparse.Namespace) -> int:
         err_console.print(f"[fail]--api-key required for provider '{provider}'[/fail]")
         return 1
 
-    # 2. Resolve model
+    # 2. Resolve model and endpoint
     model = args.model or _DEFAULT_MODELS.get(provider, "gpt-4o")
-    api_key_env = _PROVIDER_ENV_VARS.get(provider, "")
+    endpoint = getattr(args, "endpoint", None) or ""
+
+    # Always use the canonical worker env var names so docker-compose workers
+    # pick up the key without any extra configuration.
+    api_key_env = "HEXIS_LLM_CONSCIOUS_API_KEY"
+    sub_api_key_env = "HEXIS_LLM_SUBCONSCIOUS_API_KEY"
 
     console.print(make_panel(
-        f"[key]Provider:[/key] {provider}\n"
-        f"[key]Model:[/key]    {model}",
+        f"[key]Provider:[/key]  {provider}\n"
+        f"[key]Model:[/key]     {model}"
+        + (f"\n[key]Endpoint:[/key] {endpoint}" if endpoint else ""),
         title="Non-Interactive Init",
     ))
 
     # 3. Write API key to .env + set os.environ
-    if args.api_key and api_key_env:
+    if args.api_key:
         from apps.hexis_cli import _find_compose_file, _stack_root_from_compose, resolve_env_file
         compose_file, _ = _find_compose_file()
         if compose_file:
@@ -330,7 +355,9 @@ async def _run_init_noninteractive(args: argparse.Namespace) -> int:
             stack_root = Path.cwd()
         env_path = resolve_env_file(stack_root) or (stack_root / ".env")
         _write_env_var(env_path, api_key_env, args.api_key)
+        _write_env_var(env_path, sub_api_key_env, args.api_key)
         os.environ[api_key_env] = args.api_key
+        os.environ[sub_api_key_env] = args.api_key
         console.print(f"[ok]\u2714[/ok] API key written to {env_path.name}")
         # Re-load dotenv so downstream code picks it up
         load_dotenv(env_path, override=True)
@@ -355,10 +382,10 @@ async def _run_init_noninteractive(args: argparse.Namespace) -> int:
         heartbeat_config = {
             "provider": provider,
             "model": model,
-            "endpoint": "",
+            "endpoint": endpoint,
             "api_key_env": api_key_env,
         }
-        subconscious_config = heartbeat_config.copy()
+        subconscious_config = {**heartbeat_config, "api_key_env": sub_api_key_env}
 
         await conn.fetchval(
             "SELECT init_llm_config($1::jsonb, $2::jsonb)",
@@ -561,8 +588,8 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
         default="" if provider in _OAUTH_PROVIDERS else os.getenv("OPENAI_BASE_URL", ""),
     )
     api_key_env = _prompt(
-        "API key env var name (e.g. OPENAI_API_KEY)",
-        default=_PROVIDER_ENV_VARS.get(provider, "") or ("OPENAI_API_KEY" if provider in {"openai", "openai_compatible"} else ""),
+        "API key env var name",
+        default="HEXIS_LLM_CONSCIOUS_API_KEY",
     )
 
     use_separate_sub = _prompt_yes_no("Use separate subconscious model?", default=False)
@@ -570,12 +597,12 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
         sub_provider = _prompt("Subconscious provider", default=provider, required=True)
         sub_model = _prompt("Subconscious model", default=model, required=True)
         sub_endpoint = _prompt("Subconscious endpoint", default=endpoint)
-        sub_key_env = _prompt("Subconscious API key env var", default=api_key_env)
+        sub_key_env = _prompt("Subconscious API key env var", default="HEXIS_LLM_SUBCONSCIOUS_API_KEY")
     else:
         sub_provider = provider
         sub_model = model
         sub_endpoint = endpoint
-        sub_key_env = api_key_env
+        sub_key_env = "HEXIS_LLM_SUBCONSCIOUS_API_KEY"
 
     # Save LLM config to DB
     heartbeat_config = {
@@ -1007,6 +1034,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="LLM provider (auto-detected from --api-key if omitted)")
     p.add_argument("--model", default=None,
                     help="LLM model (defaults per provider)")
+    p.add_argument("--endpoint", default=None,
+                    help="Custom API base URL (for OpenAI-compatible providers, e.g. GLM, local vLLM)")
     p.add_argument("--character", default=None,
                     help="Character card name (e.g. 'hexis', 'jarvis'). Omit for express defaults")
     p.add_argument("--name", default=None,
@@ -1014,7 +1043,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-docker", action="store_true", default=False,
                     help="Skip Docker auto-start")
     p.add_argument("--no-pull", action="store_true", default=False,
-                    help="Skip Ollama embedding model pull")
+                    help="Skip embedding model availability check")
     return p
 
 
@@ -1023,7 +1052,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     # Non-interactive mode if any of these flags are present
-    if args.api_key or args.provider or args.character:
+    if args.api_key or args.provider or args.character or getattr(args, "endpoint", None):
         try:
             return asyncio.run(_run_init_noninteractive(args))
         except KeyboardInterrupt:

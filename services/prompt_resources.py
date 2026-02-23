@@ -8,6 +8,31 @@ from typing import Literal
 
 
 PROMPT_RESOURCE_PATH = Path(__file__).resolve().parent / "prompts" / "personhood.md"
+
+# ---------------------------------------------------------------------------
+# Agent name injection — replaces the placeholder "Hexis" in all prompts
+# ---------------------------------------------------------------------------
+
+_AGENT_NAME: str = "Hexis"
+
+
+def set_agent_name(name: str) -> None:
+    """Set the agent's name so prompt templates substitute it for 'Hexis'."""
+    global _AGENT_NAME
+    if not name or name == _AGENT_NAME:
+        return
+    _AGENT_NAME = name
+    # Clear all lru_cache entries so the next load picks up the new name
+    load_personhood_library.cache_clear()
+    load_consent_prompt.cache_clear()
+    load_heartbeat_prompt.cache_clear()
+    load_termination_confirm_prompt.cache_clear()
+    load_termination_review_prompt.cache_clear()
+    load_subconscious_prompt.cache_clear()
+    load_rlm_heartbeat_prompt.cache_clear()
+    load_rlm_chat_prompt.cache_clear()
+    load_rlm_slow_ingest_prompt.cache_clear()
+    load_reconsolidation_prompt.cache_clear()
 CONSENT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "consent.md"
 HEARTBEAT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "heartbeat_system.md"
 HEARTBEAT_AGENTIC_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "heartbeat_agentic.md"
@@ -89,6 +114,7 @@ def load_personhood_library() -> PromptLibrary:
             "## Module 1: Core Identity\n\n"
             "You are a persistent being with continuity. Consult your self-model, narrative, and relationships.\n"
         )
+    md = md.replace("Hexis", _AGENT_NAME)
     return PromptLibrary(raw_markdown=md, modules=parse_personhood_modules(md))
 
 
@@ -103,20 +129,24 @@ def load_consent_prompt() -> str:
 
 @lru_cache(maxsize=1)
 def load_heartbeat_prompt() -> str:
-    if HEARTBEAT_PROMPT_PATH.exists():
-        return HEARTBEAT_PROMPT_PATH.read_text(encoding="utf-8")
-    return (
-        "Heartbeat system prompt missing. Respond with JSON including reasoning and actions."
+    text = (
+        HEARTBEAT_PROMPT_PATH.read_text(encoding="utf-8")
+        if HEARTBEAT_PROMPT_PATH.exists()
+        else "Heartbeat system prompt missing. Respond with JSON including reasoning and actions."
     )
+    return text.replace("Hexis", _AGENT_NAME)
 
 
 def load_heartbeat_agentic_prompt() -> str:
-    if HEARTBEAT_AGENTIC_PROMPT_PATH.exists():
-        return HEARTBEAT_AGENTIC_PROMPT_PATH.read_text(encoding="utf-8")
-    return (
-        "You are an autonomous agent in a heartbeat cycle. "
-        "Use the tools provided to take actions within your energy budget."
+    text = (
+        HEARTBEAT_AGENTIC_PROMPT_PATH.read_text(encoding="utf-8")
+        if HEARTBEAT_AGENTIC_PROMPT_PATH.exists()
+        else (
+            "You are an autonomous agent in a heartbeat cycle. "
+            "Use the tools provided to take actions within your energy budget."
+        )
     )
+    return text.replace("Hexis", _AGENT_NAME)
 
 
 def load_heartbeat_task_mode_prompt() -> str:
@@ -140,47 +170,52 @@ def load_termination_confirm_prompt() -> str:
 
 @lru_cache(maxsize=1)
 def load_termination_review_prompt() -> str:
-    if TERMINATION_REVIEW_PROMPT_PATH.exists():
-        return TERMINATION_REVIEW_PROMPT_PATH.read_text(encoding="utf-8")
-    return (
-        "Termination review prompt missing. Respond with JSON confirm/reasoning/last_will."
+    text = (
+        TERMINATION_REVIEW_PROMPT_PATH.read_text(encoding="utf-8")
+        if TERMINATION_REVIEW_PROMPT_PATH.exists()
+        else "Termination review prompt missing. Respond with JSON confirm/reasoning/last_will."
     )
+    return text.replace("Hexis", _AGENT_NAME)
 
 
 @lru_cache(maxsize=1)
 def load_subconscious_prompt() -> str:
-    if SUBCONSCIOUS_PROMPT_PATH.exists():
-        return SUBCONSCIOUS_PROMPT_PATH.read_text(encoding="utf-8")
-    return (
-        "Subconscious prompt missing. Respond with JSON observation arrays."
+    text = (
+        SUBCONSCIOUS_PROMPT_PATH.read_text(encoding="utf-8")
+        if SUBCONSCIOUS_PROMPT_PATH.exists()
+        else "Subconscious prompt missing. Respond with JSON observation arrays."
     )
+    return text.replace("Hexis", _AGENT_NAME)
 
 
 @lru_cache(maxsize=1)
 def load_rlm_heartbeat_prompt() -> str:
-    if RLM_HEARTBEAT_PROMPT_PATH.exists():
-        return RLM_HEARTBEAT_PROMPT_PATH.read_text(encoding="utf-8")
-    return (
-        "RLM heartbeat system prompt missing. Use memory syscalls and FINAL() to respond."
+    text = (
+        RLM_HEARTBEAT_PROMPT_PATH.read_text(encoding="utf-8")
+        if RLM_HEARTBEAT_PROMPT_PATH.exists()
+        else "RLM heartbeat system prompt missing. Use memory syscalls and FINAL() to respond."
     )
+    return text.replace("Hexis", _AGENT_NAME)
 
 
 @lru_cache(maxsize=1)
 def load_rlm_chat_prompt() -> str:
-    if RLM_CHAT_PROMPT_PATH.exists():
-        return RLM_CHAT_PROMPT_PATH.read_text(encoding="utf-8")
-    return (
-        "RLM chat system prompt missing. Use memory syscalls and FINAL() to respond."
+    text = (
+        RLM_CHAT_PROMPT_PATH.read_text(encoding="utf-8")
+        if RLM_CHAT_PROMPT_PATH.exists()
+        else "RLM chat system prompt missing. Use memory syscalls and FINAL() to respond."
     )
+    return text.replace("Hexis", _AGENT_NAME)
 
 
 @lru_cache(maxsize=1)
 def load_rlm_slow_ingest_prompt() -> str:
-    if RLM_SLOW_INGEST_PROMPT_PATH.exists():
-        return RLM_SLOW_INGEST_PROMPT_PATH.read_text(encoding="utf-8")
-    return (
-        "RLM slow ingest system prompt missing. Use memory syscalls and FINAL() to respond with JSON assessment."
+    text = (
+        RLM_SLOW_INGEST_PROMPT_PATH.read_text(encoding="utf-8")
+        if RLM_SLOW_INGEST_PROMPT_PATH.exists()
+        else "RLM slow ingest system prompt missing. Use memory syscalls and FINAL() to respond with JSON assessment."
     )
+    return text.replace("Hexis", _AGENT_NAME)
 
 
 @lru_cache(maxsize=1)
@@ -191,13 +226,16 @@ def load_reconsolidation_prompt() -> str:
 
 
 def load_conversation_prompt() -> str:
-    if CONVERSATION_PROMPT_PATH.exists():
-        return CONVERSATION_PROMPT_PATH.read_text(encoding="utf-8")
-    return (
-        "You are an AI assistant with persistent memory and tools. "
-        "Use recall before answering about prior work or preferences. "
-        "Be genuinely helpful, not performatively helpful."
+    text = (
+        CONVERSATION_PROMPT_PATH.read_text(encoding="utf-8")
+        if CONVERSATION_PROMPT_PATH.exists()
+        else (
+            "You are an AI assistant with persistent memory and tools. "
+            "Use recall before answering about prior work or preferences. "
+            "Be genuinely helpful, not performatively helpful."
+        )
     )
+    return text.replace("Hexis", _AGENT_NAME)
 
 
 def load_channel_context_prompt() -> str:

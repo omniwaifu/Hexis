@@ -351,10 +351,18 @@ async def doctor_payload(
             configured = bool(await conn.fetchval("SELECT is_agent_configured()"))
             if configured:
                 profile = await conn.fetchval("SELECT get_agent_profile_context()")
-                name = "unknown"
+                name = None
                 if profile:
                     p = json.loads(profile) if isinstance(profile, str) else profile
-                    name = p.get("name") or p.get("identity", {}).get("name") or "unnamed"
+                    name = p.get("name") or p.get("identity", {}).get("name")
+                if not name:
+                    init_profile = await conn.fetchval(
+                        "SELECT value FROM config WHERE key = 'agent.init_profile'"
+                    )
+                    if init_profile:
+                        ip = json.loads(init_profile) if isinstance(init_profile, str) else init_profile
+                        name = (ip.get("agent") or {}).get("name")
+                name = name or "unnamed"
                 checks.append({
                     "label": "Agent configured",
                     "status": "OK",
@@ -599,11 +607,18 @@ async def status_payload_rich(
         # Identity (agent name)
         try:
             profile = await conn.fetchval("SELECT get_agent_profile_context()")
+            name = None
             if profile:
                 p = json.loads(profile) if isinstance(profile, str) else profile
-                payload["identity"] = p.get("name") or p.get("identity", {}).get("name") or "unnamed"
-            else:
-                payload["identity"] = None
+                name = p.get("name") or p.get("identity", {}).get("name")
+            if not name:
+                init_profile = await conn.fetchval(
+                    "SELECT value FROM config WHERE key = 'agent.init_profile'"
+                )
+                if init_profile:
+                    ip = json.loads(init_profile) if isinstance(init_profile, str) else init_profile
+                    name = (ip.get("agent") or {}).get("name")
+            payload["identity"] = name or "unnamed"
         except Exception:
             payload["identity"] = None
 
