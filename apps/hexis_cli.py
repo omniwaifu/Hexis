@@ -355,7 +355,7 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to worker")
     worker.set_defaults(func="worker")
 
-    init = sub.add_parser("init", help="Set up your agent")
+    init = sub.add_parser("init", help="Configure agent identity, LLM, and consent (first-time setup; use 'reconfigure' to redo without data loss)")
     init.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to init wizard")
     init.set_defaults(func="init")
 
@@ -380,12 +380,21 @@ def build_parser() -> argparse.ArgumentParser:
     start = sub.add_parser("start", help="Start heartbeat and maintenance workers")
     start.set_defaults(func="start")
 
-    stop = sub.add_parser("stop", help="Stop workers (containers stay running)")
+    stop = sub.add_parser("stop", help="Stop heartbeat and maintenance workers (stack stays up; use 'down' to stop everything)")
     stop.set_defaults(func="stop")
 
-    reset = sub.add_parser("reset", help="Wipe the DB and re-initialize")
+    reset = sub.add_parser("reset", help="Wipe the entire database and restart (irreversible). Use 'reconfigure' to change identity without losing memories.")
     reset.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
     reset.set_defaults(func="reset")
+
+    reconfigure = sub.add_parser(
+        "reconfigure",
+        help="Reset agent identity and re-run init. Memories preserved (use --wipe-memories to also clear them).",
+    )
+    reconfigure.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+    reconfigure.add_argument("--wipe-memories", action="store_true", help="Also delete all memories")
+    reconfigure.add_argument("args", nargs=argparse.REMAINDER, help="Forwarded to init wizard")
+    reconfigure.set_defaults(func="reconfigure")
 
     status = sub.add_parser("status", parents=[_db], help="Show agent status")
     status.add_argument("--json", action="store_true", help="Output JSON")
@@ -502,8 +511,10 @@ def build_parser() -> argparse.ArgumentParser:
     char_show.add_argument("name", help="Character name or filename (without .json)")
     char_show.set_defaults(func="characters_show")
 
-    char_create = char_sub.add_parser("create", help="Create a new character card")
-    char_create.add_argument("--name", required=True, help="Character name")
+    char_create = char_sub.add_parser("create", help="Create a character card. Use --from-file to load from TOML/JSON/YAML instead of flags.")
+    char_create.add_argument("--from-file", "-f", default=None, metavar="PATH",
+                             help="Load character fields from TOML, JSON, or YAML file")
+    char_create.add_argument("--name", default=None, help="Character name")
     char_create.add_argument("--voice", default="", help="Voice description")
     char_create.add_argument("--description", "-d", default="", help="Character description")
     char_create.add_argument("--purpose", default="", help="Character purpose")
@@ -532,6 +543,9 @@ def build_parser() -> argparse.ArgumentParser:
     char_export.add_argument("name", help="Name for the exported card")
     char_export.add_argument("--output", "-o", default=None, help="Output path (default: $XDG_DATA_HOME/hexis/characters/<name>.json)")
     char_export.set_defaults(func="characters_export")
+
+    char_template = char_sub.add_parser("template", help="Print a TOML template for character creation")
+    char_template.set_defaults(func="characters_template")
 
     characters.set_defaults(func="characters")
 
@@ -1313,54 +1327,165 @@ def _characters_show(name_query: str) -> int:
     return 0
 
 
+_CHARACTERS_TEMPLATE = """\
+name = "MyAgent"
+pronouns = "they/them"
+voice = ""
+description = ""
+purpose = ""
+personality = ""
+
+values = []
+interests = []
+goals = []
+boundaries = []
+
+[worldview]
+ethics = ""
+metaphysics = ""
+epistemology = ""
+human_nature = ""
+
+[personality_traits]
+openness = 0.5
+conscientiousness = 0.5
+extraversion = 0.5
+agreeableness = 0.5
+neuroticism = 0.5
+"""
+
+
+def _characters_template() -> int:
+    """Print a TOML template for character creation."""
+    sys.stdout.write(_CHARACTERS_TEMPLATE + "\n")
+    return 0
+
+
 def _characters_create(args: Any) -> int:
-    """Create a new character card from CLI flags."""
+    """Create a new character card from CLI flags or a file."""
     from core.init_api import save_character_card
 
-    name = args.name
-    filename = name.lower().replace(" ", "_").replace("-", "_") + ".json"
+    # --- Load file defaults ---
+    file_data: dict[str, Any] = {}
+    if getattr(args, "from_file", None):
+        fpath = Path(args.from_file).resolve()
+        if not fpath.exists():
+            _print_err(f"File not found: {args.from_file}")
+            return 1
+        suffix = fpath.suffix.lower()
+        raw = fpath.read_text(encoding="utf-8")
+        if suffix == ".toml":
+            try:
+                import tomllib  # type: ignore[import-not-found]
+            except ImportError:
+                try:
+                    import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+                except ImportError:
+                    _print_err("TOML support requires Python 3.11+ or: pip install tomli")
+                    return 1
+            file_data = tomllib.loads(raw)
+        elif suffix == ".json":
+            import json as _json
+            file_data = _json.loads(raw)
+        elif suffix in (".yaml", ".yml"):
+            try:
+                import yaml as _yaml  # type: ignore[import-not-found]
+            except ImportError:
+                _print_err("YAML support requires: pip install pyyaml")
+                return 1
+            file_data = _yaml.safe_load(raw) or {}
+        else:
+            _print_err(f"Unsupported file type '{suffix}'. Use .toml, .json, or .yaml")
+            return 1
 
-    # Build chara_card_v2
-    hexis_ext: dict[str, Any] = {
-        "name": name,
-        "pronouns": args.pronouns,
-        "voice": args.voice,
-        "description": args.description,
-        "purpose": args.purpose,
-        "personality_description": args.personality,
-        "personality_traits": {
-            "openness": args.openness,
-            "conscientiousness": args.conscientiousness,
-            "extraversion": args.extraversion,
-            "agreeableness": args.agreeableness,
-            "neuroticism": args.neuroticism,
-        },
-        "values": [v.strip() for v in args.values.split(",") if v.strip()] if args.values else [],
-        "worldview": {},
-        "interests": [i.strip() for i in args.interests.split(",") if i.strip()] if args.interests else [],
-        "goals": [g.strip() for g in args.goals.split(",") if g.strip()] if args.goals else [],
-        "boundaries": [b.strip() for b in args.boundaries.split(",") if b.strip()] if args.boundaries else [],
+    # Helper: CLI flag wins over file value when the flag was explicitly set
+    # (argparse sets default for unset flags; compare against known defaults)
+    _cli_defaults = {
+        "pronouns": "they/them", "voice": "", "description": "", "purpose": "",
+        "personality": "", "values": "", "interests": "", "goals": "", "boundaries": "",
+        "openness": 0.5, "conscientiousness": 0.5, "extraversion": 0.5,
+        "agreeableness": 0.5, "neuroticism": 0.5,
+        "metaphysics": "", "human_nature": "", "epistemology": "", "ethics": "",
     }
 
-    # Worldview
+    def _get(flag_name: str, file_key: str | None = None, default: Any = "") -> Any:
+        cli_val = getattr(args, flag_name, None)
+        if cli_val is not None and cli_val != _cli_defaults.get(flag_name):
+            return cli_val
+        fk = file_key or flag_name
+        return file_data.get(fk, default if cli_val is None else cli_val)
+
+    # --- Resolve name ---
+    name = getattr(args, "name", None) or file_data.get("name")
+    if not name:
+        _print_err("Character name is required. Pass --name or set 'name' in the file.")
+        return 1
+
+    filename = name.lower().replace(" ", "_").replace("-", "_") + ".json"
+
+    # --- Personality traits (nested in file) ---
+    file_traits = file_data.get("personality_traits", {})
+    traits: dict[str, float] = {
+        "openness": _get("openness", default=0.5),
+        "conscientiousness": _get("conscientiousness", default=0.5),
+        "extraversion": _get("extraversion", default=0.5),
+        "agreeableness": _get("agreeableness", default=0.5),
+        "neuroticism": _get("neuroticism", default=0.5),
+    }
+    # For each trait, prefer CLI if set away from default, else file_traits
+    for key in traits:
+        cli_val = getattr(args, key, None)
+        if cli_val is not None and cli_val != 0.5:
+            traits[key] = cli_val
+        elif key in file_traits:
+            traits[key] = file_traits[key]
+
+    # --- Worldview (nested in file) ---
+    file_wv = file_data.get("worldview", {})
     wv: dict[str, str] = {}
-    if args.metaphysics:
-        wv["metaphysics"] = args.metaphysics
-    if args.human_nature:
-        wv["human_nature"] = args.human_nature
-    if args.epistemology:
-        wv["epistemology"] = args.epistemology
-    if args.ethics:
-        wv["ethics"] = args.ethics
-    hexis_ext["worldview"] = wv
+    for key in ("metaphysics", "human_nature", "epistemology", "ethics"):
+        cli_val = getattr(args, key, None) or ""
+        if cli_val:
+            wv[key] = cli_val
+        elif file_wv.get(key):
+            wv[key] = file_wv[key]
+
+    # --- List fields ---
+    def _list_field(flag_name: str) -> list[str]:
+        cli_val = getattr(args, flag_name, None) or ""
+        if cli_val:
+            return [v.strip() for v in cli_val.split(",") if v.strip()]
+        fv = file_data.get(flag_name, [])
+        if isinstance(fv, list):
+            return fv
+        return [v.strip() for v in str(fv).split(",") if v.strip()]
+
+    # --- Build card ---
+    personality = _get("personality")
+    description = _get("description")
+
+    hexis_ext: dict[str, Any] = {
+        "name": name,
+        "pronouns": _get("pronouns", default="they/them"),
+        "voice": _get("voice"),
+        "description": description,
+        "purpose": _get("purpose"),
+        "personality": personality,
+        "personality_traits": traits,
+        "values": _list_field("values"),
+        "worldview": wv,
+        "interests": _list_field("interests"),
+        "goals": _list_field("goals"),
+        "boundaries": _list_field("boundaries"),
+    }
 
     card_data: dict[str, Any] = {
         "spec": "chara_card_v2",
         "spec_version": "2.0",
         "data": {
             "name": name,
-            "description": args.description,
-            "personality": args.personality,
+            "description": description,
+            "personality": personality,
             "scenario": "",
             "first_mes": "",
             "mes_example": "",
@@ -2522,6 +2647,8 @@ def main(argv: list[str] | None = None) -> int:
     if func == "characters_export":
         dsn = _get_dsn(args)
         return asyncio.run(_characters_export(dsn, args.name, args.output))
+    if func == "characters_template":
+        return _characters_template()
 
     docker_cmds = {"up", "down", "ps", "logs", "start", "stop", "reset"}
     docker_bin: str | None = None
@@ -2596,6 +2723,39 @@ def main(argv: list[str] | None = None) -> int:
         if rc == 0:
             console.print("\n[ok]Database reset complete.[/ok] Run [accent]hexis init[/accent] to reconfigure the agent.\n")
         return rc
+    if func == "reconfigure":
+        from apps.cli_theme import console
+        if not args.yes:
+            console.print(
+                "[bold yellow]WARNING:[/bold yellow] This will reset agent identity and consent config. "
+                "Memories are preserved unless [accent]--wipe-memories[/accent] is passed."
+            )
+            try:
+                answer = input("Type 'reconfigure' to confirm: ")
+            except (KeyboardInterrupt, EOFError):
+                print()
+                return 1
+            if answer.strip().lower() != "reconfigure":
+                console.print("[dim]Aborted.[/dim]")
+                return 1
+
+        import asyncpg as _asyncpg  # type: ignore[import-not-found]
+        from core.agent_api import db_dsn_from_env
+
+        async def _reset_identity() -> None:
+            conn = await _asyncpg.connect(db_dsn_from_env())
+            try:
+                await conn.execute("SELECT reset_initialization()")
+                if getattr(args, "wipe_memories", False):
+                    await conn.execute("DELETE FROM memories")
+                    console.print("[ok]Memories wiped.[/ok]")
+            finally:
+                await conn.close()
+
+        asyncio.run(_reset_identity())
+        console.print("[ok]Identity config cleared.[/ok] Launching init wizard...\n")
+        from apps.hexis_init import main as _init_main
+        return _init_main(list(args.args or []))
     if func == "ps":
         return run_compose(compose_cmd or [], compose_file, stack_root, ["ps"], env_file)
     if func == "logs":

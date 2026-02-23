@@ -45,7 +45,7 @@ def _parse_card_file(path: Path) -> dict[str, Any] | None:
         "description": hexis_ext.get("description") or card_data.get("description", "")[:120],
         "voice": hexis_ext.get("voice", ""),
         "values": hexis_ext.get("values", []),
-        "personality": hexis_ext.get("personality_description", ""),
+        "personality": hexis_ext.get("personality") or hexis_ext.get("personality_description", ""),
         "extensions_hexis": hexis_ext,
         "source_dir": str(path.parent),
     }
