@@ -2,10 +2,9 @@
 import asyncio
 import json
 from pathlib import Path
-from dotenv import load_dotenv
+from core.config_loader import load_config
 
-load_dotenv(".env.local")
-load_dotenv()
+load_config()
 
 LLM_CONFIG = {
     "provider": "openai",

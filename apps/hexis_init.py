@@ -18,7 +18,7 @@ from getpass import getpass
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
+from core.config_loader import load_config, update_config_value, _ENV_TO_TOML
 
 from core import agent_api
 from core.init_api import get_card_summary, load_character_cards
@@ -34,37 +34,28 @@ from apps.cli_theme import console, err_console, heading, make_panel, make_table
 _DEFAULT_MODELS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-20250514",
     "openai": "gpt-4o",
-    "openai-codex": "gpt-5.2",
     "grok": "grok-3",
     "gemini": "gemini-2.5-flash",
     "ollama": "llama3.1",
     "chutes": "deepseek-ai/DeepSeek-V3-0324",
-    "github-copilot": "gpt-4o",
     "qwen-portal": "qwen-max-latest",
     "minimax-portal": "MiniMax-M1",
-    "google-gemini-cli": "gemini-2.5-flash",
-    "google-antigravity": "gemini-2.5-flash",
 }
 
 _PROVIDER_ENV_VARS: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
-    "openai-codex": "",
     "grok": "XAI_API_KEY",
     "gemini": "GEMINI_API_KEY",
     "ollama": "",
     "chutes": "",
-    "github-copilot": "",
     "qwen-portal": "",
     "minimax-portal": "",
-    "google-gemini-cli": "",
-    "google-antigravity": "",
 }
 
 # Providers that use OAuth / device-code / token auth (no API key needed).
 _OAUTH_PROVIDERS: set[str] = {
-    "openai-codex", "chutes", "github-copilot", "qwen-portal",
-    "minimax-portal", "google-gemini-cli", "google-antigravity",
+    "chutes", "qwen-portal", "minimax-portal",
 }
 
 
@@ -86,12 +77,8 @@ def detect_provider(api_key: str) -> str:
 def _normalize_provider_name(provider: str | None) -> str:
     raw = (provider or "").strip().lower()
     _ALIASES = {
-        "openai_codex": "openai-codex",
-        "github_copilot": "github-copilot",
         "qwen_portal": "qwen-portal",
         "minimax_portal": "minimax-portal",
-        "google_gemini_cli": "google-gemini-cli",
-        "google_antigravity": "google-antigravity",
     }
     return _ALIASES.get(raw, raw)
 
@@ -112,13 +99,9 @@ async def _ensure_oauth_login(
     """
     # Map provider -> (module path, load function name)
     _LOADERS: dict[str, tuple[str, str]] = {
-        "openai-codex":       ("core.auth.openai_codex",      "load_openai_codex_credentials"),
-        "chutes":             ("core.auth.chutes",             "load_credentials"),
-        "github-copilot":     ("core.auth.github_copilot",     "load_credentials"),
-        "qwen-portal":        ("core.auth.qwen_portal",        "load_credentials"),
-        "minimax-portal":     ("core.auth.minimax_portal",     "load_credentials"),
-        "google-gemini-cli":  ("core.auth.google_gemini_cli",  "load_credentials"),
-        "google-antigravity": ("core.auth.google_antigravity", "load_credentials"),
+        "chutes":         ("core.auth.chutes",         "load_credentials"),
+        "qwen-portal":    ("core.auth.qwen_portal",    "load_credentials"),
+        "minimax-portal": ("core.auth.minimax_portal", "load_credentials"),
     }
 
     entry = _LOADERS.get(provider)
@@ -137,9 +120,7 @@ async def _ensure_oauth_login(
 
     # Call the async login handler directly (we're already in an event loop).
     from apps.cli_auth import (
-        _openai_codex_login, _chutes_login, _github_copilot_login,
-        _qwen_portal_login, _minimax_portal_login,
-        _google_gemini_cli_login, _google_antigravity_login,
+        _chutes_login, _qwen_portal_login, _minimax_portal_login,
     )
 
     ns = argparse.Namespace(
@@ -149,29 +130,14 @@ async def _ensure_oauth_login(
         non_interactive=not allow_manual_fallback,
     )
 
-    if provider == "openai-codex":
-        rc = await _openai_codex_login(
-            dsn,
-            wait_seconds,
-            no_open=False,
-            timeout_seconds=180,
-            allow_manual_fallback=allow_manual_fallback,
-        )
-    elif provider == "chutes":
+    if provider == "chutes":
         ns.client_id = None
         rc = await _chutes_login(dsn, wait_seconds, ns)
-    elif provider == "github-copilot":
-        ns.enterprise_domain = "github.com"
-        rc = await _github_copilot_login(dsn, wait_seconds, ns)
     elif provider == "qwen-portal":
         rc = await _qwen_portal_login(dsn, wait_seconds, ns)
     elif provider == "minimax-portal":
         ns.region = "global"
         rc = await _minimax_portal_login(dsn, wait_seconds, ns)
-    elif provider == "google-gemini-cli":
-        rc = await _google_gemini_cli_login(dsn, wait_seconds, ns)
-    elif provider == "google-antigravity":
-        rc = await _google_antigravity_login(dsn, wait_seconds, ns)
     else:
         return
 
@@ -199,24 +165,6 @@ async def _load_llm_config_for_consent(
         default_provider=provider,
         default_model=model,
     )
-
-
-def _write_env_var(env_path: Path, key: str, value: str) -> None:
-    """Upsert a KEY=value line in a .env file."""
-    lines: list[str] = []
-    replaced = False
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            stripped = line.lstrip()
-            if stripped.startswith(f"{key}=") or stripped.startswith(f"{key} ="):
-                lines.append(f"{key}={value}")
-                replaced = True
-            else:
-                lines.append(line)
-    if not replaced:
-        lines.append(f"{key}={value}")
-    # Ensure trailing newline
-    env_path.write_text("\n".join(lines) + "\n")
 
 
 def _ensure_stack_running(args: argparse.Namespace) -> Path:
@@ -345,22 +293,13 @@ async def _run_init_noninteractive(args: argparse.Namespace) -> int:
         title="Non-Interactive Init",
     ))
 
-    # 3. Write API key to .env + set os.environ
+    # 3. Write API key to hexis.toml + set os.environ
     if args.api_key:
-        from apps.hexis_cli import _find_compose_file, _stack_root_from_compose, resolve_env_file
-        compose_file, _ = _find_compose_file()
-        if compose_file:
-            stack_root = _stack_root_from_compose(compose_file)
-        else:
-            stack_root = Path.cwd()
-        env_path = resolve_env_file(stack_root) or (stack_root / ".env")
-        _write_env_var(env_path, api_key_env, args.api_key)
-        _write_env_var(env_path, sub_api_key_env, args.api_key)
+        update_config_value(_ENV_TO_TOML[api_key_env], args.api_key)
+        update_config_value(_ENV_TO_TOML[sub_api_key_env], args.api_key)
         os.environ[api_key_env] = args.api_key
         os.environ[sub_api_key_env] = args.api_key
-        console.print(f"[ok]\u2714[/ok] API key written to {env_path.name}")
-        # Re-load dotenv so downstream code picks it up
-        load_dotenv(env_path, override=True)
+        console.print("[ok]\u2714[/ok] API key written to hexis.toml")
 
     # 4. Start Docker if needed
     if not args.no_docker:
@@ -1048,7 +987,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_dotenv()
+    load_config()
     args = build_parser().parse_args(argv)
 
     # Non-interactive mode if any of these flags are present

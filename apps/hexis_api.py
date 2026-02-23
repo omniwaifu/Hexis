@@ -510,41 +510,23 @@ async def init_consent_request(req: InitConsentRequest):
     test_decision_raw = (os.getenv("HEXIS_TEST_CONSENT_DECISION") or "").strip().lower()
     use_mock_consent = os.getenv("HEXIS_CONSENT_MOCK") == "1" or bool(test_decision_raw)
 
-    # Resolve OAuth (Codex) + check for existing records.
+    # Check for existing consent records.
     existing: dict[str, Any] | None = None
-    if provider == "openai-codex":
-        async with pool.acquire() as conn:
-            from core.auth.openai_codex import ensure_fresh_openai_codex_credentials
+    # Resolve API key for non-OAuth providers
+    if not api_key:
+        api_key = _resolve_fallback_api_key(provider, role)
 
-            try:
-                creds = await ensure_fresh_openai_codex_credentials()
-            except Exception as exc:
-                return JSONResponse({"error": str(exc)}, status_code=400)
+    # Fail early if we need a key (unless mocked).
+    if not use_mock_consent and provider in {"openai", "anthropic", "grok", "gemini"} and not api_key:
+        return JSONResponse({"error": "Missing API key"}, status_code=400)
 
-            api_key = creds.access
-            endpoint = endpoint or "https://chatgpt.com/backend-api"
-            existing = await _fetch_consent_record(conn, provider=provider, model=model, endpoint=endpoint)
-            if existing:
-                if role == "conscious":
-                    applied = await _apply_existing_consent(conn, existing)
-                    return JSONResponse({"consent_record": existing, "reused": True, "status": applied.get("status")})
-                return JSONResponse({"consent_record": existing, "reused": True, "status": None})
-    else:
-        # Resolve API key for non-OAuth providers
-        if not api_key:
-            api_key = _resolve_fallback_api_key(provider, role)
-
-        # Fail early if we need a key (unless mocked).
-        if not use_mock_consent and provider in {"openai", "anthropic", "grok", "gemini"} and not api_key:
-            return JSONResponse({"error": "Missing API key"}, status_code=400)
-
-        async with pool.acquire() as conn:
-            existing = await _fetch_consent_record(conn, provider=provider, model=model, endpoint=endpoint)
-            if existing:
-                if role == "conscious":
-                    applied = await _apply_existing_consent(conn, existing)
-                    return JSONResponse({"consent_record": existing, "reused": True, "status": applied.get("status")})
-                return JSONResponse({"consent_record": existing, "reused": True, "status": None})
+    async with pool.acquire() as conn:
+        existing = await _fetch_consent_record(conn, provider=provider, model=model, endpoint=endpoint)
+        if existing:
+            if role == "conscious":
+                applied = await _apply_existing_consent(conn, existing)
+                return JSONResponse({"consent_record": existing, "reused": True, "status": applied.get("status")})
+            return JSONResponse({"consent_record": existing, "reused": True, "status": None})
 
     # No existing record; request consent from the configured provider/model.
     prompt_path = os.path.join(os.path.dirname(__file__), "..", "services", "prompts", "consent.md")
@@ -691,8 +673,8 @@ async def init_consent_request(req: InitConsentRequest):
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> None:
-    from dotenv import load_dotenv
-    load_dotenv()
+    from core.config_loader import load_config
+    load_config()
 
     parser = argparse.ArgumentParser(description="Hexis API server")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")

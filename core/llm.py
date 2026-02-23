@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
 from typing import Any, AsyncIterator
-
-import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -35,13 +32,8 @@ OPENAI_COMPATIBLE = {
     "ollama",
     "grok",
     "chutes",
-    "github-copilot",
     "qwen-portal",
 }
-
-# OpenAI Codex (ChatGPT subscription) backend
-_CODEX_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api"
-_CODEX_JWT_CLAIM_PATH = "https://api.openai.com/auth"
 
 # OpenAI client cache: (api_key, base_url, provider) -> client
 _openai_clients: dict[tuple[str, str, str], Any] = {}
@@ -88,7 +80,6 @@ def _get_openai_client(api_key: str | None, base_url: str | None, provider: str,
     if openai is None:
         raise RuntimeError("openai package is required for OpenAI-compatible providers.")
 
-    # Include headers in cache key to handle cases like github-copilot
     headers_key = tuple(sorted((default_headers or {}).items())) if default_headers else ()
     cache_key = (api_key or "", base_url or "", provider, headers_key)
     if cache_key in _openai_clients:
@@ -108,283 +99,6 @@ def _clear_openai_client_cache() -> None:
     _openai_clients.clear()
 
 
-def _b64url_decode(raw: str) -> bytes:
-    s = (raw or "").strip()
-    if not s:
-        return b""
-    pad = "=" * ((4 - (len(s) % 4)) % 4)
-    return base64.urlsafe_b64decode(s + pad)
-
-
-def _extract_codex_account_id(token: str) -> str:
-    try:
-        parts = token.split(".")
-        if len(parts) != 3:
-            raise ValueError("Invalid JWT")
-        payload = json.loads(_b64url_decode(parts[1]).decode("utf-8"))
-        account_id = payload.get(_CODEX_JWT_CLAIM_PATH, {}).get("chatgpt_account_id")
-        if not isinstance(account_id, str) or not account_id:
-            raise ValueError("Missing account id in token")
-        return account_id
-    except Exception as exc:
-        raise ValueError("Failed to extract accountId from token") from exc
-
-
-def _resolve_codex_url(base_url: str | None) -> str:
-    raw = (base_url or _CODEX_DEFAULT_BASE_URL).strip()
-    normalized = raw.rstrip("/")
-    if normalized.endswith("/codex/responses"):
-        return normalized
-    if normalized.endswith("/codex"):
-        return f"{normalized}/responses"
-    return f"{normalized}/codex/responses"
-
-
-def _messages_to_codex_responses_input(
-    messages: list[dict[str, Any]],
-) -> tuple[str | None, list[dict[str, Any]]]:
-    """
-    Convert Chat Completions-style messages into Responses API input items in the
-    structured content-part format Codex expects.
-    """
-    system_parts: list[str] = []
-    input_items: list[dict[str, Any]] = []
-
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "") or ""
-
-        if role == "system":
-            if isinstance(content, str) and content.strip():
-                system_parts.append(content)
-            continue
-
-        if role == "user":
-            input_items.append({
-                "role": "user",
-                "content": [{"type": "input_text", "text": str(content)}],
-            })
-            continue
-
-        if role == "assistant":
-            if content:
-                input_items.append({
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": str(content)}],
-                })
-            for tc in msg.get("tool_calls") or []:
-                fn = tc.get("function", {})
-                args = fn.get("arguments", "{}")
-                if isinstance(args, dict):
-                    args = json.dumps(args)
-                input_items.append({
-                    "type": "function_call",
-                    "call_id": tc.get("id", ""),
-                    "name": fn.get("name", ""),
-                    "arguments": args,
-                })
-            continue
-
-        if role == "tool":
-            input_items.append({
-                "type": "function_call_output",
-                "call_id": msg.get("tool_call_id", ""),
-                "output": str(content),
-            })
-            continue
-
-    instructions = "\n\n".join(p for p in system_parts if p.strip()) or None
-    return instructions, input_items
-
-
-async def _iter_sse_events_json(response: httpx.Response) -> AsyncIterator[dict[str, Any]]:
-    """
-    Parse SSE responses where each event is JSON in one or more `data:` lines.
-    Mirrors the parsing strategy used by OpenClaw/pi-ai for Codex.
-    """
-    data_lines: list[str] = []
-    async for line in response.aiter_lines():
-        if line.startswith("data:"):
-            data_lines.append(line[5:].strip())
-            continue
-        if line.strip() != "":
-            # Ignore non-data SSE fields (event:, id:, retry:, etc.)
-            continue
-        if not data_lines:
-            continue
-        data = "\n".join(data_lines).strip()
-        data_lines = []
-        if not data or data == "[DONE]":
-            continue
-        try:
-            obj = json.loads(data)
-        except Exception:
-            continue
-        if isinstance(obj, dict):
-            yield obj
-
-
-async def _codex_responses_completion(
-    *,
-    model: str,
-    endpoint: str | None,
-    api_key: str | None,
-    messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]] | None,
-    temperature: float,
-    max_tokens: int,
-    on_text_delta: Any | None = None,
-) -> dict[str, Any]:
-    if not api_key:
-        raise RuntimeError("Missing OpenAI Codex OAuth access token (api_key).")
-
-    account_id = _extract_codex_account_id(api_key)
-    url = _resolve_codex_url(endpoint)
-    instructions, input_items = _messages_to_codex_responses_input(messages)
-    responses_tools = _tools_to_responses(tools)
-
-    payload: dict[str, Any] = {
-        "model": model,
-        "store": False,
-        "stream": True,
-        "input": input_items,
-        "text": {"verbosity": "medium"},
-        "include": ["reasoning.encrypted_content"],
-    }
-    if instructions:
-        payload["instructions"] = instructions
-    # Codex Responses API does not support temperature or max_tokens; omit both.
-    _ = temperature, max_tokens  # kept for signature parity
-
-    if responses_tools:
-        payload["tools"] = responses_tools
-        payload["tool_choice"] = "auto"
-        payload["parallel_tool_calls"] = True
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "chatgpt-account-id": account_id,
-        "OpenAI-Beta": "responses=experimental",
-        "originator": "pi",
-        "accept": "text/event-stream",
-        "content-type": "application/json",
-        "user-agent": f"hexis (python; {os.uname().sysname if hasattr(os, 'uname') else 'unknown'})",
-    }
-
-    import asyncio as _asyncio
-    import ssl as _ssl
-
-    _MAX_RETRIES = 3
-    timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
-
-    for attempt in range(_MAX_RETRIES):
-        try:
-            return await _codex_responses_attempt(
-                url=url, headers=headers, payload=payload,
-                timeout=timeout, on_text_delta=on_text_delta,
-            )
-        except (_ssl.SSLError, httpx.RemoteProtocolError, httpx.ReadError) as exc:
-            if attempt < _MAX_RETRIES - 1:
-                wait = 2 ** attempt
-                await _asyncio.sleep(wait)
-                continue
-            raise RuntimeError(f"OpenAI Codex request failed after {_MAX_RETRIES} retries: {exc}") from exc
-
-
-async def _codex_responses_attempt(
-    *,
-    url: str,
-    headers: dict[str, str],
-    payload: dict[str, Any],
-    timeout: Any,
-    on_text_delta: Any | None = None,
-) -> dict[str, Any]:
-    """Single attempt at a Codex Responses API streaming call."""
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        async with client.stream("POST", url, headers=headers, json=payload) as resp:
-            if resp.status_code < 200 or resp.status_code >= 300:
-                text = await resp.aread()
-                raise RuntimeError(
-                    f"OpenAI Codex request failed: HTTP {resp.status_code}: {text.decode('utf-8', errors='replace')}"
-                )
-
-            content_parts: list[str] = []
-            tool_calls: list[dict[str, Any]] = []
-            # Current function call (arguments stream)
-            current_fc: dict[str, Any] | None = None
-
-            async for event in _iter_sse_events_json(resp):
-                event_type = event.get("type")
-
-                if event_type == "response.output_text.delta":
-                    delta = event.get("delta", "")
-                    if isinstance(delta, str) and delta:
-                        content_parts.append(delta)
-                        if on_text_delta:
-                            import asyncio
-
-                            result = on_text_delta(delta)
-                            if asyncio.iscoroutine(result):
-                                await result
-                    continue
-
-                if event_type == "response.output_item.added":
-                    item = event.get("item") or {}
-                    if isinstance(item, dict) and item.get("type") == "function_call":
-                        current_fc = {
-                            "call_id": item.get("call_id"),
-                            "name": item.get("name"),
-                            "args_buf": item.get("arguments") or "",
-                        }
-                    continue
-
-                if event_type == "response.function_call_arguments.delta":
-                    if current_fc is not None:
-                        delta = event.get("delta", "")
-                        if isinstance(delta, str) and delta:
-                            current_fc["args_buf"] = (current_fc.get("args_buf") or "") + delta
-                    continue
-
-                if event_type == "response.function_call_arguments.done":
-                    if current_fc is not None:
-                        args = event.get("arguments", "")
-                        if isinstance(args, str) and args:
-                            current_fc["args_buf"] = args
-                    continue
-
-                if event_type in {"response.done", "response.completed"}:
-                    break
-
-                if event_type in {"error", "response.failed"}:
-                    message = (
-                        event.get("message")
-                        or (event.get("error") or {}).get("message")
-                        or "Codex request failed"
-                    )
-                    raise RuntimeError(str(message))
-
-                if event_type == "response.output_item.done":
-                    item = event.get("item") or {}
-                    if not isinstance(item, dict) or item.get("type") != "function_call":
-                        continue
-                    call_id = item.get("call_id") or (current_fc or {}).get("call_id")
-                    name = item.get("name") or (current_fc or {}).get("name")
-                    args_str = item.get("arguments") or (current_fc or {}).get("args_buf") or ""
-
-                    try:
-                        args = json.loads(args_str) if isinstance(args_str, str) and args_str else {}
-                    except Exception:
-                        logger.debug("Failed to parse tool arguments: %r", str(args_str)[:200])
-                        args = {}
-                    tool_calls.append({
-                        "id": call_id,
-                        "name": name or "",
-                        "arguments": args,
-                    })
-                    current_fc = None
-                    continue
-
-            return {"content": "".join(content_parts), "tool_calls": tool_calls, "raw": None}
 
 
 # ---------------------------------------------------------------------------
@@ -533,12 +247,8 @@ def _extract_responses_result(response: Any) -> dict[str, Any]:
 
 _PROVIDER_ALIASES: dict[str, str] = {
     "openai_chat_completions_endpoint": "openai-chat-completions-endpoint",
-    "openai_codex": "openai-codex",
-    "github_copilot": "github-copilot",
     "qwen_portal": "qwen-portal",
     "minimax_portal": "minimax-portal",
-    "google_gemini_cli": "google-gemini-cli",
-    "google_antigravity": "google-antigravity",
 }
 
 
@@ -555,11 +265,8 @@ def normalize_endpoint(provider: str, endpoint: str | None) -> str | None:
     _DEFAULTS: dict[str, str] = {
         "ollama": "http://localhost:11434/v1",
         "grok": "https://api.x.ai/v1",
-        "openai-codex": _CODEX_DEFAULT_BASE_URL,
         "chutes": "https://api.chutes.ai/v1",
         "qwen-portal": "https://portal.qwen.ai/v1",
-        "google-gemini-cli": "https://cloudcode-pa.googleapis.com",
-        "google-antigravity": "https://cloudcode-pa.googleapis.com",
     }
     return _DEFAULTS.get(provider)
 
@@ -580,7 +287,7 @@ def normalize_llm_config(config: dict[str, Any] | None, *, default_model: str = 
 
     .. warning::
         This function does **not** run provider-specific credential loaders
-        (OAuth token refresh for Codex, Copilot, Gemini CLI, etc.).  Entry
+        (OAuth token refresh for Chutes, Qwen Portal, MiniMax Portal, etc.).  Entry
         points that need fully-resolved credentials should use
         :func:`core.llm_config.resolve_llm_config` or
         :func:`core.llm_config.load_llm_config` instead.
@@ -969,11 +676,7 @@ async def chat_completion(
         return await _retry_on_transient(_do_gemini_completion)
 
     if provider in OPENAI_COMPATIBLE:
-        default_headers = None
-        if provider == "github-copilot":
-            from core.auth.github_copilot import COPILOT_REQUEST_HEADERS
-            default_headers = COPILOT_REQUEST_HEADERS
-        client = _get_openai_client(api_key, endpoint, provider, default_headers)
+        client = _get_openai_client(api_key, endpoint, provider)
 
         # Try Responses API first, fall back to Chat Completions
         if _should_try_responses(endpoint):
@@ -1009,18 +712,6 @@ async def chat_completion(
             return {"content": content, "tool_calls": tool_calls, "raw": response}
 
         return await _retry_on_transient(_do_chat_completion)
-
-    if provider == "openai-codex":
-        return await _codex_responses_completion(
-            model=model,
-            endpoint=endpoint,
-            api_key=api_key,
-            messages=messages,
-            tools=tools,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            on_text_delta=None,
-        )
 
     if provider == "anthropic":
         if auth_mode == "setup-token":
@@ -1074,22 +765,6 @@ async def chat_completion(
             auth_mode="api-key",
             max_tokens=max_tokens,
             system_prompt=system_prompt or None,
-        )
-
-    if provider in {"google-gemini-cli", "google-antigravity"}:
-        from core.providers.google_code_assist import google_code_assist_completion
-        _api_key_data = json.loads(api_key) if api_key else {}
-        access_token = _api_key_data.get("token", api_key or "")
-        project_id = _api_key_data.get("projectId", "")
-        return await google_code_assist_completion(
-            endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
-            access_token=access_token,
-            project_id=project_id,
-            model=model,
-            messages=messages,
-            tools=tools,
-            is_antigravity=(provider == "google-antigravity"),
-            system_prompt=_extract_system_prompt(messages)[0] or None,
         )
 
     raise ValueError(f"Unsupported provider: {provider}")
@@ -1187,11 +862,7 @@ async def stream_chat_completion(
         return await _retry_on_transient(_do_gemini_stream)
 
     if provider in OPENAI_COMPATIBLE:
-        default_headers = None
-        if provider == "github-copilot":
-            from core.auth.github_copilot import COPILOT_REQUEST_HEADERS
-            default_headers = COPILOT_REQUEST_HEADERS
-        client = _get_openai_client(api_key, endpoint, provider, default_headers)
+        client = _get_openai_client(api_key, endpoint, provider)
 
         # Try Responses API first, fall back to Chat Completions
         if _should_try_responses(endpoint):
@@ -1266,18 +937,6 @@ async def stream_chat_completion(
             return {"content": "".join(content_parts), "tool_calls": tool_calls, "raw": None}
 
         return await _retry_on_transient(_do_stream_completion)
-
-    if provider == "openai-codex":
-        return await _codex_responses_completion(
-            model=model,
-            endpoint=endpoint,
-            api_key=api_key,
-            messages=messages,
-            tools=tools,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            on_text_delta=on_text_delta,
-        )
 
     if provider == "anthropic":
         if auth_mode == "setup-token":
@@ -1364,24 +1023,6 @@ async def stream_chat_completion(
             auth_mode="api-key",
             max_tokens=max_tokens,
             system_prompt=system_prompt or None,
-            on_text_delta=on_text_delta,
-        )
-
-    if provider in {"google-gemini-cli", "google-antigravity"}:
-        from core.providers.google_code_assist import stream_google_code_assist_completion
-        _api_key_data = json.loads(api_key) if api_key else {}
-        access_token = _api_key_data.get("token", api_key or "")
-        project_id = _api_key_data.get("projectId", "")
-        system_prompt = _extract_system_prompt(messages)[0] or None
-        return await stream_google_code_assist_completion(
-            endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
-            access_token=access_token,
-            project_id=project_id,
-            model=model,
-            messages=messages,
-            tools=tools,
-            is_antigravity=(provider == "google-antigravity"),
-            system_prompt=system_prompt,
             on_text_delta=on_text_delta,
         )
 
@@ -1477,54 +1118,6 @@ async def stream_text_completion(
                 yield text
         return
 
-    if provider == "openai-codex":
-        if not api_key:
-            raise RuntimeError("Missing OpenAI Codex OAuth access token (api_key).")
-        account_id = _extract_codex_account_id(api_key)
-        url = _resolve_codex_url(endpoint)
-        instructions, input_items = _messages_to_codex_responses_input(messages)
-        payload: dict[str, Any] = {
-            "model": model,
-            "store": False,
-            "stream": True,
-            "input": input_items,
-            "text": {"verbosity": "medium"},
-            "include": ["reasoning.encrypted_content"],
-            "temperature": temperature,
-        }
-        if instructions:
-            payload["instructions"] = instructions
-        _ = max_tokens  # max token field support is inconsistent; omit unless proven.
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "chatgpt-account-id": account_id,
-            "OpenAI-Beta": "responses=experimental",
-            "originator": "pi",
-            "accept": "text/event-stream",
-            "content-type": "application/json",
-            "user-agent": f"hexis (python; {os.uname().sysname if hasattr(os, 'uname') else 'unknown'})",
-        }
-        timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream("POST", url, headers=headers, json=payload) as resp:
-                if resp.status_code < 200 or resp.status_code >= 300:
-                    text = await resp.aread()
-                    raise RuntimeError(
-                        f"OpenAI Codex request failed: HTTP {resp.status_code}: {text.decode('utf-8', errors='replace')}"
-                    )
-                async for event in _iter_sse_events_json(resp):
-                    event_type = event.get("type")
-                    if event_type == "response.output_text.delta":
-                        delta = event.get("delta", "")
-                        if isinstance(delta, str) and delta:
-                            yield delta
-                    elif event_type in {"response.done", "response.completed"}:
-                        return
-                    elif event_type in {"error", "response.failed"}:
-                        message = event.get("message") or "Codex request failed"
-                        raise RuntimeError(str(message))
-        return
-
     if provider == "minimax-portal":
         from core.providers.anthropic_http import stream_anthropic_http_completion
         system_prompt, rest = _extract_system_prompt(messages)
@@ -1537,26 +1130,6 @@ async def stream_text_completion(
             auth_mode="api-key",
             max_tokens=max_tokens,
             system_prompt=system_prompt or None,
-        )
-        if result["content"]:
-            yield result["content"]
-        return
-
-    if provider in {"google-gemini-cli", "google-antigravity"}:
-        from core.providers.google_code_assist import stream_google_code_assist_completion
-        _api_key_data = json.loads(api_key) if api_key else {}
-        access_token = _api_key_data.get("token", api_key or "")
-        project_id = _api_key_data.get("projectId", "")
-        system_prompt = _extract_system_prompt(messages)[0] or None
-        result = await stream_google_code_assist_completion(
-            endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
-            access_token=access_token,
-            project_id=project_id,
-            model=model,
-            messages=messages,
-            tools=None,
-            is_antigravity=(provider == "google-antigravity"),
-            system_prompt=system_prompt,
         )
         if result["content"]:
             yield result["content"]

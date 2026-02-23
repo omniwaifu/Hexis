@@ -9,10 +9,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 COMPOSE_FILE="${REPO_ROOT}/docker-compose.yml"
 
-# Load environment variables if .env exists
-if [ -f "${REPO_ROOT}/.env" ]; then
-    export $(cat "${REPO_ROOT}/.env" | grep -v '^#' | xargs)
-fi
+# DB credentials: configure via hexis.toml (loaded by the hexis CLI) or export
+# POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
+# before running this script.
 
 # Default values
 POSTGRES_USER=${POSTGRES_USER:-postgres}

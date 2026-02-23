@@ -156,23 +156,11 @@ async def config_validate(dsn: str | None = None, *, wait_seconds: int = 30) -> 
             if not model and provider not in {"ollama"}:
                 warnings.append(f"{name}.model is empty (will rely on worker defaults)")
 
-            if provider == "openai-codex":
-                oauth = cfg.get("oauth.openai_codex")
-                if not isinstance(oauth, dict) or not oauth.get("refresh") or not oauth.get("access"):
-                    errors.append(
-                        "OpenAI Codex OAuth is not configured (missing oauth.openai_codex). "
-                        "Run: `hexis auth openai-codex login`"
-                    )
-                return
-
             # OAuth providers with stored credentials
             _oauth_providers: dict[str, str] = {
                 "chutes": "oauth.chutes",
-                "github-copilot": "oauth.github_copilot",
                 "qwen-portal": "oauth.qwen_portal",
                 "minimax-portal": "oauth.minimax_portal",
-                "google-gemini-cli": "oauth.google_gemini_cli",
-                "google-antigravity": "oauth.google_antigravity",
             }
             oauth_key = _oauth_providers.get(provider)
             if oauth_key:
@@ -183,16 +171,6 @@ async def config_validate(dsn: str | None = None, *, wait_seconds: int = 30) -> 
                         f"Run: `hexis auth {provider} login`"
                     )
                 return
-
-            # Anthropic with setup-token fallback
-            if provider == "anthropic" and not api_key_env and not os.getenv("ANTHROPIC_API_KEY"):
-                token_cfg = cfg.get("token.anthropic_setup_token")
-                if isinstance(token_cfg, dict) and token_cfg.get("token"):
-                    return  # setup-token is configured
-                warnings.append(
-                    f"{name}: no ANTHROPIC_API_KEY env var and no setup-token configured. "
-                    "Run: `hexis auth anthropic setup-token` or set api_key_env"
-                )
 
             if provider in {"openai", "anthropic", "openai_compatible", "grok", "gemini"}:
                 if api_key_env:

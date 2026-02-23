@@ -29,7 +29,6 @@ wheels/
 venv/
 env/
 ENV/
-.env*
 
 # IDE
 .idea/
@@ -41,7 +40,8 @@ ENV/
 # Environment variables
 .env
 .env.*
-!.env.local
+.env.local
+hexis.toml
 
 # PostgreSQL
 *.sql.gz

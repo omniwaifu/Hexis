@@ -1,0 +1,30 @@
+# hexis.toml.example — copy to hexis.toml and fill in your values
+# hexis.toml is gitignored; this example file is tracked.
+
+[postgres]
+host = "127.0.0.1"
+port = 43815
+db = "hexis_memory"
+user = "hexis_user"
+password = "hexis_password"
+
+[hexis]
+bind_address = "0.0.0.0:43817"
+
+[llm]
+conscious_api_key = ""
+subconscious_api_key = ""
+
+[embedding]
+service_url = "http://localhost:11434"
+cache_dir = ""
+
+[telegram]
+bot_token = ""
+
+[discord]
+bot_token = ""
+
+[slack]
+bot_token = ""
+app_token = ""

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
+from core.config_loader import load_config
 from textual.app import App
 
 from apps.tui.theme import hexis_theme
@@ -95,7 +95,7 @@ class HexisInitApp(App):
         self._conn: Any = None
 
     async def on_mount(self) -> None:
-        load_dotenv()
+        load_config()
         from core.agent_api import db_dsn_from_env, ensure_schema_has_config, _connect_with_retry
 
         # Parse DSN / wait-seconds from forwarded argv

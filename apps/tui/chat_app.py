@@ -5,7 +5,7 @@ import time
 import uuid
 from typing import Any
 
-from dotenv import load_dotenv
+from core.config_loader import load_config
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
@@ -385,7 +385,7 @@ class HexisChatApp(App):
         self.dsn: str = ""
 
     async def on_mount(self) -> None:
-        load_dotenv()
+        load_config()
         import asyncpg
         from core.agent_api import db_dsn_from_env, get_agent_profile_context
         from core.llm_config import load_llm_config

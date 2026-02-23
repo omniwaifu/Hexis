@@ -31,68 +31,48 @@ from apps.tui.init_widgets import BigFiveSliders, CharacterPreview, StepBar
 _DEFAULT_MODELS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-20250514",
     "openai": "gpt-4o",
-    "openai-codex": "gpt-5.2",
     "grok": "grok-3",
     "gemini": "gemini-2.5-flash",
     "ollama": "llama3.1",
     "chutes": "deepseek-ai/DeepSeek-V3-0324",
-    "github-copilot": "gpt-4o",
     "qwen-portal": "qwen-max-latest",
     "minimax-portal": "MiniMax-M1",
-    "google-gemini-cli": "gemini-2.5-flash",
-    "google-antigravity": "gemini-2.5-flash",
 }
 
 _PROVIDER_ENV_VARS: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
-    "openai-codex": "",
     "grok": "XAI_API_KEY",
     "gemini": "GEMINI_API_KEY",
     "ollama": "",
     "chutes": "",
-    "github-copilot": "",
     "qwen-portal": "",
     "minimax-portal": "",
-    "google-gemini-cli": "",
-    "google-antigravity": "",
 }
 
 _PROVIDER_OPTIONS: list[tuple[str, str]] = [
-    ("OpenAI Codex (ChatGPT OAuth)", "openai-codex"),
     ("OpenAI Platform (API key)", "openai"),
     ("Anthropic", "anthropic"),
     ("Grok (xAI)", "grok"),
     ("Gemini", "gemini"),
     ("Ollama (local)", "ollama"),
     ("Chutes (OAuth)", "chutes"),
-    ("GitHub Copilot (OAuth)", "github-copilot"),
     ("Qwen Portal (OAuth)", "qwen-portal"),
     ("MiniMax Portal (OAuth)", "minimax-portal"),
-    ("Google Gemini CLI (OAuth)", "google-gemini-cli"),
-    ("Google Antigravity (OAuth)", "google-antigravity"),
 ]
 
 _OAUTH_PROVIDERS: set[str] = {
-    "openai-codex",
     "chutes",
-    "github-copilot",
     "qwen-portal",
     "minimax-portal",
-    "google-gemini-cli",
-    "google-antigravity",
 }
 
 
 def _normalize_provider(raw: str) -> str:
     val = (raw or "").strip().lower()
     aliases = {
-        "openai_codex": "openai-codex",
-        "github_copilot": "github-copilot",
         "qwen_portal": "qwen-portal",
         "minimax_portal": "minimax-portal",
-        "google_gemini_cli": "google-gemini-cli",
-        "google_antigravity": "google-antigravity",
     }
     return aliases.get(val, val)
 
@@ -194,10 +174,7 @@ class LLMConfigScreen(Screen):
             key_input.value = ""
             key_input.placeholder = "Not required for OAuth providers"
             key_input.disabled = True
-            if provider == "openai-codex":
-                help_text.update("Next opens browser OAuth for ChatGPT Plus/Pro.")
-            else:
-                help_text.update("Next runs provider OAuth/device-code login.")
+            help_text.update("Next runs provider OAuth/device-code login.")
         else:
             endpoint_input.disabled = False
             endpoint_input.placeholder = "https://..."
@@ -223,60 +200,8 @@ class LLMConfigScreen(Screen):
         provider = _normalize_provider(str(event.value)) if isinstance(event.value, str) else "openai"
         self._apply_provider_defaults(provider)
 
-    async def _ensure_openai_codex_login(self) -> None:
-        import socket
-        import webbrowser
-
-        from core.auth.callback_server import run_callback_server
-        from core.auth.openai_codex import (
-            build_authorize_url,
-            create_state,
-            ensure_fresh_openai_codex_credentials,
-            exchange_authorization_code,
-            generate_pkce,
-            save_openai_codex_credentials,
-        )
-
-        # Match CLI behavior: callback server binds localhost:1455.
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.bind(("127.0.0.1", 1455))
-        except OSError as e:
-            raise RuntimeError(
-                "OpenAI Codex OAuth needs localhost:1455, but the port is in use."
-            ) from e
-
-        verifier, challenge = generate_pkce()
-        state = create_state()
-        auth_url = build_authorize_url(challenge=challenge, state=state)
-        try:
-            webbrowser.open(auth_url)
-        except Exception:
-            pass
-
-        result = await asyncio.to_thread(
-            run_callback_server,
-            1455,
-            "/auth/callback",
-            180,
-            state,
-        )
-        code = result.get("code") if result else None
-        if not code:
-            raise RuntimeError(
-                "OpenAI Codex OAuth callback not received. "
-                "Retry, or run `hexis auth openai-codex login` in a terminal."
-            )
-
-        creds = await exchange_authorization_code(code=code, verifier=verifier)
-        save_openai_codex_credentials(creds)
-        await ensure_fresh_openai_codex_credentials(skew_seconds=0)
-
     async def _ensure_provider_auth(self, provider: str) -> None:
         if provider not in _OAUTH_PROVIDERS:
-            return
-        if provider == "openai-codex":
-            await self._ensure_openai_codex_login()
             return
 
         from apps.hexis_init import _ensure_oauth_login

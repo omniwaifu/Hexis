@@ -18,7 +18,7 @@ import sys
 import uuid
 from typing import Any
 
-from dotenv import load_dotenv
+from core.config_loader import load_config
 
 from apps.cli_theme import console, err_console
 
@@ -359,7 +359,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_dotenv()
+    load_config()
     from core.agent_api import db_dsn_from_env
 
     args = build_parser().parse_args(argv)

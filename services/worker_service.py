@@ -9,7 +9,7 @@ from datetime import datetime, timezone as tz
 from typing import Any
 from zoneinfo import ZoneInfo
 import asyncpg
-from dotenv import load_dotenv
+from core.config_loader import load_config
 
 from core.agent_api import db_dsn_from_env
 from core.gateway import EventSource, Gateway, GatewayConsumer, GatewayEvent
@@ -30,7 +30,7 @@ from services.reconsolidation import run_reconsolidation_step
 from services.subconscious import run_subconscious_decider
 
 
-load_dotenv()
+load_config()
 
 logging.basicConfig(
     level=logging.INFO,

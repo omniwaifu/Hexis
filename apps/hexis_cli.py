@@ -11,7 +11,7 @@ from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
+from core.config_loader import load_config
 
 from core import cli_api
 from core.agent_api import db_dsn_from_env, resolve_instance
@@ -2347,7 +2347,7 @@ def _handle_ui_container(
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_dotenv()
+    load_config()
 
     # Some commands intentionally forward argv to another module (init/chat/ingest/etc).
     # `argparse` does not accept unknown `--flags` as positional passthrough unless the

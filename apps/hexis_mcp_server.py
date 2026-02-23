@@ -24,7 +24,7 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 from uuid import UUID
 
-from dotenv import load_dotenv
+from core.config_loader import load_config
 
 from core.cognitive_memory_api import (
     CognitiveMemory,
@@ -715,7 +715,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_dotenv()
+    load_config()
     args = build_parser().parse_args(argv)
     dsn = args.dsn or _env_dsn()
     try:

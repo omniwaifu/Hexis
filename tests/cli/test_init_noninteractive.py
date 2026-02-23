@@ -9,7 +9,6 @@ import pytest
 from apps.hexis_init import (
     _DEFAULT_MODELS,
     _PROVIDER_ENV_VARS,
-    _write_env_var,
     build_parser,
     detect_provider,
 )
@@ -46,38 +45,6 @@ def test_detect_provider_unknown():
 def test_detect_provider_ordering():
     """sk-ant- must match anthropic, not openai."""
     assert detect_provider("sk-ant-api03-xxxx") == "anthropic"
-
-
-# ---------------------------------------------------------------------------
-# _write_env_var unit tests
-# ---------------------------------------------------------------------------
-
-
-def test_write_env_var_creates_file(tmp_path):
-    env_path = tmp_path / ".env"
-    _write_env_var(env_path, "MY_KEY", "my_value")
-    content = env_path.read_text()
-    assert "MY_KEY=my_value" in content
-    assert content.endswith("\n")
-
-
-def test_write_env_var_updates_existing(tmp_path):
-    env_path = tmp_path / ".env"
-    env_path.write_text("MY_KEY=old_value\nOTHER=keep\n")
-    _write_env_var(env_path, "MY_KEY", "new_value")
-    content = env_path.read_text()
-    assert "MY_KEY=new_value" in content
-    assert "old_value" not in content
-    assert "OTHER=keep" in content
-
-
-def test_write_env_var_appends_new(tmp_path):
-    env_path = tmp_path / ".env"
-    env_path.write_text("EXISTING=value\n")
-    _write_env_var(env_path, "NEW_KEY", "new_value")
-    content = env_path.read_text()
-    assert "EXISTING=value" in content
-    assert "NEW_KEY=new_value" in content
 
 
 # ---------------------------------------------------------------------------

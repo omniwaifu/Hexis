@@ -20,11 +20,11 @@ import signal
 from typing import Any
 
 import asyncpg
-from dotenv import load_dotenv
+from core.config_loader import load_config
 
 from core.agent_api import db_dsn_from_env
 
-load_dotenv()
+load_config()
 
 logging.basicConfig(
     level=logging.INFO,
