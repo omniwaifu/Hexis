@@ -515,7 +515,7 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
     heading("LLM Configuration")
 
     provider = _prompt(
-        "Provider (openai, openai-codex, anthropic, ollama, chutes, github-copilot, qwen-portal, ...)",
+        "Provider (openai, anthropic, gemini, ollama, chutes, qwen-portal, minimax-portal, zhipu, ...)",
         default=os.getenv("LLM_PROVIDER", "openai"),
         required=True,
     )
