@@ -1405,9 +1405,10 @@ async def _characters_export(dsn: str, name: str, output: str | None) -> int:
         async with pool.acquire() as conn:
             # Gather identity
             identity_row = await conn.fetchrow(
-                "SELECT value FROM config WHERE key = 'agent.identity'"
+                "SELECT value FROM config WHERE key = 'agent.init_profile'"
             )
-            identity = json.loads(identity_row["value"]) if identity_row else {}
+            init_profile = json.loads(identity_row["value"]) if identity_row else {}
+            identity = init_profile.get("agent", {})
 
             # Gather personality traits (from worldview memories with personality subcategory)
             traits_rows = await conn.fetch("""
@@ -1485,7 +1486,7 @@ async def _characters_export(dsn: str, name: str, output: str | None) -> int:
             "voice": identity.get("voice", ""),
             "description": identity.get("description", ""),
             "purpose": identity.get("purpose", ""),
-            "personality_description": identity.get("personality_description", ""),
+            "personality": identity.get("personality", ""),
             "personality_traits": traits if traits else {
                 "openness": 0.5, "conscientiousness": 0.5,
                 "extraversion": 0.5, "agreeableness": 0.5, "neuroticism": 0.5,
@@ -1503,7 +1504,7 @@ async def _characters_export(dsn: str, name: str, output: str | None) -> int:
             "data": {
                 "name": agent_name,
                 "description": identity.get("description", ""),
-                "personality": identity.get("personality_description", ""),
+                "personality": identity.get("personality", ""),
                 "scenario": "",
                 "first_mes": "",
                 "mes_example": "",

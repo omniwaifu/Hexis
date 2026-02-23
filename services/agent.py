@@ -311,6 +311,34 @@ async def build_system_prompt(
 
 
 # ---------------------------------------------------------------------------
+# Helper: read persona from config
+# ---------------------------------------------------------------------------
+
+
+async def _read_persona(conn: "asyncpg.Connection") -> dict[str, Any] | None:
+    """
+    Load agent persona from config.
+
+    Reads agent.init_profile, extracts agent name (sets it globally),
+    and returns persona dict with keys: description, voice, personality, purpose, pronouns.
+    """
+    _persona: dict[str, Any] | None = None
+    try:
+        _raw = await conn.fetchval("SELECT value FROM config WHERE key = 'agent.init_profile'")
+        if _raw:
+            _ip = json.loads(_raw) if isinstance(_raw, str) else _raw
+            _agent = _ip.get("agent") or {}
+            _aname = _agent.get("name") or _ip.get("name")
+            if _aname:
+                from services.prompt_resources import set_agent_name
+                set_agent_name(_aname)
+            _persona = {k: _agent[k] for k in ("description", "voice", "personality", "purpose", "pronouns") if _agent.get(k)}
+    except Exception:
+        pass
+    return _persona
+
+
+# ---------------------------------------------------------------------------
 # Unified run_agent
 # ---------------------------------------------------------------------------
 
@@ -362,19 +390,7 @@ async def run_agent(
         llm_config = await load_llm_config(conn, llm_key, fallback_key=llm_fallback)
 
         # Inject agent name into prompts + capture persona for system prompt
-        _persona: dict[str, Any] | None = None
-        try:
-            _raw = await conn.fetchval("SELECT value FROM config WHERE key = 'agent.init_profile'")
-            if _raw:
-                _ip = json.loads(_raw) if isinstance(_raw, str) else _raw
-                _agent = _ip.get("agent") or {}
-                _aname = _agent.get("name") or _ip.get("name")
-                if _aname:
-                    from services.prompt_resources import set_agent_name
-                    set_agent_name(_aname)
-                _persona = {k: _agent[k] for k in ("description", "voice", "personality", "purpose", "pronouns") if _agent.get(k)}
-        except Exception:
-            pass
+        _persona = await _read_persona(conn)
 
         # 2. Hydrate memory context (chat mode - heartbeat builds its own context)
         memory_context = ""
@@ -557,19 +573,7 @@ async def stream_agent(
         llm_config = await load_llm_config(conn, llm_key, fallback_key=llm_fallback)
 
         # Inject agent name into prompts + capture persona for system prompt
-        _persona: dict[str, Any] | None = None
-        try:
-            _raw = await conn.fetchval("SELECT value FROM config WHERE key = 'agent.init_profile'")
-            if _raw:
-                _ip = json.loads(_raw) if isinstance(_raw, str) else _raw
-                _agent = _ip.get("agent") or {}
-                _aname = _agent.get("name") or _ip.get("name")
-                if _aname:
-                    from services.prompt_resources import set_agent_name
-                    set_agent_name(_aname)
-                _persona = {k: _agent[k] for k in ("description", "voice", "personality", "purpose", "pronouns") if _agent.get(k)}
-        except Exception:
-            pass
+        _persona = await _read_persona(conn)
 
         # Hydrate memory
         memory_context = ""

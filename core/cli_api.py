@@ -584,18 +584,13 @@ async def status_payload_rich(
 
         # Identity (agent name)
         try:
-            profile = await conn.fetchval("SELECT get_agent_profile_context()")
+            init_profile = await conn.fetchval(
+                "SELECT value FROM config WHERE key = 'agent.init_profile'"
+            )
             name = None
-            if profile:
-                p = json.loads(profile) if isinstance(profile, str) else profile
-                name = p.get("name") or p.get("identity", {}).get("name")
-            if not name:
-                init_profile = await conn.fetchval(
-                    "SELECT value FROM config WHERE key = 'agent.init_profile'"
-                )
-                if init_profile:
-                    ip = json.loads(init_profile) if isinstance(init_profile, str) else init_profile
-                    name = (ip.get("agent") or {}).get("name")
+            if init_profile:
+                ip = json.loads(init_profile) if isinstance(init_profile, str) else init_profile
+                name = (ip.get("agent") or {}).get("name") or ip.get("name")
             payload["identity"] = name or "unnamed"
         except Exception:
             payload["identity"] = None
