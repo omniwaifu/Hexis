@@ -137,7 +137,8 @@ class HeartbeatWorker:
         try:
             async with self.pool.acquire() as conn:
                 return bool(await conn.fetchval("SELECT is_agent_configured() AND is_init_complete()"))
-        except Exception:
+        except Exception as exc:
+            logger.warning("DB unreachable in HeartbeatWorker._is_agent_ready: %s", exc)
             return False
 
     async def _is_active_hour(self) -> bool:
@@ -274,8 +275,8 @@ def create_heartbeat_handler(
                     if _tz:
                         env = context.setdefault("environment", {})
                         env["timezone"] = _tz
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Failed to inject timezone into heartbeat context: %s", exc)
 
                 try:
                     result = await run_agentic_heartbeat(
@@ -511,7 +512,8 @@ class MaintenanceWorker:
         try:
             async with self.pool.acquire() as conn:
                 return bool(await conn.fetchval("SELECT is_agent_configured() AND is_init_complete()"))
-        except Exception:
+        except Exception as exc:
+            logger.warning("DB unreachable in MaintenanceWorker._is_agent_ready: %s", exc)
             return False
 
 

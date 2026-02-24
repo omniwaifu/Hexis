@@ -221,7 +221,7 @@ async def finalize_heartbeat(
         )
     except Exception:
         memory_id = None
-        logger.debug("Failed to record heartbeat memory", exc_info=True)
+        logger.error("Failed to record heartbeat memory", exc_info=True)
 
     # Update heartbeat state (mark completion, deduct energy)
     try:
@@ -234,7 +234,7 @@ async def finalize_heartbeat(
             """
         )
     except Exception:
-        logger.debug("Failed to update heartbeat state", exc_info=True)
+        logger.error("Failed to update heartbeat state", exc_info=True)
 
     # Auto-checkpoint: if backlog had tasks and heartbeat was interrupted,
     # checkpoint any still-in-progress items so next heartbeat can resume
