@@ -6,12 +6,8 @@ default:
 
 # ── Docker stack ──────────────────────────────────────────────────────────────
 
-# Start DB only (passive)
+# Start stack (DB + heartbeat + maintenance + channels)
 up:
-    docker compose up -d
-
-# Start DB + workers (active: heartbeat + maintenance + channels)
-up-active:
     docker compose --profile active up -d
 
 # Stop everything
