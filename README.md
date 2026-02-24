@@ -94,17 +94,22 @@ For the full treatment: [PERSONHOOD.md](docs/philosophy/PERSONHOOD.md) | [PHILOS
 ## CLI Quick Reference
 
 ```bash
-hexis init                    # setup wizard
-hexis chat                    # interactive chat
-hexis status                  # agent status
-hexis doctor                  # health check
-hexis up [--profile active]   # start services
-hexis down                    # stop services
-hexis ingest --input ./docs   # knowledge ingestion
-hexis mcp                     # MCP server
-hexis ui                      # web UI
-hexis tools list              # list tools
-hexis instance list           # list instances
+hexis init                              # setup wizard
+hexis reconfigure                       # reset identity/consent, keep memories
+hexis chat                              # interactive chat
+hexis status                            # agent status (snapshot)
+hexis status --watch                    # live-updating status with heartbeat countdown
+hexis doctor                            # health check
+hexis up [--profile active]             # start services
+hexis down                              # stop services
+hexis ingest --input ./docs             # knowledge ingestion
+hexis mcp                               # MCP server
+hexis ui                                # web UI
+hexis tools list                        # list tools
+hexis instance list                     # list instances
+hexis characters list                   # list character cards
+hexis characters create --from-file c.toml  # create from file
+hexis characters template               # print TOML template
 ```
 
 See [CLI Reference](docs/reference/cli.md) for the complete command reference.
@@ -128,7 +133,7 @@ See [Quickstart](docs/start/quickstart.md) for setup and [Production](docs/opera
 ```bash
 git clone https://github.com/QuixiAI/Hexis.git && cd Hexis
 pip install -e .
-cp .env.local .env
+hexis init   # interactive wizard writes ~/.config/hexis/config.toml
 hexis up
 ```
 

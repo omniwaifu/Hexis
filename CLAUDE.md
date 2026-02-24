@@ -31,10 +31,13 @@ hexis/
 │   ├── usage.py                  # Token and cost tracking
 │   └── rabbitmq_bridge.py        # Messaging bridge
 ├── services/               # Orchestration/workflows built on core
-│   ├── conversation.py     # Conversation loop orchestration
-│   ├── ingest.py           # Ingestion pipeline orchestration
-│   ├── worker_service.py   # Heartbeat + maintenance loops
-│   └── prompts/            # Markdown prompt templates
+│   ├── conversation.py         # Conversation loop orchestration
+│   ├── chat.py                 # chat_turn() entry point; routes to normal or RLM path
+│   ├── agent.py                # run_agent() / stream_agent() + _read_persona() helper
+│   ├── ingest.py               # Ingestion pipeline orchestration
+│   ├── worker_service.py       # HeartbeatWorker + MaintenanceWorker loop runners
+│   ├── hexis_rlm.py            # RLM (recursive language model) chat/heartbeat path
+│   └── prompts/                # Markdown prompt templates
 ├── characters/             # Preset character cards (JSON + images)
 ├── apps/
 │   ├── hexis_cli.py          # CLI entrypoint (hexis ...)
@@ -42,7 +45,12 @@ hexis/
 │   ├── hexis_api.py          # FastAPI API server (SSE chat)
 │   ├── hexis_mcp_server.py   # MCP tools server for LLMs
 │   └── worker.py             # Heartbeat + maintenance workers
-├── channels/               # Multi-platform messaging adapters
+├── channels/               # Multi-platform messaging adapters (Discord, Telegram, Slack, ...)
+│   ├── manager.py              # ChannelManager: routes inbound messages, sends outbound
+│   ├── base.py                 # ChannelAdapter ABC and ChannelMessage dataclass
+│   ├── conversation.py         # Bridges channel messages into the agent conversation loop
+│   ├── telegram_adapter.py     # Telegram Bot API adapter
+│   └── commands.py             # Slash command registry for channel messages
 ├── hexis-ui/               # Next.js web dashboard
 ├── plugins/                # Plugin system (extensibility framework)
 ├── skills/                 # Skill system (declarative skill definitions)
@@ -115,10 +123,19 @@ pytest tests/core -q      # Core API tests
 pytest tests/cli -q       # CLI smoke tests
 
 # Other CLI commands
-hexis status              # Agent status
+hexis status              # Agent status (snapshot)
+hexis status --watch      # Live-updating status with heartbeat countdown
 hexis chat                # Interactive chat
+hexis reconfigure         # Reset identity/consent, preserve memories (--wipe-memories to clear)
 hexis ingest --input <docs>  # Batch knowledge ingestion
 hexis mcp                 # Start MCP server
+
+# Character management
+hexis characters list                         # List loaded characters
+hexis characters create --name ... --persona ... # Create character from flags
+hexis characters create --from-file card.toml # Create from TOML/JSON/YAML file
+hexis characters template                     # Print TOML template to stdout
+hexis characters export <name>               # Export active character to file
 ```
 
 ## Coding Style & Naming Conventions
@@ -144,7 +161,7 @@ hexis mcp                 # Start MCP server
 
 ## Configuration & Safety Notes
 
-- **Secrets**: Store API keys in environment variables (`.env`), not in Postgres; DB config stores env var *names* only
+- **Secrets**: Store API keys in `hexis.toml` (searched at `./hexis.toml` then `~/.config/hexis/config.toml`), not in Postgres. `core/config_loader.py` reads TOML and injects into `os.environ` at startup; DB config stores env var *names* only, not values. Channel tokens (Telegram, Discord, Slack) go under `[telegram]`, `[discord]`, `[slack]` sections in the same file.
 - **Heartbeat gating**: Heartbeat is blocked until `agent.is_configured=true` (set via `hexis init`)
 - **Consent flow**: Agent signs consent before first LLM use; consent is final and only ends via self-termination
 - **Pause/terminate**: Heartbeat pauses must include a detailed reason queued to the outbox; self-termination must queue a last will to the outbox
@@ -159,6 +176,26 @@ hexis mcp                 # Start MCP server
 5. **Energy as Unified Constraint** - Balances compute cost, network load, user attention
 6. **Precomputed Neighborhoods** - Hot path optimization for fast recall
 7. **Schema Authority** - DB schema is source of truth; Python is convenience layer
+
+## Channel System (Messaging Adapters)
+
+The `channels/` module connects the agent to external messaging platforms. All channels run under `--profile active` via the `hexis_channel_worker` Docker service.
+
+**Key concepts:**
+- `ChannelAdapter` (ABC in `channels/base.py`) — each platform implements `start()`, `send()`, `send_typing()`, `stop()`
+- `ChannelManager` (`channels/manager.py`) — registers adapters, routes inbound `ChannelMessage` objects to `channels/conversation.py`, sends outbound via `adapter.send()`
+- Inbound messages route to `stream_channel_message()` if the adapter supports `edit_message`, otherwise `process_channel_message()` with chunked delivery
+- Slash commands are intercepted before LLM routing via `channels/commands.py`
+
+**Config keys** (set via `INSERT INTO config (key, value) VALUES (...)` or `hexis init`):
+- `channel.{type}.allowed_users` — JSON array of user IDs, or `"*"` to allow all (default: all)
+- `channel.{type}.session_ttl` — session lifetime in seconds (default: 3600)
+- `chat.use_rlm` — if `true`, routes chat turns through `services/hexis_rlm.py` instead of the normal persona-aware agent path. **Keep this `false`** unless intentionally testing RLM.
+
+**Telegram-specific notes:**
+- `edit_message=False` on `TelegramAdapter` forces chunked delivery (not streaming). This is intentional: streaming starves the typing indicator task of event loop time.
+- Reply threading is suppressed in DMs (`reply_to_message_id` is only set for group chats).
+- Bot token goes in `hexis.toml` under `[telegram] bot_token = "..."`.
 
 ## Heartbeat System (Autonomous Loop)
 
@@ -176,9 +213,16 @@ The heartbeat is the agent's conscious cognitive loop:
 
 ## Debugging Tips
 
-- **Schema changes not taking effect?** SQL files are baked into the Docker image -- see "Bouncing the Database" below
+- **Schema changes not taking effect?** SQL files are bind-mounted into the container and re-executed on fresh volume init — see "Bouncing the Database" below. No image rebuild required; just `docker-compose down -v && docker-compose up -d`.
 - **Heartbeat not running?** Check `agent.is_configured` via `hexis status` or run `hexis init`
-- **Memory not found?** Check if Ollama is running and has the embedding model (`ollama list`)
+- **Memory not found?** Embeddings require a running embedding service (default: Ollama via `ollama list`; can also be TEI or any compatible endpoint configured in `hexis.toml` under `embedding.service_url`).
+- **Persona broken / agent responding generically?** Check `chat.use_rlm` in the DB: `docker exec hexis_brain psql -U hexis_user -d hexis_memory -c "SELECT value FROM config WHERE key = 'chat.use_rlm'"`. If `true`, the RLM path (`services/hexis_rlm.py`) activates on next Docker rebuild, bypassing `build_system_prompt()` and ignoring the character persona. Fix: `UPDATE config SET value = 'false' WHERE key = 'chat.use_rlm';` — takes effect immediately, no rebuild needed.
+- **Workers need code changes?** Python changes in workers require an image rebuild. Rebuild and restart a single worker without disrupting the DB:
+  ```bash
+  docker compose build channel_worker && docker compose up -d channel_worker
+  # or heartbeat_worker / maintenance_worker
+  ```
+  This is different from schema changes, which only need a volume bounce.
 - **Test failures?** Ensure Docker services are up before running pytest; after a fresh `down -v`, wait for Postgres to accept connections. Use `POSTGRES_HOST=127.0.0.1` with pytest if localhost SSL negotiation flakes.
 
 ## Agent Operational Notes
