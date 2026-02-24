@@ -690,6 +690,8 @@ async def status_payload_rich(
             emo_raw = await conn.fetchval("SELECT value FROM state WHERE key = 'heartbeat_state'")
             if emo_raw:
                 emo = json.loads(emo_raw) if isinstance(emo_raw, str) else emo_raw
+                payload["next_heartbeat_at"] = emo.get("next_heartbeat_at")
+                payload["last_heartbeat_at_iso"] = emo.get("last_heartbeat_at")
                 aff = emo.get("affective_state", {})
                 if aff:
                     valence = aff.get("valence", 0.0)

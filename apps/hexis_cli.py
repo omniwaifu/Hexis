@@ -400,6 +400,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--json", action="store_true", help="Output JSON")
     status.add_argument("--no-docker", action="store_true", help="Skip docker compose checks")
     status.add_argument("--raw", action="store_true", help="Show raw status (legacy format)")
+    status.add_argument("--watch", "-w", action="store_true", help="Live-updating status (refreshes every second)")
     status.set_defaults(func="status")
 
     doctor = sub.add_parser("doctor", parents=[_db], help="Diagnose common issues")
@@ -1877,6 +1878,137 @@ async def _channels_setup(dsn: str, channel_type: str) -> int:
         await pool.close()
 
 
+def _build_status_group(p: dict[str, Any], now: Any) -> Any:
+    """Build a rich renderable for the live status view."""
+    from datetime import timezone as tz
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.text import Text
+    from apps.cli_theme import energy_bar, mood_label, HEXIS_THEME
+
+    identity = p.get("identity") or "unnamed"
+    instance = p.get("instance", "default")
+
+    lines: list[Any] = []
+
+    def row(key: str, value: str) -> Text:
+        return Text.from_markup(f"  [key]{key:<10}[/key]{value}")
+
+    # Energy
+    energy = p.get("energy")
+    max_energy = p.get("max_energy", 20)
+    if energy is not None:
+        lines.append(row("Energy", energy_bar(energy, max_energy)))
+
+    # Heartbeat countdown
+    next_hb_iso = p.get("next_heartbeat_at")
+    last_hb_iso = p.get("last_heartbeat_at_iso")
+    if next_hb_iso:
+        try:
+            from datetime import datetime
+            next_hb = datetime.fromisoformat(next_hb_iso)
+            if next_hb.tzinfo is None:
+                next_hb = next_hb.replace(tzinfo=tz.utc)
+            secs = max(0, int((next_hb - now).total_seconds()))
+            m, s = divmod(secs, 60)
+            countdown = f"[accent]{m}:{s:02d}[/accent]"
+            paused = p.get("heartbeat_paused", False)
+            hb_count = p.get("heartbeat_count", 0)
+            if paused:
+                hb_str = "[warn]paused[/warn]"
+            else:
+                hb_str = f"next in {countdown}  [muted]#{hb_count} total[/muted]"
+            lines.append(row("Heartbeat", hb_str))
+        except Exception:
+            pass
+    elif p.get("last_heartbeat_ago"):
+        lines.append(row("Heartbeat", f"[muted]idle (last: {p['last_heartbeat_ago']} ago)[/muted]"))
+
+    # Last active
+    if last_hb_iso:
+        try:
+            from datetime import datetime
+            last_hb = datetime.fromisoformat(last_hb_iso)
+            if last_hb.tzinfo is None:
+                last_hb = last_hb.replace(tzinfo=tz.utc)
+            ago = int((now - last_hb).total_seconds())
+            h, rem = divmod(ago, 3600)
+            m, s = divmod(rem, 60)
+            ago_str = f"{h}h {m}m {s}s ago" if h else (f"{m}m {s}s ago" if m else f"{s}s ago")
+            lines.append(row("Last beat", f"[muted]{ago_str}[/muted]"))
+        except Exception:
+            pass
+
+    # Memory
+    memories = p.get("memories", {})
+    if memories:
+        mem_parts = ", ".join(
+            f"[accent]{cnt}[/accent] {mtype}" for mtype, cnt in sorted(memories.items())
+        )
+        lines.append(row("Memory", mem_parts))
+
+    # Channels
+    channels = p.get("channels", [])
+    if channels:
+        ch_parts = " ".join(f"[teal]{ch['type']}[/teal]" for ch in channels)
+        lines.append(row("Channels", ch_parts))
+
+    # Goals
+    goals = p.get("goals", [])
+    if goals:
+        lines.append(row("Goals", f"[accent]{len(goals)}[/accent] active"))
+        for g in goals:
+            lines.append(Text.from_markup(f"  [muted]  \u2022 {g['content'][:80]}[/muted]"))
+
+    # Mood
+    mood = p.get("mood")
+    valence = p.get("valence")
+    if mood:
+        lines.append(row("Mood", mood_label(mood, valence)))
+
+    # Clock
+    clock = Text()
+    clock.append(f"\n  {now.strftime('%H:%M:%S UTC')} ", style="muted")
+    lines.append(clock)
+
+    return Panel(
+        Group(*lines),
+        title=f"[accent]{identity}[/accent]",
+        subtitle=f"[muted]{instance}[/muted]",
+        border_style="muted",
+        padding=(0, 1),
+    )
+
+
+async def _run_live_status(dsn: str) -> int:
+    """Live-updating status display. Queries DB every 10s, redraws every second."""
+    import asyncio
+    import time
+    from datetime import datetime, timezone as tz
+    from rich.live import Live
+    from apps.cli_theme import console
+
+    payload = await cli_api.status_payload_rich(dsn)
+    last_fetch = time.monotonic()
+
+    try:
+        with Live(console=console, refresh_per_second=2, screen=False) as live:
+            while True:
+                now = datetime.now(tz.utc)
+                live.update(_build_status_group(payload, now))
+                await asyncio.sleep(0.5)
+
+                if time.monotonic() - last_fetch >= 10:
+                    try:
+                        payload = await cli_api.status_payload_rich(dsn)
+                    except Exception:
+                        pass
+                    last_fetch = time.monotonic()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def _print_rich_status(p: dict[str, Any]) -> None:
     """Print a rich, human-readable status display."""
     from apps.cli_theme import console, energy_bar, kv, make_panel, mood_label
@@ -2914,6 +3046,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if func == "status":
         dsn = _get_dsn(args)
+        if getattr(args, "watch", False):
+            return asyncio.run(_run_live_status(dsn))
         if args.raw:
             # Legacy raw status
             payload = asyncio.run(cli_api.status_payload(dsn, wait_seconds=args.wait_seconds))
