@@ -345,6 +345,15 @@ async def _run_init_noninteractive(args: argparse.Namespace) -> int:
         await conn.execute("SELECT set_config('llm.subconscious', $1::jsonb)", json.dumps(subconscious_config))
         console.print(f"[ok]\u2714[/ok] LLM config saved: [bold]{provider}/{model}[/bold]")
 
+        # 7b. Timezone
+        tz_val = getattr(args, "timezone", None)
+        if tz_val:
+            await conn.execute(
+                "SELECT set_config('agent.timezone', $1::jsonb)",
+                json.dumps(tz_val),
+            )
+            console.print(f"[ok]\u2714[/ok] Timezone set: [bold]{tz_val}[/bold]")
+
         # 8. Apply character or express defaults
         user_name = args.name or "User"
         if args.character:
@@ -988,6 +997,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Character card name (e.g. 'hexis', 'jarvis'). Omit for express defaults")
     p.add_argument("--name", default=None,
                     help="What the agent should call you (default: 'User')")
+    p.add_argument("--timezone", default=None,
+                    help="IANA timezone for agent (e.g. 'America/New_York'). Defaults to UTC")
     p.add_argument("--no-docker", action="store_true", default=False,
                     help="Skip Docker auto-start")
     p.add_argument("--no-pull", action="store_true", default=False,

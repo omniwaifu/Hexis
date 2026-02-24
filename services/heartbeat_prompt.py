@@ -26,6 +26,25 @@ def build_heartbeat_decision_prompt(context: dict[str, Any]) -> str:
     backlog = context.get("backlog", {})
     hb_number = context.get("heartbeat_number", 0)
 
+    # Resolve local time from UTC timestamp + stored timezone
+    _tz_str = env.get("timezone") or "UTC"
+    _raw_ts = env.get("timestamp")
+    try:
+        from datetime import datetime, timezone as _utc
+        from zoneinfo import ZoneInfo
+        if _raw_ts:
+            _dt = datetime.fromisoformat(str(_raw_ts).replace(" ", "T").rstrip("Z+00"))
+            _dt = _dt.replace(tzinfo=_utc.utc).astimezone(ZoneInfo(_tz_str))
+        else:
+            _dt = datetime.now(ZoneInfo(_tz_str))
+        _ts_display = _dt.strftime("%A, %B %d %Y %H:%M") + f" ({_tz_str})"
+        _dow = _dt.weekday()  # 0=Mon
+        _hour = _dt.hour
+    except Exception:
+        _ts_display = str(_raw_ts or "Unknown")
+        _dow = env.get("day_of_week", "?")
+        _hour = env.get("hour_of_day", "?")
+
     prompt = f"""## Heartbeat #{hb_number}
 
 ## Agent Profile
@@ -42,8 +61,8 @@ Budget:
 {json.dumps(agent.get("budget") or {})}
 
 ## Current Time
-{env.get('timestamp', 'Unknown')}
-Day of week: {env.get('day_of_week', '?')}, Hour: {env.get('hour_of_day', '?')}
+{_ts_display}
+Day of week: {_dow}, Hour: {_hour}
 
 ## Environment
 - Time since last user interaction: {env.get('time_since_user_hours', 'Never')} hours

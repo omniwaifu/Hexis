@@ -240,6 +240,7 @@ async def build_system_prompt(
     has_backlog_tasks: bool = False,
     is_group: bool = False,
     persona: dict[str, Any] | None = None,
+    timezone: str = "UTC",
 ) -> str:
     """Build the system prompt for either chat or heartbeat mode."""
 
@@ -251,6 +252,20 @@ async def build_system_prompt(
             prompt += "\n\n" + load_channel_context_prompt().strip()
     else:
         prompt = load_heartbeat_agentic_prompt().strip()
+
+    # Current time (chat mode only — heartbeat gets this from DB context)
+    if mode == "chat":
+        try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(timezone)
+            now = datetime.now(tz)
+            prompt += (
+                f"\n\n## Current Time\n"
+                f"{now.strftime('%A, %B %d %Y %H:%M')} ({timezone})"
+            )
+        except Exception:
+            pass
 
     # Persona preamble — voice, description, personality from init_profile
     if persona:
@@ -392,6 +407,9 @@ async def run_agent(
         # Inject agent name into prompts + capture persona for system prompt
         _persona = await _read_persona(conn)
 
+        # Read agent timezone (defaults to UTC if not set)
+        _tz_str = await conn.fetchval("SELECT get_config_text('agent.timezone')") or "UTC"
+
         # 2. Hydrate memory context (chat mode - heartbeat builds its own context)
         memory_context = ""
         if mode == "chat":
@@ -456,6 +474,7 @@ async def run_agent(
         has_backlog_tasks=has_backlog_tasks,
         is_group=is_group,
         persona=_persona,
+        timezone=_tz_str,
     )
 
     # 5. Build enriched user message
@@ -575,6 +594,9 @@ async def stream_agent(
         # Inject agent name into prompts + capture persona for system prompt
         _persona = await _read_persona(conn)
 
+        # Read agent timezone (defaults to UTC if not set)
+        _tz_str = await conn.fetchval("SELECT get_config_text('agent.timezone')") or "UTC"
+
         # Hydrate memory
         memory_context = ""
         if mode == "chat":
@@ -635,6 +657,7 @@ async def stream_agent(
         has_backlog_tasks=has_backlog_tasks,
         is_group=is_group,
         persona=_persona,
+        timezone=_tz_str,
     )
 
     # Build enriched user message

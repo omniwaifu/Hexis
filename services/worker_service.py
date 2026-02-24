@@ -268,6 +268,15 @@ def create_heartbeat_handler(
 
                 context = _extract_heartbeat_context(payload)
 
+                # Inject agent timezone so heartbeat_prompt can display local time
+                try:
+                    _tz = await conn.fetchval("SELECT get_config_text('agent.timezone')")
+                    if _tz:
+                        env = context.setdefault("environment", {})
+                        env["timezone"] = _tz
+                except Exception:
+                    pass
+
                 try:
                     result = await run_agentic_heartbeat(
                         conn,
