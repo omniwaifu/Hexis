@@ -177,13 +177,12 @@ class ChatScreen(Screen):
             try:
                 from core.cli_api import status_payload_rich
                 payload = await status_payload_rich(app.dsn)
-                agent = payload.get("agent", {})
-                log.write_info(f"Agent: {agent.get('name', '?')}")
-                log.write_info(f"Mood: {agent.get('mood', '?')}")
-                energy = payload.get("energy", {})
-                log.write_info(f"Energy: {energy.get('current', '?')}/{energy.get('max', '?')}")
-                consent = payload.get("consent", {})
-                log.write_info(f"Consent: {consent.get('status', '?')}")
+                log.write_info(f"Agent: {payload.get('identity', '?')}")
+                log.write_info(f"Mood: {payload.get('mood', '?')}")
+                energy = payload.get("energy")
+                max_energy = payload.get("max_energy", "?")
+                log.write_info(f"Energy: {energy}/{max_energy}")
+                log.write_info(f"Heartbeat: {payload.get('last_heartbeat_ago', '?')} ago")
             except Exception as e:
                 log.write_error(str(e))
             return

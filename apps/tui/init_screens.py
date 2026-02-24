@@ -37,7 +37,7 @@ _DEFAULT_MODELS: dict[str, str] = {
     "chutes": "deepseek-ai/DeepSeek-V3-0324",
     "qwen-portal": "qwen-max-latest",
     "minimax-portal": "MiniMax-M1",
-    "zhipu": "glm-4-flash",
+    "zhipu": "glm-4.7",
 }
 
 _PROVIDER_ENV_VARS: dict[str, str] = {

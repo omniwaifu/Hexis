@@ -268,7 +268,7 @@ def normalize_endpoint(provider: str, endpoint: str | None) -> str | None:
         "grok": "https://api.x.ai/v1",
         "chutes": "https://api.chutes.ai/v1",
         "qwen-portal": "https://portal.qwen.ai/v1",
-        "zhipu": "https://open.bigmodel.cn/api/paas/v4/",
+        "zhipu": "https://api.z.ai/api/coding/paas/v4",
     }
     return _DEFAULTS.get(provider)
 

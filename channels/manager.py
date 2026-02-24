@@ -152,40 +152,62 @@ class ChannelManager:
                         logger.exception("Failed to send command response for /%s", cmd_name)
                 return
 
-        # Send typing indicator while processing
+        # Keep typing indicator alive for the duration of processing
+        typing_task: asyncio.Task | None = None
         if adapter.capabilities.typing_indicator:
-            try:
-                await adapter.send_typing(msg.channel_id)
-            except Exception:
-                pass  # Non-critical
-
-        # Use streaming for channels that support edit_message
-        if adapter.capabilities.edit_message:
-            await stream_channel_message(msg, self._pool, adapter)
-        else:
-            # Fall back to chunked delivery
-            max_len = adapter.capabilities.max_message_length
-            response_chunks = await process_channel_message(
-                msg,
-                self._pool,
-                max_message_length=max_len,
-            )
-
-            reply_to = msg.message_id
-            for i, chunk in enumerate(response_chunks):
+            async def _keep_typing() -> None:
                 try:
-                    await adapter.send(
-                        msg.channel_id,
-                        chunk,
-                        reply_to=reply_to if i == 0 else None,
-                        thread_id=msg.thread_id,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to send response chunk %d to %s/%s",
-                        i, msg.channel_type, msg.channel_id,
-                    )
-                    break
+                    while True:
+                        try:
+                            await adapter.send_typing(msg.channel_id)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(4)
+                except asyncio.CancelledError:
+                    pass
+            typing_task = asyncio.create_task(_keep_typing())
+
+        try:
+            # Use streaming for channels that support edit_message
+            if adapter.capabilities.edit_message:
+                await stream_channel_message(msg, self._pool, adapter)
+            else:
+                # Fall back to chunked delivery
+                max_len = adapter.capabilities.max_message_length
+                response_chunks = await process_channel_message(
+                    msg,
+                    self._pool,
+                    max_message_length=max_len,
+                )
+
+                reply_to = msg.message_id
+                for i, chunk in enumerate(response_chunks):
+                    try:
+                        await adapter.send(
+                            msg.channel_id,
+                            chunk,
+                            reply_to=reply_to if i == 0 else None,
+                            thread_id=msg.thread_id,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to send response chunk %d to %s/%s",
+                            i, msg.channel_type, msg.channel_id,
+                        )
+                        break
+        except Exception as exc:
+            logger.exception("Error processing message from %s/%s", msg.channel_type, msg.channel_id)
+            try:
+                await adapter.send(msg.channel_id, f"⚠ Error: {exc}", thread_id=msg.thread_id)
+            except Exception:
+                pass
+        finally:
+            if typing_task:
+                typing_task.cancel()
+                try:
+                    await typing_task
+                except asyncio.CancelledError:
+                    pass
 
     async def send(
         self,

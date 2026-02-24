@@ -2570,6 +2570,52 @@ def main(argv: list[str] | None = None) -> int:
 
         return _run_module(forward_map[cmd], fwd_argv)
 
+    if cmd == "reconfigure":
+        if instance:
+            os.environ["HEXIS_INSTANCE"] = instance
+        fwd_argv = cmd_argv[1:]
+        if "-h" in fwd_argv or "--help" in fwd_argv:
+            build_parser().parse_args(["reconfigure", "--help"])
+            return 0
+        yes_flag = "--yes" in fwd_argv or "-y" in fwd_argv
+        wipe_flag = "--wipe-memories" in fwd_argv
+        init_argv = [a for a in fwd_argv if a not in {"--yes", "-y", "--wipe-memories"}]
+
+        from apps.cli_theme import console
+        if not yes_flag:
+            console.print(
+                "[bold yellow]WARNING:[/bold yellow] This will reset agent identity and consent config. "
+                "Memories are preserved unless [accent]--wipe-memories[/accent] is passed."
+            )
+            try:
+                answer = input("Type 'reconfigure' to confirm: ")
+            except (KeyboardInterrupt, EOFError):
+                print()
+                return 1
+            if answer.strip().lower() != "reconfigure":
+                console.print("[dim]Aborted.[/dim]")
+                return 1
+
+        import asyncio as _asyncio
+        import asyncpg as _asyncpg  # type: ignore[import-not-found]
+        from core.agent_api import db_dsn_from_env
+        load_config()
+
+        async def _reset_identity() -> None:
+            conn = await _asyncpg.connect(db_dsn_from_env())
+            try:
+                await conn.execute("SELECT reset_initialization()")
+                if wipe_flag:
+                    await conn.execute("DELETE FROM memories")
+                    console.print("[ok]Memories wiped.[/ok]")
+            finally:
+                await conn.close()
+
+        _asyncio.run(_reset_identity())
+        console.print("[ok]Identity config cleared.[/ok] Launching init wizard...\n")
+        from apps.hexis_init import main as _init_main
+        return _init_main(init_argv)
+
     parser = build_parser()
     args = parser.parse_args(raw_argv)
 
@@ -2723,39 +2769,6 @@ def main(argv: list[str] | None = None) -> int:
         if rc == 0:
             console.print("\n[ok]Database reset complete.[/ok] Run [accent]hexis init[/accent] to reconfigure the agent.\n")
         return rc
-    if func == "reconfigure":
-        from apps.cli_theme import console
-        if not args.yes:
-            console.print(
-                "[bold yellow]WARNING:[/bold yellow] This will reset agent identity and consent config. "
-                "Memories are preserved unless [accent]--wipe-memories[/accent] is passed."
-            )
-            try:
-                answer = input("Type 'reconfigure' to confirm: ")
-            except (KeyboardInterrupt, EOFError):
-                print()
-                return 1
-            if answer.strip().lower() != "reconfigure":
-                console.print("[dim]Aborted.[/dim]")
-                return 1
-
-        import asyncpg as _asyncpg  # type: ignore[import-not-found]
-        from core.agent_api import db_dsn_from_env
-
-        async def _reset_identity() -> None:
-            conn = await _asyncpg.connect(db_dsn_from_env())
-            try:
-                await conn.execute("SELECT reset_initialization()")
-                if getattr(args, "wipe_memories", False):
-                    await conn.execute("DELETE FROM memories")
-                    console.print("[ok]Memories wiped.[/ok]")
-            finally:
-                await conn.close()
-
-        asyncio.run(_reset_identity())
-        console.print("[ok]Identity config cleared.[/ok] Launching init wizard...\n")
-        from apps.hexis_init import main as _init_main
-        return _init_main(list(args.args or []))
     if func == "ps":
         return run_compose(compose_cmd or [], compose_file, stack_root, ["ps"], env_file)
     if func == "logs":

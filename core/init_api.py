@@ -8,41 +8,55 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tomllib
 from pathlib import Path
 from typing import Any
 
 PACKAGE_CHARACTERS_DIR = Path(__file__).resolve().parent.parent / "characters"
-from core.config import HEXIS_DATA_DIR
+from core.config import HEXIS_CONFIG_DIR, HEXIS_DATA_DIR
 USER_CHARACTERS_DIR = HEXIS_DATA_DIR / "characters"
+CONFIG_CHARACTERS_DIR = HEXIS_CONFIG_DIR / "characters"
 
 # Backwards compat alias
 CHARACTERS_DIR = PACKAGE_CHARACTERS_DIR
 
 
 def _character_search_dirs() -> list[Path]:
-    """Return character directories in priority order (first wins on filename collision)."""
+    """Return character directories in priority order (first wins on stem collision).
+
+    Priority: HEXIS_CHARACTERS_DIR env > ~/.config/hexis/characters/
+              > ~/.local/share/hexis/characters/ > package/characters/
+    """
     dirs: list[Path] = []
     env_dir = os.environ.get("HEXIS_CHARACTERS_DIR")
     if env_dir:
         dirs.append(Path(env_dir))
+    dirs.append(CONFIG_CHARACTERS_DIR)
     dirs.append(USER_CHARACTERS_DIR)
     dirs.append(PACKAGE_CHARACTERS_DIR)
     return dirs
 
 
 def _parse_card_file(path: Path) -> dict[str, Any] | None:
-    """Parse a single character card JSON file. Returns None on error."""
+    """Parse a character card file (JSON chara_card_v2 or TOML flat format).
+
+    Returns None on error.
+    """
     try:
-        data = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
+        if path.suffix.lower() == ".toml":
+            hexis_ext = tomllib.loads(path.read_text(encoding="utf-8"))
+            name = hexis_ext.get("name") or path.stem
+        else:
+            data = json.loads(path.read_text())
+            card_data = data.get("data", {})
+            hexis_ext = card_data.get("extensions", {}).get("hexis", {})
+            name = hexis_ext.get("name") or card_data.get("name") or path.stem
+    except Exception:
         return None
-    card_data = data.get("data", {})
-    hexis_ext = card_data.get("extensions", {}).get("hexis", {})
-    name = hexis_ext.get("name") or card_data.get("name") or path.stem
     return {
         "filename": path.name,
         "name": name,
-        "description": hexis_ext.get("description") or card_data.get("description", "")[:120],
+        "description": hexis_ext.get("description", "")[:120],
         "voice": hexis_ext.get("voice", ""),
         "values": hexis_ext.get("values", []),
         "personality": hexis_ext.get("personality") or hexis_ext.get("personality_description", ""),
@@ -52,10 +66,11 @@ def _parse_card_file(path: Path) -> dict[str, Any] | None:
 
 
 def load_character_cards() -> list[dict[str, Any]]:
-    """Load character card JSON files from all search directories.
+    """Load character card files (JSON or TOML) from all search directories.
 
-    Scans env override, user dir ($XDG_DATA_HOME/hexis/characters/), and package dir.
-    First-seen filename wins (env > user > package).
+    Scans env override, ~/.config/hexis/characters/, ~/.local/share/hexis/characters/,
+    and package dir. First-seen stem wins (TOML and JSON with the same stem are
+    treated as the same card).
 
     Returns list of dicts with keys: filename, name, description, voice,
     values, personality, extensions_hexis, source_dir.
@@ -65,10 +80,12 @@ def load_character_cards() -> list[dict[str, Any]]:
     for d in _character_search_dirs():
         if not d.is_dir():
             continue
-        for path in sorted(d.glob("*.json")):
-            if path.name in seen:
+        for path in sorted(d.glob("*")):
+            if path.suffix.lower() not in (".json", ".toml"):
                 continue
-            seen.add(path.name)
+            if path.stem in seen:
+                continue
+            seen.add(path.stem)
             card = _parse_card_file(path)
             if card is not None:
                 cards.append(card)

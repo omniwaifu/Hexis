@@ -114,8 +114,6 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       XAI_API_KEY: ${XAI_API_KEY:-}
-      HEXIS_LLM_CONSCIOUS_API_KEY: ${HEXIS_LLM_CONSCIOUS_API_KEY:-}
-      HEXIS_LLM_SUBCONSCIOUS_API_KEY: ${HEXIS_LLM_SUBCONSCIOUS_API_KEY:-}
     volumes:
       - ${XDG_CONFIG_HOME:-~/.config}/hexis:/root/.config/hexis:ro
     networks:
@@ -150,8 +148,6 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       XAI_API_KEY: ${XAI_API_KEY:-}
-      HEXIS_LLM_CONSCIOUS_API_KEY: ${HEXIS_LLM_CONSCIOUS_API_KEY:-}
-      HEXIS_LLM_SUBCONSCIOUS_API_KEY: ${HEXIS_LLM_SUBCONSCIOUS_API_KEY:-}
     volumes:
       - ${XDG_CONFIG_HOME:-~/.config}/hexis:/root/.config/hexis:ro
     networks:
@@ -184,8 +180,6 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       XAI_API_KEY: ${XAI_API_KEY:-}
-      HEXIS_LLM_CONSCIOUS_API_KEY: ${HEXIS_LLM_CONSCIOUS_API_KEY:-}
-      HEXIS_LLM_SUBCONSCIOUS_API_KEY: ${HEXIS_LLM_SUBCONSCIOUS_API_KEY:-}
     volumes:
       - ${XDG_CONFIG_HOME:-~/.config}/hexis:/root/.config/hexis:ro
     networks:
@@ -234,8 +228,6 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       XAI_API_KEY: ${XAI_API_KEY:-}
-      HEXIS_LLM_CONSCIOUS_API_KEY: ${HEXIS_LLM_CONSCIOUS_API_KEY:-}
-      HEXIS_LLM_SUBCONSCIOUS_API_KEY: ${HEXIS_LLM_SUBCONSCIOUS_API_KEY:-}
     volumes:
       - ${XDG_CONFIG_HOME:-~/.config}/hexis:/root/.config/hexis:ro
     networks:

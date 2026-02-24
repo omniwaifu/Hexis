@@ -40,7 +40,7 @@ _DEFAULT_MODELS: dict[str, str] = {
     "chutes": "deepseek-ai/DeepSeek-V3-0324",
     "qwen-portal": "qwen-max-latest",
     "minimax-portal": "MiniMax-M1",
-    "zhipu": "glm-4-flash",
+    "zhipu": "glm-4.7",
 }
 
 _PROVIDER_ENV_VARS: dict[str, str] = {
@@ -275,10 +275,14 @@ async def _run_init_noninteractive(args: argparse.Namespace) -> int:
         if args.api_key:
             provider = detect_provider(args.api_key)
         else:
-            provider = "ollama"
+            existing_key = os.environ.get("HEXIS_LLM_CONSCIOUS_API_KEY", "")
+            if existing_key:
+                provider = detect_provider(existing_key)
+            else:
+                provider = "ollama"
     provider = _normalize_provider_name(provider)
 
-    if provider not in (_OAUTH_PROVIDERS | {"ollama"}) and not args.api_key:
+    if provider not in (_OAUTH_PROVIDERS | {"ollama"}) and not args.api_key and not os.environ.get("HEXIS_LLM_CONSCIOUS_API_KEY"):
         err_console.print(f"[fail]--api-key required for provider '{provider}'[/fail]")
         return 1
 
@@ -345,9 +349,9 @@ async def _run_init_noninteractive(args: argparse.Namespace) -> int:
         user_name = args.name or "User"
         if args.character:
             cards = load_character_cards()
-            match = [c for c in cards if c["filename"].replace(".json", "") == args.character]
+            match = [c for c in cards if Path(c["filename"]).stem == args.character]
             if not match:
-                available = ", ".join(c["filename"].replace(".json", "") for c in cards)
+                available = ", ".join(Path(c["filename"]).stem for c in cards)
                 err_console.print(f"[fail]Character '{args.character}' not found. Available: {available}[/fail]")
                 return 1
             chosen = match[0]

@@ -39,7 +39,7 @@ def load_config(path: Path | None = None) -> None:
             for toml_key, env_key in _TOML_TO_ENV.items():
                 section, _, field = toml_key.partition(".")
                 val = data.get(section, {}).get(field)
-                if val is not None and env_key not in os.environ:
+                if val is not None and not os.environ.get(env_key):
                     os.environ[env_key] = str(val)
             return  # first match wins
 

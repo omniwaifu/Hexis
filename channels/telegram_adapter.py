@@ -61,7 +61,7 @@ class TelegramAdapter(ChannelAdapter):
             reactions=True,
             media=True,
             typing_indicator=True,
-            edit_message=True,
+            edit_message=False,
             max_message_length=4096,
         )
 
@@ -261,7 +261,8 @@ class TelegramAdapter(ChannelAdapter):
                 "text": text,
                 "parse_mode": "Markdown",
             }
-            if reply_to:
+            if reply_to and int(channel_id) < 0:
+                # Only thread replies in groups (negative chat_id); suppress in DMs
                 kwargs["reply_to_message_id"] = int(reply_to)
             # I.1: Telegram forum topic support — route to specific topic
             if thread_id:
