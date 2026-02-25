@@ -21,6 +21,8 @@ from .base import (
     ToolSpec,
 )
 
+_HEARTBEAT_ONLY = {ToolContext.HEARTBEAT}
+
 
 class RecallHandler(ToolHandler):
     """Search memories by semantic similarity."""

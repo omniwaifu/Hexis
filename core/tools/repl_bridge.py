@@ -174,7 +174,7 @@ class ReplToolBridge:
     def list_tools(self) -> list[dict[str, Any]]:
         """Return available tools with descriptions and energy costs."""
         tools = []
-        for name, handler in self._registry.handlers.items():
+        for name, handler in self._registry._handlers.items():
             spec = handler.spec
             if self._tool_context in spec.allowed_contexts:
                 tools.append({
