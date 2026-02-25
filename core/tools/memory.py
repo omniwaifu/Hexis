@@ -7,6 +7,7 @@ These wrap the existing CognitiveMemory API.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from uuid import UUID
 
@@ -1007,6 +1008,157 @@ class QueueUserMessageHandler(ToolHandler):
             return ToolResult.error_result(str(e), ToolErrorType.EXECUTION_FAILED)
 
 
+class ListRecentEpisodesHandler(ToolHandler):
+    """List recent episodic memory episodes."""
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="list_recent_episodes",
+            description=(
+                "List recent episodic memory episodes — grouped periods of activity with "
+                "summaries and memory counts. Useful for reviewing what has happened recently."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of recent episodes to return (default 5, max 20).",
+                        "default": 5,
+                    },
+                },
+                "required": [],
+            },
+            category=ToolCategory.MEMORY,
+            energy_cost=0,
+            is_read_only=True,
+        )
+
+    async def execute(
+        self,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        limit = min(int(arguments.get("limit", 5)), 20)
+        try:
+            async with context.registry.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, started_at, ended_at, episode_type, summary, memory_count
+                    FROM list_recent_episodes($1::int)
+                    """,
+                    limit,
+                )
+            episodes = [
+                {
+                    "id": str(r["id"]),
+                    "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+                    "ended_at": r["ended_at"].isoformat() if r["ended_at"] else None,
+                    "episode_type": r["episode_type"],
+                    "summary": r["summary"],
+                    "memory_count": r["memory_count"],
+                }
+                for r in rows
+            ]
+            return ToolResult.success_result(
+                output={"episodes": episodes, "count": len(episodes)},
+                display_output=f"Found {len(episodes)} recent episodes",
+            )
+        except Exception as e:
+            return ToolResult.error_result(str(e), ToolErrorType.EXECUTION_FAILED)
+
+
+class BrainstormGoalsHandler(ToolHandler):
+    """Gather goal context for brainstorming — current goals, recent episodes, drive levels."""
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="brainstorm_goals",
+            description=(
+                "Gather context for goal brainstorming: returns your current goals, "
+                "recent episodic activity, and drive levels. Use the output to reason "
+                "about what goals to create or update, then call manage_goals to act."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "max_goals": {
+                        "type": "integer",
+                        "description": "Maximum existing goals to return (default 10).",
+                        "default": 10,
+                    },
+                },
+                "required": [],
+            },
+            category=ToolCategory.MEMORY,
+            allowed_contexts=_HEARTBEAT_ONLY,
+            energy_cost=2,
+            is_read_only=True,
+        )
+
+    async def execute(
+        self,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        try:
+            async with context.registry.pool.acquire() as conn:
+                snapshot_raw = await conn.fetchval("SELECT get_goals_snapshot()")
+                goals = (
+                    snapshot_raw if isinstance(snapshot_raw, dict)
+                    else json.loads(snapshot_raw) if snapshot_raw
+                    else {"goals": []}
+                )
+
+                episode_rows = await conn.fetch(
+                    """
+                    SELECT id, started_at, episode_type, summary, memory_count
+                    FROM list_recent_episodes(5)
+                    """,
+                )
+                episodes = [
+                    {
+                        "id": str(r["id"]),
+                        "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+                        "episode_type": r["episode_type"],
+                        "summary": r["summary"],
+                        "memory_count": r["memory_count"],
+                    }
+                    for r in episode_rows
+                ]
+
+                drive_rows = await conn.fetch(
+                    "SELECT name, current_level, urgency_threshold FROM drives ORDER BY current_level DESC"
+                )
+                drives = [
+                    {
+                        "name": r["name"],
+                        "level": round(r["current_level"], 3),
+                        "urgent": r["current_level"] >= r["urgency_threshold"],
+                    }
+                    for r in drive_rows
+                ]
+
+            goal_count = len(goals.get("goals", []))
+            urgent_drives = [d["name"] for d in drives if d["urgent"]]
+            return ToolResult.success_result(
+                output={
+                    "current_goals": goals,
+                    "recent_episodes": episodes,
+                    "drives": drives,
+                },
+                display_output=(
+                    f"{goal_count} current goals; "
+                    f"{len(episodes)} recent episodes; "
+                    f"urgent drives: {', '.join(urgent_drives) or 'none'}"
+                ),
+            )
+        except Exception as e:
+            return ToolResult.error_result(str(e), ToolErrorType.EXECUTION_FAILED)
+
+
 def create_memory_tools() -> list[ToolHandler]:
     """Create memory tool handlers.
 
@@ -1022,4 +1174,6 @@ def create_memory_tools() -> list[ToolHandler]:
         GetProceduresHandler(),
         GetStrategiesHandler(),
         QueueUserMessageHandler(),
+        ListRecentEpisodesHandler(),
+        BrainstormGoalsHandler(),
     ]

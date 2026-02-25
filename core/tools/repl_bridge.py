@@ -139,13 +139,16 @@ class ReplToolBridge:
 
             self._call_records.append(record)
 
-            logger.info(
-                "REPL tool_use: %s -> success=%s energy=%d duration=%.2fs",
-                name,
-                result.success,
-                result.energy_spent,
-                record.duration,
-            )
+            if result.success:
+                logger.info(
+                    "REPL tool_use: %s -> success=True energy=%d duration=%.2fs",
+                    name, result.energy_spent, record.duration,
+                )
+            else:
+                logger.warning(
+                    "REPL tool_use: %s -> success=False energy=%d duration=%.2fs error=%s",
+                    name, result.energy_spent, record.duration, result.error,
+                )
 
             return {
                 "success": result.success,
